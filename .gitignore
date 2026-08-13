@@ -27,6 +27,19 @@ go.work.sum
 # env file
 .env
 
+# Frontend (web/)
+node_modules/
+dist/
+build/
+
+# Local SQLite databases
+*.db
+*.db-wal
+*.db-shm
+
+# OS
+.DS_Store
+
 # Editor/IDE
 # .idea/
 # .vscode/

@@ -1,0 +1,370 @@
+package runtime
+
+import (
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/creack/pty"
+
+	"github.com/delve8/agora/internal/adapter"
+	"github.com/delve8/agora/internal/terminal"
+)
+
+// PTYManager owns Claude Code subprocesses launched under PTYs that Agora
+// controls. Each managed session gets a PTY whose master fd stays inside this
+// process (macOS /dev/ptmx cannot be re-opened by another process), served to
+// `claude-wrapper` / `agora attach` clients over a Unix socket, and written to
+// by Input() when a message arrives from the web UI or IM.
+type PTYManager struct {
+	binary    string
+	homeDir   string
+	socketDir string
+
+	mu       sync.Mutex
+	sessions map[string]*PTYSession // keyed by Agora session id
+}
+
+type PTYSession struct {
+	AgoraID       string
+	ClaudeSession string // Claude's own session id (from ~/.claude/sessions after launch)
+	Workspace     string
+	Process       *os.Process
+	Master        *os.File
+	Listener      net.Listener
+	SocketPath    string
+	StartedAt     time.Time
+
+	observation *ptyObservation
+}
+
+type ptyObservation struct {
+	mu       sync.RWMutex
+	emulator terminal.Emulator
+	frames   []rawFrame
+	capacity int
+	sequence uint64
+}
+
+type rawFrame struct {
+	Sequence   uint64
+	CapturedAt time.Time
+	Data       []byte
+}
+
+const (
+	defaultPTYCols       = 120
+	defaultPTYRows       = 40
+	defaultRawFrameLimit = 256
+)
+
+func newPTYObservation() *ptyObservation {
+	return &ptyObservation{
+		emulator: terminal.NewVT10x(defaultPTYCols, defaultPTYRows),
+		capacity: defaultRawFrameLimit,
+	}
+}
+
+func (o *ptyObservation) record(data []byte) {
+	copyData := append([]byte(nil), data...)
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.sequence++
+	capturedAt := time.Now().UTC()
+	_ = o.emulator.Write(copyData)
+	o.frames = append(o.frames, rawFrame{Sequence: o.sequence, CapturedAt: capturedAt, Data: copyData})
+	if len(o.frames) > o.capacity {
+		o.frames = o.frames[len(o.frames)-o.capacity:]
+	}
+}
+
+func (o *ptyObservation) snapshot() terminal.Snapshot {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	value := o.emulator.Snapshot()
+	value.Sequence = o.sequence
+	return value
+}
+
+func NewPTYManager(binary, homeDir string) *PTYManager {
+	if binary == "" {
+		binary = "claude"
+	}
+	if homeDir == "" {
+		homeDir, _ = os.UserHomeDir()
+	}
+	return &PTYManager{
+		binary:    binary,
+		homeDir:   homeDir,
+		socketDir: filepath.Join(os.TempDir(), "agora-pty"),
+		sessions:  make(map[string]*PTYSession),
+	}
+}
+
+// Launch starts a Claude Code process for the given Agora session under a PTY.
+// If claudeSession is non-empty it resumes that conversation (--resume);
+// otherwise it starts fresh. The Claude session id is read from the metadata
+// file (~/.claude/sessions/<pid>.json), which is written while the process runs.
+func (m *PTYManager) Launch(agoraID, workspace, claudeSession string) (*PTYSession, error) {
+	m.mu.Lock()
+	if existing := m.sessions[agoraID]; existing != nil {
+		m.mu.Unlock()
+		return existing, nil
+	}
+	m.mu.Unlock()
+
+	args := []string{m.binary}
+	if claudeSession != "" {
+		args = append(args, "--resume", claudeSession)
+	}
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Dir = workspace
+	cmd.Env = cleanClaudeEnv()
+
+	file, err := pty.Start(cmd)
+	if err != nil {
+		return nil, fmt.Errorf("start claude PTY: %w", err)
+	}
+	if err := os.MkdirAll(m.socketDir, 0o700); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	socketPath := filepath.Join(m.socketDir, fmt.Sprintf("sess-%d.sock", time.Now().UnixNano()))
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("listen %s: %w", socketPath, err)
+	}
+
+	session := &PTYSession{
+		AgoraID:       agoraID,
+		Workspace:     workspace,
+		Process:       cmd.Process,
+		Master:        file,
+		Listener:      listener,
+		SocketPath:    socketPath,
+		StartedAt:     time.Now().UTC(),
+		ClaudeSession: claudeSession,
+		observation:   newPTYObservation(),
+	}
+	go m.serveAttach(session)
+
+	m.mu.Lock()
+	m.sessions[agoraID] = session
+	m.mu.Unlock()
+
+	// Read the Claude session id this process records (it appears shortly after
+	// launch in ~/.claude/sessions/<pid>.json). A fresh launch may not record it
+	// until the workspace trust prompt is accepted, so poll in the background
+	// until it appears or the process exits; callers that need the id re-check
+	// via ClaudeSessionID.
+	if claudeSession == "" {
+		metaPath := filepath.Join(m.homeDir, ".claude", "sessions", fmt.Sprintf("%d.json", cmd.Process.Pid))
+		go func() {
+			for {
+				if sid, _, err := adapter.ReadSessionMetadata(metaPath); err == nil && sid != "" {
+					m.mu.Lock()
+					session.ClaudeSession = sid
+					m.mu.Unlock()
+					log.Printf("agora: managed session %s has Claude session %s", agoraID, sid)
+					return
+				}
+				if cmd.ProcessState != nil {
+					return
+				}
+				time.Sleep(300 * time.Millisecond)
+			}
+		}()
+	}
+
+	go func() {
+		_ = cmd.Wait()
+		m.mu.Lock()
+		delete(m.sessions, agoraID)
+		m.mu.Unlock()
+		_ = listener.Close()
+		_ = file.Close()
+		log.Printf("agora: managed session %s process exited", agoraID)
+	}()
+
+	return session, nil
+}
+
+// Input writes a line into the PTY master, which the Claude TUI reads as typed
+// input followed by Enter (\r submits in the Claude TUI; \n alone only moves
+// the cursor). Concurrent sends are serialized by the caller (Manager.Send
+// holds the per-session active lock).
+func (m *PTYManager) Input(agoraID, content string) error {
+	m.mu.Lock()
+	session := m.sessions[agoraID]
+	m.mu.Unlock()
+	if session == nil {
+		return fmt.Errorf("managed session %s is not running", agoraID)
+	}
+	_, err := io.WriteString(session.Master, content+"\r")
+	return err
+}
+
+// Snapshot returns a read-only view of the current terminal screen.
+func (m *PTYManager) Snapshot(agoraID string) (terminal.Snapshot, error) {
+	m.mu.Lock()
+	session := m.sessions[agoraID]
+	m.mu.Unlock()
+	if session == nil || session.observation == nil {
+		return terminal.Snapshot{}, fmt.Errorf("managed session %s is not running", agoraID)
+	}
+	return session.observation.snapshot(), nil
+}
+
+// AttachAddr returns the Unix socket a client connects to for `claude-wrapper`.
+func (m *PTYManager) AttachAddr(agoraID string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	session := m.sessions[agoraID]
+	if session == nil {
+		return "", fmt.Errorf("managed session %s is not running", agoraID)
+	}
+	return session.SocketPath, nil
+}
+
+// ClaudeSessionID returns the recorded Claude session id for a managed session.
+func (m *PTYManager) ClaudeSessionID(agoraID string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if session := m.sessions[agoraID]; session != nil {
+		return session.ClaudeSession
+	}
+	return ""
+}
+
+// Close stops all managed PTY sessions.
+func (m *PTYManager) Close() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, session := range m.sessions {
+		_ = session.Listener.Close()
+		_ = session.Master.Close()
+		if session.Process != nil {
+			_ = session.Process.Kill()
+		}
+	}
+	m.sessions = make(map[string]*PTYSession)
+}
+
+// serveAttach is a hub for a session's PTY: one goroutine reads master output
+// and broadcasts it to every attached client; each client's keyboard input is
+// written back into the master. This guarantees the PTY output is always
+// consumed (so claude never blocks on a full buffer) even when no client is
+// attached, and multiple clients (terminal wrapper + web) never fight over the
+// master.
+func (m *PTYManager) serveAttach(session *PTYSession) {
+	listener := session.Listener
+	master := session.Master
+	type client struct {
+		conn net.Conn
+		send chan []byte
+	}
+	var clientsMu sync.Mutex
+	clients := make(map[*client]bool)
+	broadcast := func(data []byte) {
+		clientsMu.Lock()
+		for c := range clients {
+			select {
+			case c.send <- data:
+			default: // slow client: drop this frame rather than block the hub
+			}
+		}
+		clientsMu.Unlock()
+	}
+	unregister := func(c *client) {
+		clientsMu.Lock()
+		delete(clients, c)
+		clientsMu.Unlock()
+		close(c.send)
+		_ = c.conn.Close()
+	}
+
+	// Always consume master output, even with zero clients, so the PTY never
+	// back-pressures claude.
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := master.Read(buf)
+			if n > 0 {
+				data := append([]byte(nil), buf[:n]...)
+				if session.observation != nil {
+					session.observation.record(data)
+				}
+				broadcast(data)
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		c := &client{conn: conn, send: make(chan []byte, 256)}
+		clientsMu.Lock()
+		clients[c] = true
+		clientsMu.Unlock()
+
+		go func(c *client) {
+			defer unregister(c)
+			// Master output -> client.
+			go func() {
+				for data := range c.send {
+					if _, err := c.conn.Write(data); err != nil {
+						return
+					}
+				}
+			}()
+			// Client keyboard -> master.
+			_, _ = io.Copy(master, c.conn)
+		}(c)
+	}
+}
+
+// cleanClaudeEnv returns the process environment with all inherited Claude
+// Code "child session" variables stripped. These markers (set by Cursor/VS
+// Code extensions or a parent claude) tell claude it is a sub-session, which
+// disables transcript/JSONL persistence. Without them, a fresh interactive
+// claude writes its history JSONL normally.
+func cleanClaudeEnv() []string {
+	blocked := map[string]bool{
+		"CLAUDE_CODE_CHILD_SESSION":                 true,
+		"CLAUDE_CODE_SESSION_ID":                    true,
+		"CLAUDE_PID":                                true,
+		"CLAUDE_CODE_ENTRYPOINT":                    true,
+		"CLAUDE_AGENT_SDK_VERSION":                  true,
+		"CLAUDE_CODE_EXECPATH":                      true,
+		"CURSOR_SPAWNED_BY_EXTENSION_ID":            true,
+		"CURSOR_SPAWN_CHAIN":                        true,
+		"AI_AGENT":                                  true,
+		"CLAUDE_CODE_ENABLE_TASKS":                  true,
+		"CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING": true,
+		"CLAUDE_CODE_SUBAGENT_MODEL":                true,
+	}
+	env := make([]string, 0, len(os.Environ()))
+	for _, entry := range os.Environ() {
+		key := entry
+		if i := strings.IndexByte(entry, '='); i >= 0 {
+			key = entry[:i]
+		}
+		if !blocked[key] {
+			env = append(env, entry)
+		}
+	}
+	return env
+}
