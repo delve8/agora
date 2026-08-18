@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -10,6 +11,31 @@ import (
 	"github.com/delve8/agora/internal/coordination"
 	"github.com/delve8/agora/internal/session"
 )
+
+func TestMigrationDropsLegacyEventsTable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agora.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec(`CREATE TABLE events (id TEXT PRIMARY KEY, content TEXT NOT NULL); INSERT INTO events(id,content) VALUES('evt-1','secret transcript')`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var name string
+	err = db.db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='events'`).Scan(&name)
+	if err != sql.ErrNoRows {
+		t.Fatalf("events table still exists: name=%q err=%v", name, err)
+	}
+}
 
 func TestListSessionsDoesNotHoldRowsWhileLoadingValues(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "agora.db")

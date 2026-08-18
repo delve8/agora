@@ -21,7 +21,7 @@ export function SessionCreate({ onCreate, onCreated, disabled }: SessionCreatePr
       <Title level={2}>Start a Claude Code session</Title>
       <Text type="secondary">Agora keeps the native Claude Code terminal experience while giving you a responsive web view for history, activity and explicit input.</Text>
     </Space>
-    <Form form={form} layout="vertical" onFinish={submit} initialValues={{ display_name: "Claude Code", role: "agent" }} className="setup-form">
+    <Form form={form} layout="vertical" onFinish={submit} initialValues={{ display_name: "New session", role: "agent" }} className="setup-form">
       <Form.Item name="workspace" label="Workspace directory" rules={[{ required: true, message: "Enter an existing workspace path" }]}>
         <Input prefix={<FolderOpenOutlined />} placeholder="/path/to/workspace" />
       </Form.Item>

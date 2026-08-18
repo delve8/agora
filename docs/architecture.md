@@ -134,8 +134,9 @@ JSONL Observer → Daemon → Server 内存 SSE/通知 → Web
 - 前端：TypeScript + React + Ant Design 5；
 - Server ↔ Daemon：出站 WebSocket，设备配对、心跳、自动重连、resync、有限 outbox；
 - Daemon ↔ Wrapper：Unix domain socket / loopback 控制面；
-- Server 持久化：控制面数据；不保存完整业务历史；
-- Daemon 持久化：纳管 Session 映射、游标、进程状态和有限 outbox；
+- Server 持久化：当前实现中的控制面和 session metadata；不保存 Daemon 的完整业务历史；
+- Daemon identity：首次运行生成 UUID 并写入 `~/.agora/config.json`；该配置文件只保存设备身份，不保存 Session runtime、PID、PTY、cursor 或 history；
+- Daemon 启动时从 `~/.claude/projects/*/*.jsonl` 重新建立内存中的 history index；这些条目可 resume，但不恢复 PID、PTY、cursor 或 observer；
 - Claude 历史事实源：用户电脑原有项目 JSONL；
 - 前端实时更新：WebSocket（Daemon）+ SSE（Web）。
 

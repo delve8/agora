@@ -2,9 +2,10 @@ package runtime
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"errors"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,23 +21,107 @@ import (
 )
 
 type Manager struct {
-	store   *store.Store
-	adapter *adapter.ClaudeCodeAdapter
-	pty     *PTYManager
-	homeDir string
+	store    StateStore
+	adapter  *adapter.ClaudeCodeAdapter
+	pty      *PTYManager
+	daemonID string
+	homeDir  string
+	history  *adapter.HistoryCatalog
 
-	mu        sync.Mutex
-	active    map[string]bool
-	observers map[string]context.CancelFunc
-	subs      map[string]map[chan event.Event]struct{}
-	closed    bool
+	mu            sync.Mutex
+	active        map[string]bool
+	generation    map[string]uint64
+	observers     map[string]context.CancelFunc
+	subs          map[string]map[chan event.Event]struct{}
+	sessionOnExit func(session.Session, PTYExit)
+	closed        bool
 }
 
-func NewManager(db *store.Store, agentAdapter *adapter.ClaudeCodeAdapter, ptyManager *PTYManager) *Manager {
+func NewManager(db StateStore, agentAdapter *adapter.ClaudeCodeAdapter, ptyManager *PTYManager) *Manager {
 	homeDir, _ := os.UserHomeDir()
-	return &Manager{store: db, adapter: agentAdapter, pty: ptyManager, homeDir: homeDir, active: make(map[string]bool), observers: make(map[string]context.CancelFunc), subs: make(map[string]map[chan event.Event]struct{})}
+	if ptyManager != nil && ptyManager.homeDir != "" {
+		homeDir = ptyManager.homeDir
+	}
+	manager := &Manager{store: db, adapter: agentAdapter, pty: ptyManager, homeDir: homeDir, history: adapter.NewHistoryCatalog(homeDir), active: make(map[string]bool), generation: make(map[string]uint64), observers: make(map[string]context.CancelFunc), subs: make(map[string]map[chan event.Event]struct{})}
+	if ptyManager != nil {
+		ptyManager.SetExitHandler(manager.handlePTYExit)
+	}
+	return manager
 }
 
+func NewDaemonManager(db StateStore, daemonID string, agentAdapter *adapter.ClaudeCodeAdapter, ptyManager *PTYManager) *Manager {
+	manager := NewManager(db, agentAdapter, ptyManager)
+	manager.daemonID = daemonID
+	return manager
+}
+func (m *Manager) ListSessions(ctx context.Context, coordinationID string) ([]session.Session, error) {
+	return m.store.ListSessions(ctx, coordinationID)
+}
+
+func (m *Manager) GetSession(ctx context.Context, id string) (session.Session, error) {
+	return m.store.GetSession(ctx, id)
+}
+
+func (m *Manager) WaitAgentSessionID(ctx context.Context, id string) (string, error) {
+	if m == nil || m.pty == nil {
+		return "", fmt.Errorf("session manager is unavailable")
+	}
+	return m.pty.WaitClaudeSessionID(ctx, id)
+}
+func (m *Manager) AgentSessionID(id string) string {
+	if m == nil || m.pty == nil {
+		return ""
+	}
+	return m.pty.ClaudeSessionID(id)
+}
+
+func (m *Manager) SetAgentIdentity(ctx context.Context, id, agent, agentSessionID string) (session.Session, error) {
+	value, err := m.store.GetSession(ctx, id)
+	if err != nil {
+		return session.Session{}, err
+	}
+	value.Agent = agent
+	value.AgentSessionID = agentSessionID
+	if agent == "claude" {
+		value.ClaudeSessionID = strings.TrimPrefix(agentSessionID, "claude://")
+	}
+	value.HistoryPath = adapter.FindHistoryBySessionID(m.homeDir, strings.TrimPrefix(agentSessionID, agent+"://"))
+	if err := m.store.UpdateSessionObservation(ctx, value); err != nil {
+		return session.Session{}, err
+	}
+	return value, nil
+}
+
+func (m *Manager) RekeySession(ctx context.Context, oldID, newID string) (session.Session, error) {
+	value, err := m.store.GetSession(ctx, oldID)
+	if err != nil {
+		return session.Session{}, err
+	}
+	if m.pty != nil {
+		if err := m.pty.Rekey(oldID, newID); err != nil {
+			return session.Session{}, err
+		}
+	}
+	m.StopObserver(oldID)
+	value.ID = newID
+	if err := m.store.RekeySession(ctx, oldID, value); err != nil {
+		return session.Session{}, err
+	}
+	m.mu.Lock()
+	if active := m.active[oldID]; active {
+		m.active[newID] = active
+		delete(m.active, oldID)
+	}
+	if generation := m.generation[oldID]; generation != 0 {
+		m.generation[newID] = generation
+		delete(m.generation, oldID)
+	}
+	m.mu.Unlock()
+	if value.HistoryPath != "" {
+		_ = m.StartObserver(value)
+	}
+	return value, nil
+}
 func (m *Manager) Subscribe(coordinationID string) (<-chan event.Event, func()) {
 	ch := make(chan event.Event, 64)
 	m.mu.Lock()
@@ -89,10 +174,9 @@ func (m *Manager) Close() {
 	}
 }
 
-// Send runs one turn against a managed session: the print-session manager
-// executes `claude --resume <id> --print <msg>`, which appends to the
-// session's JSONL. Send returns once the turn produced output; the observer
-// ingests the new JSONL content asynchronously.
+// Send writes one turn into a managed session's PTY and returns after the input
+// is accepted. A manager-owned watcher keeps the session active until the JSONL
+// observer sees new output or the turn times out.
 func (m *Manager) Send(ctx context.Context, value session.Session, msg message.Message) error {
 	if !value.Capabilities.CanSendInput {
 		return fmt.Errorf("session does not accept input")
@@ -118,6 +202,10 @@ func (m *Manager) Send(ctx context.Context, value session.Session, msg message.M
 		return err
 	}
 
+	// Snapshot observation state before input so even a very fast JSONL append is
+	// observed as completion.
+	before := m.observationGeneration(value.ID)
+
 	// Write into the PTY master; the Claude TUI reads it as typed input and the
 	// observer picks up the resulting history from JSONL.
 	if err := m.pty.Input(value.ID, msg.Content); err != nil {
@@ -129,24 +217,22 @@ func (m *Manager) Send(ctx context.Context, value session.Session, msg message.M
 	}
 
 	// The turn completes when the observer sees new history land in the JSONL.
-	before, _ := m.store.CountEvents(context.Background(), value.ID)
 	go func() {
 		deadline := time.Now().Add(90 * time.Second)
 		for time.Now().Before(deadline) {
-			select {
-			case <-ctx.Done():
+			if m.isClosed() {
 				m.clearActive(value.ID)
-				_ = m.store.UpdateSessionState(context.Background(), value.ID, session.StateWaiting)
 				return
-			default:
 			}
-			after, err := m.store.CountEvents(context.Background(), value.ID)
-			if err == nil && after > before {
+			if m.observationGeneration(value.ID) > before {
 				break
 			}
 			time.Sleep(300 * time.Millisecond)
 		}
 		m.clearActive(value.ID)
+		if !m.IsRunning(value.ID) {
+			return
+		}
 		_ = m.store.UpdateSessionState(context.Background(), value.ID, session.StateWaiting)
 	}()
 
@@ -162,22 +248,23 @@ func (m *Manager) CreateManagedSession(ctx context.Context, coordinationID, work
 		return session.Session{}, fmt.Errorf("session manager is unavailable")
 	}
 	if displayName == "" {
-		displayName = "Claude Code"
+		displayName = "New session"
 	}
 	now := time.Now().UTC()
 	value := session.Session{
-		ID:             fmt.Sprintf("sess-%d", now.UnixNano()),
-		CoordinationID: coordinationID,
-		Agent:          "claude-code",
-		Workspace:      workspace,
-		DisplayName:    displayName,
-		Role:           role,
-		State:          session.StateStarting,
-		Source:         session.SourceManaged,
-		Connection:     session.ConnectionUnavailable,
-		Capabilities:   session.Capabilities{CanStart: true, CanSendInput: true, CanStream: true, CanResume: true, CanReadHistory: true, CanObserve: true},
-		CreatedAt:      now,
-		UpdatedAt:      now,
+		ID:                fmt.Sprintf("sess-%d", now.UnixNano()),
+		CoordinationID:    coordinationID,
+		Agent:             "claude-code",
+		Workspace:         workspace,
+		DisplayName:       displayName,
+		DisplayNameSource: session.InitialDisplayNameSource(displayName),
+		Role:              role,
+		State:             session.StateStarting,
+		Source:            session.SourceManaged,
+		Connection:        session.ConnectionUnavailable,
+		Capabilities:      session.Capabilities{CanStart: true, CanSendInput: true, CanStream: true, CanInterrupt: true, CanResume: true, CanReadHistory: true, CanReadTerminal: true, CanObserve: true},
+		CreatedAt:         now,
+		UpdatedAt:         now,
 	}
 	if err := m.store.CreateSession(ctx, value); err != nil {
 		return session.Session{}, err
@@ -244,10 +331,10 @@ func (m *Manager) CreateManagedSessionWithID(ctx context.Context, id, coordinati
 		return session.Session{}, fmt.Errorf("session manager is unavailable")
 	}
 	if displayName == "" {
-		displayName = "Claude Code"
+		displayName = "New session"
 	}
 	now := time.Now().UTC()
-	value := session.Session{ID: id, CoordinationID: coordinationID, Agent: "claude-code", Workspace: workspace, DisplayName: displayName, Role: role, State: session.StateStarting, Source: session.SourceManaged, Connection: session.ConnectionUnavailable, Capabilities: session.Capabilities{CanStart: true, CanSendInput: true, CanStream: true, CanResume: true, CanReadHistory: true, CanObserve: true}, CreatedAt: now, UpdatedAt: now}
+	value := session.Session{ID: id, CoordinationID: coordinationID, Agent: "claude-code", Workspace: workspace, DisplayName: displayName, DisplayNameSource: session.InitialDisplayNameSource(displayName), Role: role, State: session.StateStarting, Source: session.SourceManaged, Connection: session.ConnectionUnavailable, Capabilities: session.Capabilities{CanStart: true, CanSendInput: true, CanStream: true, CanInterrupt: true, CanResume: true, CanReadHistory: true, CanReadTerminal: true, CanObserve: true}, CreatedAt: now, UpdatedAt: now}
 	if err := m.store.CreateSession(ctx, value); err != nil {
 		return session.Session{}, err
 	}
@@ -278,43 +365,101 @@ func (m *Manager) CreateManagedSessionWithID(ctx context.Context, id, coordinati
 	return m.store.GetSession(ctx, value.ID)
 }
 
-// ResumeManagedSessions relaunches every persisted managed session that has a
-// recorded Claude session id, so an Agora restart continues the same
-// conversations (claude --resume). Each session is re-held under an
-// Agora-owned PTY; the JSONL observer starts immediately.
+// ResumeManagedSessions is retained for startup compatibility. Sessions are no
+// longer relaunched automatically: persisted state is reconciled against the
+// actual PTY table and users resume inactive conversations explicitly.
 func (m *Manager) ResumeManagedSessions(ctx context.Context) error {
 	values, err := m.store.ListSessions(ctx, "")
 	if err != nil {
 		return err
 	}
 	for _, value := range values {
-		if value.Source != session.SourceManaged || value.ClaudeSessionID == "" || value.Workspace == "" {
+		if value.Source != session.SourceManaged || m.IsRunning(value.ID) {
 			continue
 		}
-		if m.pty == nil {
-			return fmt.Errorf("session manager is unavailable")
+		effective := m.EffectiveSession(value)
+		if err := m.store.UpdateSessionObservation(ctx, effective); err != nil {
+			return err
 		}
-		launched, err := m.pty.Launch(value.ID, value.Workspace, value.ClaudeSessionID)
-		if err != nil {
-			value.LastError = err.Error()
-			value.State = session.StateStale
-			value.Connection = session.ConnectionStale
-			_ = m.store.UpdateSessionObservation(ctx, value)
-			continue
-		}
-		value.ProcessID = launched.Process.Pid
-		value.SessionMetaPath = filepath.Join(m.homeDir, ".claude", "sessions", fmt.Sprintf("%d.json", launched.Process.Pid))
-		value.State = session.StateRunning
-		value.Connection = session.ConnectionObserved
-		value.LastError = ""
-		_ = m.store.UpdateSessionObservation(ctx, value)
-		if err := m.StartObserver(value); err != nil {
-			value.LastError = err.Error()
-			_ = m.store.UpdateSessionObservation(ctx, value)
-		}
-		log.Printf("agora: resumed managed session %s (claude %s)", value.ID, value.ClaudeSessionID)
 	}
 	return nil
+}
+
+func (m *Manager) ResumeSession(ctx context.Context, value session.Session) (session.Session, error) {
+	if m.pty == nil {
+		return session.Session{}, fmt.Errorf("session manager is unavailable")
+	}
+	if strings.TrimSpace(value.ClaudeSessionID) == "" {
+		return session.Session{}, fmt.Errorf("Claude session id is required")
+	}
+	workspace, err := filepath.Abs(strings.TrimSpace(value.Workspace))
+	if err != nil {
+		return session.Session{}, err
+	}
+	info, err := os.Stat(workspace)
+	if err != nil || !info.IsDir() {
+		return session.Session{}, fmt.Errorf("workspace must be an existing directory")
+	}
+	value.Workspace = workspace
+	if m.IsRunning(value.ID) {
+		if stored, getErr := m.store.GetSession(ctx, value.ID); getErr == nil {
+			return m.EffectiveSession(stored), nil
+		}
+		return m.EffectiveSession(value), nil
+	}
+	if _, err := m.store.GetSession(ctx, value.ID); errors.Is(err, sql.ErrNoRows) {
+		value.Source = session.SourceManaged
+		value.State = session.StateStarting
+		value.Connection = session.ConnectionUnavailable
+		value.ProcessID = 0
+		value.Capabilities = session.Capabilities{CanReadHistory: true, CanResume: true}
+		if value.CreatedAt.IsZero() {
+			value.CreatedAt = time.Now().UTC()
+		}
+		value.UpdatedAt = time.Now().UTC()
+		if err := m.store.CreateSession(ctx, value); err != nil {
+			return session.Session{}, err
+		}
+	} else if err != nil {
+		return session.Session{}, err
+	}
+	launched, err := m.pty.Launch(value.ID, value.Workspace, value.ClaudeSessionID)
+	if err != nil {
+		value.State = session.StateFailed
+		value.Connection = session.ConnectionStale
+		value.LastError = err.Error()
+		_ = m.store.UpdateSessionObservation(ctx, value)
+		return session.Session{}, err
+	}
+	value.Source = session.SourceManaged
+	value.ProcessID = launched.Process.Pid
+	value.SessionMetaPath = filepath.Join(m.homeDir, ".claude", "sessions", fmt.Sprintf("%d.json", launched.Process.Pid))
+	value.HistoryPath = adapter.FindHistoryBySessionID(m.homeDir, value.ClaudeSessionID)
+	value.State = session.StateRunning
+	value.Connection = session.ConnectionObserved
+	value.LastError = ""
+	if err := m.store.UpdateSessionObservation(ctx, value); err != nil {
+		return session.Session{}, err
+	}
+	if err := m.StartObserver(value); err != nil {
+		return session.Session{}, err
+	}
+	stored, err := m.store.GetSession(ctx, value.ID)
+	if err != nil {
+		return session.Session{}, err
+	}
+	return m.EffectiveSession(stored), nil
+}
+
+func (m *Manager) StopSession(value session.Session) error {
+	if m.pty == nil {
+		return fmt.Errorf("session manager is unavailable")
+	}
+	if !m.IsRunning(value.ID) {
+		return fmt.Errorf("session is not running")
+	}
+	m.clearActive(value.ID)
+	return m.pty.Stop(value.ID)
 }
 
 func (m *Manager) StartObserver(value session.Session) error {
@@ -349,12 +494,15 @@ func (m *Manager) StopObserver(id string) {
 // history path (both fresh managed launches and sessions restored after an
 // Agora restart). It does not launch Claude — that is PTYManager's job.
 func (m *Manager) ReconcileObservers(ctx context.Context) error {
+	if m.store == nil {
+		return nil
+	}
 	values, err := m.store.ListSessions(ctx, "")
 	if err != nil {
 		return err
 	}
 	for _, value := range values {
-		if value.HistoryPath == "" {
+		if value.HistoryPath == "" || !m.IsRunning(value.ID) {
 			continue
 		}
 		if err := m.StartObserver(value); err != nil {
@@ -378,6 +526,12 @@ func (m *Manager) observe(ctx context.Context, value session.Session) {
 	}
 	if cursor.Path == "" {
 		cursor.Path = value.HistoryPath
+	}
+	if cursor.Path != "" {
+		if info, statErr := os.Stat(cursor.Path); statErr == nil && cursor.ByteOffset == 0 && cursor.Line == 0 {
+			cursor.ByteOffset = info.Size()
+			_ = m.store.SaveObservationCursor(ctx, store.ObservationCursor{SessionID: value.ID, Path: cursor.Path, ByteOffset: cursor.ByteOffset})
+		}
 	}
 	for {
 		if err := ctx.Err(); err != nil {
@@ -410,30 +564,33 @@ func (m *Manager) observe(ctx context.Context, value session.Session) {
 			}
 		}
 		for _, record := range records {
-			if record.Event.ExternalID != "" {
-				exists, err := m.store.HasEvent(ctx, value.ID, record.Event.Source, record.Event.ExternalID)
-				if err != nil {
-					m.markObservationError(value, err)
-					return
+			name := ""
+			nameSource := ""
+			switch record.Event.Kind {
+			case event.KindAITitle:
+				if session.CanApplyAITitle(value) {
+					name = session.DescribeMessage(record.Event.Content)
+					nameSource = session.DisplayNameSourceAITitle
 				}
-				if exists {
-					cursor.ByteOffset = record.Cursor.ByteOffset
-					cursor.Line = record.Cursor.Line
-					cursor.LastID = record.Event.ExternalID
-					continue
+			case event.KindUser:
+				if session.CanApplyFirstUserName(value) {
+					name = session.DescribeMessage(record.Event.Content)
+					nameSource = session.DisplayNameSourceFirstUser
 				}
 			}
-			if err := m.store.AppendEvent(ctx, record.Event); err != nil {
-				m.markObservationError(value, err)
-				return
+			if name != "" {
+				value.DisplayName = name
+				value.DisplayNameSource = nameSource
+				_ = m.store.UpdateSessionDisplayName(ctx, value.ID, name, nameSource)
 			}
 			cursor.ByteOffset = record.Cursor.ByteOffset
 			cursor.Line = record.Cursor.Line
 			cursor.LastID = record.Event.ExternalID
 			_ = m.store.SaveObservationCursor(ctx, store.ObservationCursor{SessionID: value.ID, Path: cursor.Path, ByteOffset: cursor.ByteOffset, Line: cursor.Line, LastID: cursor.LastID})
+			m.advanceObservation(value.ID)
 			m.publish(value.CoordinationID, record.Event)
 		}
-		if len(records) > 0 {
+		if len(records) > 0 && m.IsRunning(value.ID) {
 			now := time.Now().UTC()
 			value.LastObservedAt = &now
 			value.Connection = session.ConnectionObserved
@@ -456,6 +613,274 @@ func (m *Manager) markObservationError(value session.Session, err error) {
 	_ = m.store.UpdateSessionObservation(context.Background(), value)
 }
 
+func (m *Manager) SetSessionExitHandler(handler func(session.Session, PTYExit)) {
+	m.mu.Lock()
+	m.sessionOnExit = handler
+	m.mu.Unlock()
+}
+
+func (m *Manager) handlePTYExit(exited PTYExit) {
+	m.clearActive(exited.AgoraID)
+	m.StopObserver(exited.AgoraID)
+	if m.isClosed() {
+		return
+	}
+	value, err := m.store.GetSession(context.Background(), exited.AgoraID)
+	if err != nil {
+		return
+	}
+	if value.ClaudeSessionID == "" {
+		value.ClaudeSessionID = exited.ClaudeSession
+	}
+	if value.HistoryPath == "" && value.ClaudeSessionID != "" {
+		value.HistoryPath = adapter.FindHistoryBySessionID(m.homeDir, value.ClaudeSessionID)
+	}
+	value.ProcessID = 0
+	value.SessionMetaPath = ""
+	value.State = session.StateStopped
+	value.Connection = session.ConnectionUnavailable
+	value.LastError = ""
+	if exited.Err != nil && exited.ExitCode != 0 {
+		value.LastError = exited.Err.Error()
+	}
+	_ = m.store.UpdateSessionObservation(context.Background(), value)
+	m.mu.Lock()
+	handler := m.sessionOnExit
+	m.mu.Unlock()
+	if handler != nil {
+		handler(value, exited)
+	}
+}
+
+func (m *Manager) IsRunning(id string) bool {
+	return m != nil && m.pty != nil && m.pty.IsRunning(id)
+}
+
+func (m *Manager) EffectiveSession(value session.Session) session.Session {
+	if value.Source == session.SourceHistory {
+		value.Capabilities = session.Capabilities{CanReadHistory: true, CanResume: value.ClaudeSessionID != "" && value.Workspace != ""}
+		value.State = session.StateStopped
+		value.Connection = session.ConnectionUnavailable
+		value.ProcessID = 0
+		return value
+	}
+	if value.Source != session.SourceManaged {
+		return value
+	}
+	if m.IsRunning(value.ID) {
+		if value.State != session.StateWaiting && value.State != session.StateStarting {
+			value.State = session.StateRunning
+		}
+		value.Connection = session.ConnectionObserved
+		value.Capabilities = session.Capabilities{CanStart: true, CanAttach: true, CanObserve: true, CanSendInput: true, CanStream: true, CanInterrupt: true, CanResume: true, CanReadHistory: true, CanReadTerminal: true}
+		return value
+	}
+	value.State = session.StateStopped
+	value.Connection = session.ConnectionUnavailable
+	value.ProcessID = 0
+	value.Capabilities = session.Capabilities{CanReadHistory: value.HistoryPath != "" || value.ClaudeSessionID != "", CanResume: value.ClaudeSessionID != "" && value.Workspace != ""}
+	return value
+}
+
+func (m *Manager) DiscoverHistorySessions(ctx context.Context, coordinationID, daemonID string) ([]session.Session, error) {
+	summaries, err := m.history.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	values := make([]session.Session, 0, len(summaries))
+	for _, summary := range summaries {
+		if summary.SessionID == "" {
+			continue
+		}
+		uri := "claude://" + summary.SessionID
+		id, err := session.NewSessionID(daemonID, "claude", uri)
+		if err != nil {
+			continue
+		}
+		name := session.DescribeMessage(summary.LatestAITitle)
+		nameSource := session.DisplayNameSourceAITitle
+		if name == "" {
+			name = session.DescribeMessage(summary.FirstUser)
+			nameSource = session.DisplayNameSourceFirstUser
+		}
+		if name == "" {
+			name = summary.SessionID
+			nameSource = session.DisplayNameSourceInitial
+		}
+		workspace := strings.TrimSpace(summary.Workspace)
+		if workspace == "" {
+			workspace = summary.ProjectDirectory
+		}
+		updatedAt := summary.LastEventAt
+		if updatedAt.IsZero() {
+			updatedAt = summary.ModifiedAt
+		}
+		createdAt := summary.FirstEventAt
+		if createdAt.IsZero() {
+			createdAt = updatedAt
+		}
+		values = append(values, session.Session{ID: id, CoordinationID: coordinationID, DaemonID: daemonID, Agent: "claude", AgentSessionID: uri, ClaudeSessionID: summary.SessionID, Workspace: workspace, DisplayName: name, DisplayNameSource: nameSource, Role: "history", State: session.StateStopped, Source: session.SourceHistory, Connection: session.ConnectionUnavailable, HistoryPath: summary.Path, Capabilities: session.Capabilities{CanReadHistory: true, CanResume: workspace != ""}, CreatedAt: createdAt, UpdatedAt: updatedAt})
+	}
+	return values, nil
+}
+func (m *Manager) HistorySessions(ctx context.Context, coordinationID, owner string) ([]session.Session, error) {
+	summaries, err := m.history.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	values := make([]session.Session, 0, len(summaries))
+	for _, summary := range summaries {
+		values = append(values, historySession(summary, coordinationID, owner))
+	}
+	return values, nil
+}
+
+func (m *Manager) HistorySession(ctx context.Context, id, coordinationID, owner string) (session.Session, bool, error) {
+	values, err := m.HistorySessions(ctx, coordinationID, owner)
+	if err != nil {
+		return session.Session{}, false, err
+	}
+	for _, value := range values {
+		if value.ID == id {
+			return value, true, nil
+		}
+	}
+	return session.Session{}, false, nil
+}
+
+func (m *Manager) ResolveHistory(ctx context.Context, id, coordinationID, owner string, limit int) ([]event.Event, error) {
+	if value, err := m.store.GetSession(ctx, id); err == nil {
+		return m.HistoryForSession(ctx, value, limit)
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	value, ok, err := m.HistorySession(ctx, id, coordinationID, owner)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, sql.ErrNoRows
+	}
+	return m.HistoryForSession(ctx, value, limit)
+}
+
+func (m *Manager) HistoryForSession(ctx context.Context, value session.Session, limit int) ([]event.Event, error) {
+	if value.Source == session.SourceHistory {
+		if value.HistoryPath == "" {
+			return []event.Event{}, nil
+		}
+		values, err := adapter.ReadAllHistory(ctx, value.HistoryPath, value.ID, limit)
+		if os.IsNotExist(err) {
+			return []event.Event{}, nil
+		}
+		return values, err
+	}
+	return m.History(ctx, value.ID, limit)
+}
+
+func historySession(summary adapter.HistorySummary, coordinationID, owner string) session.Session {
+	name := session.DescribeMessage(summary.LatestAITitle)
+	nameSource := session.DisplayNameSourceAITitle
+	if name == "" {
+		name = session.DescribeMessage(summary.FirstUser)
+		nameSource = session.DisplayNameSourceFirstUser
+	}
+	if name == "" {
+		name = summary.SessionID
+		nameSource = session.DisplayNameSourceInitial
+	}
+	workspace := strings.TrimSpace(summary.Workspace)
+	if workspace == "" {
+		workspace = summary.ProjectDirectory
+	}
+	updatedAt := summary.LastEventAt
+	if updatedAt.IsZero() {
+		updatedAt = summary.ModifiedAt
+	}
+	createdAt := summary.FirstEventAt
+	if createdAt.IsZero() {
+		createdAt = updatedAt
+	}
+	return session.Session{
+		ID:                historySessionID(owner, summary.SessionID),
+		CoordinationID:    coordinationID,
+		Agent:             "claude-code",
+		ExternalID:        summary.SessionID,
+		ClaudeSessionID:   summary.SessionID,
+		Workspace:         workspace,
+		DisplayName:       name,
+		DisplayNameSource: nameSource,
+		Role:              "history",
+		State:             session.StateStopped,
+		Source:            session.SourceHistory,
+		Connection:        session.ConnectionUnavailable,
+		HistoryPath:       summary.Path,
+		Capabilities:      session.Capabilities{CanReadHistory: true, CanResume: summary.SessionID != "" && workspace != ""},
+		CreatedAt:         createdAt,
+		UpdatedAt:         updatedAt,
+	}
+}
+
+func historySessionID(owner, claudeSessionID string) string {
+	sum := sha256.Sum256([]byte(owner + "\x00" + claudeSessionID))
+	return fmt.Sprintf("history-%x", sum[:12])
+}
+
+// CanManageSessions reports whether this Manager owns a PTY and local Claude
+// processes. Standalone Server mode has a Manager only for shared services.
+func (m *Manager) CanManageSessions() bool { return m != nil && m.pty != nil }
+
+func (m *Manager) History(ctx context.Context, id string, limit int) ([]event.Event, error) {
+	value, err := m.store.GetSession(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	path := value.HistoryPath
+	if path == "" && value.ClaudeSessionID != "" {
+		path = adapter.FindHistoryBySessionID(m.homeDir, value.ClaudeSessionID)
+		if path != "" {
+			value.HistoryPath = path
+			_ = m.store.UpdateSessionObservation(ctx, value)
+		}
+	}
+	if path == "" {
+		return []event.Event{}, nil
+	}
+	values, err := adapter.ReadAllHistory(ctx, path, id, limit)
+	if os.IsNotExist(err) {
+		return []event.Event{}, nil
+	}
+	return values, err
+}
+
+func (m *Manager) FirstUserEvent(ctx context.Context, id string) (event.Event, bool, error) {
+	value, err := m.store.GetSession(ctx, id)
+	if err != nil {
+		return event.Event{}, false, err
+	}
+	path := value.HistoryPath
+	if path == "" && value.ClaudeSessionID != "" {
+		path = adapter.FindHistoryBySessionID(m.homeDir, value.ClaudeSessionID)
+	}
+	if path == "" {
+		return event.Event{}, false, nil
+	}
+	first, ok, err := adapter.FirstUserHistoryEvent(ctx, path, id)
+	if os.IsNotExist(err) {
+		return event.Event{}, false, nil
+	}
+	return first, ok, err
+}
+
+func (m *Manager) DerivedDisplayName(ctx context.Context, id string) (string, string, bool, error) {
+	values, err := m.History(ctx, id, 0)
+	if err != nil {
+		return "", "", false, err
+	}
+	name, source := session.DerivedDisplayName(values)
+	return name, source, name != "", nil
+}
+
 // Snapshot returns a read-only view of a managed session's terminal screen.
 func (m *Manager) Snapshot(id string) (terminal.Snapshot, error) {
 	if m.pty == nil {
@@ -473,19 +898,27 @@ func (m *Manager) AttachAddr(sessionID string) (string, error) {
 	return m.pty.AttachAddr(sessionID)
 }
 
-func (m *Manager) PublishEvent(ctx context.Context, sessionID string, value event.Event) error {
-	current, err := m.store.GetSession(ctx, sessionID)
-	if err != nil {
-		return err
-	}
-	value.SessionID = sessionID
-	m.publish(current.CoordinationID, value)
-	return nil
-}
-
 func (m *Manager) clearActive(id string) {
 	m.mu.Lock()
 	delete(m.active, id)
+	m.mu.Unlock()
+}
+
+func (m *Manager) isClosed() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.closed
+}
+
+func (m *Manager) observationGeneration(id string) uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.generation[id]
+}
+
+func (m *Manager) advanceObservation(id string) {
+	m.mu.Lock()
+	m.generation[id]++
 	m.mu.Unlock()
 }
 
@@ -502,6 +935,5 @@ func (m *Manager) publish(coordinationID string, value event.Event) {
 
 func (m *Manager) publishError(value session.Session, err error) {
 	e := event.Event{ID: fmt.Sprintf("evt-%d", time.Now().UnixNano()), SessionID: value.ID, Kind: event.KindError, Source: event.SourceStream, Content: err.Error(), CreatedAt: time.Now().UTC()}
-	_ = m.store.AppendEvent(context.Background(), e)
 	m.publish(value.CoordinationID, e)
 }

@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+const MaxFrameSize = 8 << 20
+
 const (
 	DaemonRegister         = "daemon.register"
 	DaemonRegistered       = "daemon.registered"
@@ -25,6 +27,8 @@ const (
 	SnapshotResponse       = "snapshot.response"
 	SessionInput           = "session.input"
 	SessionInputResult     = "session.input_result"
+	SessionStop            = "session.stop"
+	SessionStopResult      = "session.stop_result"
 	SessionExit            = "session.exit"
 	Ack                    = "ack"
 	Error                  = "error"
@@ -67,7 +71,7 @@ func ValidateType(typ string) error {
 		DaemonResync, ServerResyncRequest, SessionCreate, SessionCreated,
 		SessionUpdate, EventBatch, SessionHistoryRequest, SessionHistoryResponse,
 		SnapshotRequest, SnapshotResponse, SessionInput, SessionInputResult,
-		SessionExit, Ack, Error:
+		SessionStop, SessionStopResult, SessionExit, Ack, Error:
 		return nil
 	default:
 		return fmt.Errorf("unknown protocol message type %q", typ)
@@ -87,32 +91,59 @@ type HeartbeatPayload struct {
 }
 
 type SessionSummary struct {
-	SessionID       string `json:"session_id"`
+	SessionID      string `json:"session_id"`
+	DaemonID       string `json:"daemon_id,omitempty"`
+	Agent          string `json:"agent,omitempty"`
+	AgentSessionID string `json:"agent_session_id,omitempty"`
+	// Deprecated compatibility field.
 	ClaudeSessionID string `json:"claude_session_id,omitempty"`
 	State           string `json:"state"`
 	Connection      string `json:"connection,omitempty"`
 	PID             int    `json:"pid,omitempty"`
 }
 
+type HistorySessionSummary struct {
+	SessionID      string `json:"session_id"`
+	DaemonID       string `json:"daemon_id,omitempty"`
+	Agent          string `json:"agent,omitempty"`
+	AgentSessionID string `json:"agent_session_id"`
+	// Deprecated compatibility field.
+	ClaudeSessionID   string    `json:"claude_session_id,omitempty"`
+	Workspace         string    `json:"workspace"`
+	DisplayName       string    `json:"display_name"`
+	DisplayNameSource string    `json:"display_name_source,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
+}
+
 type ResyncPayload struct {
-	DaemonID  string           `json:"daemon_id"`
-	Sessions  []SessionSummary `json:"sessions,omitempty"`
-	OutboxMin string           `json:"outbox_min,omitempty"`
-	OutboxMax string           `json:"outbox_max,omitempty"`
-	Gap       bool             `json:"gap,omitempty"`
+	DaemonID  string                  `json:"daemon_id"`
+	Part      int                     `json:"part,omitempty"`
+	Chunked   bool                    `json:"chunked,omitempty"`
+	Final     bool                    `json:"final,omitempty"`
+	Sessions  []SessionSummary        `json:"sessions,omitempty"`
+	History   []HistorySessionSummary `json:"history,omitempty"`
+	OutboxMin string                  `json:"outbox_min,omitempty"`
+	OutboxMax string                  `json:"outbox_max,omitempty"`
+	Gap       bool                    `json:"gap,omitempty"`
 }
 
 type SessionCreatePayload struct {
-	SessionID      string `json:"session_id"`
+	SessionID      string `json:"session_id,omitempty"`
 	CoordinationID string `json:"coordination_id,omitempty"`
 	Workspace      string `json:"workspace"`
 	DisplayName    string `json:"display_name,omitempty"`
 	Role           string `json:"role,omitempty"`
+	Agent          string `json:"agent,omitempty"`
 	ResumeID       string `json:"resume_id,omitempty"`
 }
 
 type SessionCreatedPayload struct {
-	SessionID       string          `json:"session_id"`
+	SessionID      string `json:"session_id"`
+	DaemonID       string `json:"daemon_id,omitempty"`
+	Agent          string `json:"agent,omitempty"`
+	AgentSessionID string `json:"agent_session_id,omitempty"`
+	// Deprecated compatibility field.
 	ClaudeSessionID string          `json:"claude_session_id,omitempty"`
 	PID             int             `json:"pid,omitempty"`
 	HistoryPath     string          `json:"history_path,omitempty"`
@@ -121,7 +152,11 @@ type SessionCreatedPayload struct {
 }
 
 type SessionUpdatePayload struct {
-	SessionID       string `json:"session_id"`
+	SessionID      string `json:"session_id"`
+	DaemonID       string `json:"daemon_id,omitempty"`
+	Agent          string `json:"agent,omitempty"`
+	AgentSessionID string `json:"agent_session_id,omitempty"`
+	// Deprecated compatibility field.
 	ClaudeSessionID string `json:"claude_session_id,omitempty"`
 	State           string `json:"state"`
 	Connection      string `json:"connection,omitempty"`
@@ -162,6 +197,16 @@ type InputPayload struct {
 }
 
 type InputResultPayload struct {
+	SessionID string `json:"session_id"`
+	Accepted  bool   `json:"accepted"`
+	Error     string `json:"error,omitempty"`
+}
+
+type StopPayload struct {
+	SessionID string `json:"session_id"`
+}
+
+type StopResultPayload struct {
 	SessionID string `json:"session_id"`
 	Accepted  bool   `json:"accepted"`
 	Error     string `json:"error,omitempty"`

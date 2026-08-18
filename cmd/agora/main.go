@@ -74,7 +74,7 @@ func serve() error {
 	if addr == "" {
 		addr = "127.0.0.1:8080"
 	}
-	srv := server.New(addr, database, manager)
+	srv := server.NewWithWebDir(addr, database, manager, os.Getenv("AGORA_WEB_DIR"))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

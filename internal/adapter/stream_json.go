@@ -51,7 +51,11 @@ func ParseStreamEvent(sessionID string, data []byte) (TurnEvent, error) {
 	if raw.Type == "result" && content == "" {
 		content = raw.Result
 	}
-	return TurnEvent{Event: event.Event{ID: newID(), ExternalID: raw.UUID, SessionID: sessionID, Source: event.SourceStream, Kind: kind, Type: streamEventType(raw.Type, kind), Role: streamEventRole(raw.Type), Subtype: raw.Subtype, Content: content, Summary: summarize(content), IsError: raw.IsError || kind == event.KindError, RawJSON: string(data), CreatedAt: now()}, Done: raw.Type == "result"}, nil
+	identity := raw.UUID
+	if identity == "" {
+		identity = fmt.Sprintf("line-%x", stableHash(data))
+	}
+	return TurnEvent{Event: event.Event{ID: stableEventID(sessionID, identity), ExternalID: raw.UUID, SessionID: sessionID, Source: event.SourceStream, Kind: kind, Type: streamEventType(raw.Type, kind), Role: streamEventRole(raw.Type), Subtype: raw.Subtype, Content: content, Summary: summarize(content), IsError: raw.IsError || kind == event.KindError, RawJSON: string(data), CreatedAt: now()}, Done: raw.Type == "result"}, nil
 }
 
 func streamEventType(rawType, kind string) string {
@@ -86,5 +90,3 @@ func streamEventRole(rawType string) string {
 }
 
 func now() time.Time { return time.Now().UTC() }
-
-func newID() string { return fmt.Sprintf("evt-%d", time.Now().UnixNano()) }

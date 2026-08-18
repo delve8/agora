@@ -40,7 +40,7 @@ func createWrapperSession() (string, error) {
 	}
 	base := filepath.Base(workspace)
 	if base == "." || base == string(filepath.Separator) || base == "" {
-		base = "Claude Code"
+		base = "New session"
 	}
 	apiBase := agoraAPIBase()
 	stateResp, err := http.Get(apiBase + "/api/state")

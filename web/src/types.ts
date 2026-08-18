@@ -10,15 +10,19 @@ export type Capabilities = {
   can_resume: boolean;
   can_approve: boolean;
   can_read_history: boolean;
+  can_read_terminal: boolean;
 };
 export type Session = {
   id: string;
   coordination_id: string;
+  daemon_id?: string;
   agent: string;
-  external_id: string;
+  agent_session_id?: string;
+  /** @deprecated use agent_session_id */
   claude_session_id?: string;
   workspace: string;
   display_name: string;
+  display_name_source?: "initial" | "custom" | "first_user" | "ai_title";
   role: string;
   state: string;
   source: string;

@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,7 +21,6 @@ import (
 	"github.com/delve8/agora/internal/protocol"
 	"github.com/delve8/agora/internal/runtime"
 	"github.com/delve8/agora/internal/session"
-	"github.com/delve8/agora/internal/store"
 )
 
 type Config struct {
@@ -28,7 +29,6 @@ type Config struct {
 	ServerURL      string
 	Credential     string
 	CredentialPath string
-	DatabasePath   string
 	ClaudeBinary   string
 	HomeDir        string
 	Heartbeat      time.Duration
@@ -36,20 +36,21 @@ type Config struct {
 }
 
 type Daemon struct {
-	config  Config
-	store   *store.Store
-	manager *runtime.Manager
-	connMu  sync.Mutex
-	writeMu sync.Mutex
-	conn    *websocket.Conn
-	outbox  *outbox
-	eventMu sync.Mutex
-	events  map[string]context.CancelFunc
+	config          Config
+	manager         *runtime.Manager
+	connMu          sync.Mutex
+	writeMu         sync.Mutex
+	conn            *websocket.Conn
+	outbox          *outbox
+	eventMu         sync.Mutex
+	events          map[string]context.CancelFunc
+	historyMu       sync.RWMutex
+	historySessions []session.Session
 }
 
 func New(config Config) (*Daemon, error) {
 	if config.ID == "" {
-		config.ID = protocol.NewID("daemon")
+		return nil, errors.New("daemon id is required")
 	}
 	if config.Version == "" {
 		config.Version = "dev"
@@ -60,12 +61,13 @@ func New(config Config) (*Daemon, error) {
 	if config.OutboxLimit <= 0 {
 		config.OutboxLimit = 256
 	}
-	db, err := store.Open(config.DatabasePath)
-	if err != nil {
-		return nil, err
-	}
-	manager := runtime.NewManager(db, adapter.NewClaudeCodeAdapter(config.ClaudeBinary), runtime.NewPTYManager(config.ClaudeBinary, config.HomeDir))
-	return &Daemon{config: config, store: db, manager: manager, outbox: newOutbox(config.OutboxLimit), events: make(map[string]context.CancelFunc)}, nil
+	manager := runtime.NewManager(runtime.NewMemoryStore(), adapter.NewClaudeCodeAdapter(config.ClaudeBinary), runtime.NewPTYManager(config.ClaudeBinary, config.HomeDir))
+	daemon := &Daemon{config: config, manager: manager, outbox: newOutbox(config.OutboxLimit), events: make(map[string]context.CancelFunc)}
+	manager.SetSessionExitHandler(func(value session.Session, exited runtime.PTYExit) {
+		daemon.stopEventBridge(value.ID)
+		_ = daemon.send(protocol.SessionExit, protocol.ExitPayload{SessionID: value.ID, State: value.State, ExitCode: exited.ExitCode, LastError: value.LastError})
+	})
+	return daemon, nil
 }
 
 func (d *Daemon) Close() error {
@@ -77,9 +79,6 @@ func (d *Daemon) Close() error {
 	d.eventMu.Unlock()
 	if d.manager != nil {
 		d.manager.Close()
-	}
-	if d.store != nil {
-		return d.store.Close()
 	}
 	return nil
 }
@@ -94,7 +93,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err := d.manager.ResumeManagedSessions(ctx); err != nil {
 		return err
 	}
-	values, err := d.store.ListSessions(ctx, "")
+	values, err := d.manager.ListSessions(context.Background(), "")
 	if err != nil {
 		return err
 	}
@@ -103,22 +102,72 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.startEventBridge(value)
 		}
 	}
+	go d.discoverHistory(ctx)
+	var retryAttempt int
 	for {
 		if err := d.connect(ctx); err != nil {
-			select {
-			case <-ctx.Done():
+			if ctx.Err() != nil {
 				return ctx.Err()
-			case <-time.After(time.Second):
+			}
+			delay := reconnectDelay(retryAttempt)
+			retryAttempt++
+			log.Printf("agora daemon: connect to %s failed: %v; retrying in %s", d.config.ServerURL, err, delay)
+			if err := waitReconnect(ctx, delay); err != nil {
+				return err
 			}
 			continue
 		}
+		retryAttempt = 0
+		log.Printf("agora daemon: connected to %s", d.config.ServerURL)
 		if err := d.session(ctx); err != nil {
-			select {
-			case <-ctx.Done():
+			if ctx.Err() != nil {
 				return ctx.Err()
-			case <-time.After(time.Second):
+			}
+			delay := reconnectDelay(retryAttempt)
+			retryAttempt++
+			log.Printf("agora daemon: disconnected: %v; reconnecting in %s", err, delay)
+			if err := waitReconnect(ctx, delay); err != nil {
+				return err
 			}
 		}
+	}
+}
+
+func (d *Daemon) discoverHistory(ctx context.Context) {
+	log.Printf("agora daemon: indexing local Claude history")
+	values, err := d.manager.DiscoverHistorySessions(ctx, "", d.config.ID)
+	if err != nil {
+		if ctx.Err() == nil {
+			log.Printf("agora daemon: history discovery failed: %v", err)
+		}
+		return
+	}
+	d.historyMu.Lock()
+	d.historySessions = values
+	d.historyMu.Unlock()
+	log.Printf("agora daemon: indexed %d history sessions", len(values))
+	if err := d.sendResync(); err != nil && ctx.Err() == nil {
+		log.Printf("agora daemon: history resync deferred: %v", err)
+	}
+}
+func reconnectDelay(attempt int) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+	if attempt > 5 {
+		attempt = 5
+	}
+	return time.Duration(1<<attempt) * time.Second
+}
+
+func waitReconnect(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 
@@ -131,7 +180,7 @@ func (d *Daemon) connect(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	conn.SetReadLimit(1 << 20)
+	conn.SetReadLimit(protocol.MaxFrameSize)
 	d.connMu.Lock()
 	d.conn = conn
 	d.connMu.Unlock()
@@ -140,9 +189,10 @@ func (d *Daemon) connect(ctx context.Context) error {
 
 func (d *Daemon) session(ctx context.Context) error {
 	defer d.disconnect()
-	if err := d.send(protocol.DaemonRegister, protocol.DaemonRegisterPayload{DaemonID: d.config.ID, Version: d.config.Version, Hostname: hostname(), Capabilities: map[string]bool{"can_start": true, "can_attach": true, "can_observe": true, "can_send_input": true, "can_stream": true, "can_resume": true, "can_approve": false, "can_read_history": true}}); err != nil {
+	if err := d.send(protocol.DaemonRegister, protocol.DaemonRegisterPayload{DaemonID: d.config.ID, Version: d.config.Version, Hostname: hostname(), Capabilities: map[string]bool{"can_start": true, "can_attach": true, "can_observe": true, "can_send_input": true, "can_stream": true, "can_interrupt": true, "can_resume": true, "can_approve": false, "can_read_history": true}}); err != nil {
 		return err
 	}
+	log.Printf("agora daemon: registered as %s", d.config.ID)
 	if err := d.flushOutbox(); err != nil {
 		return err
 	}
@@ -152,6 +202,7 @@ func (d *Daemon) session(ctx context.Context) error {
 	go func() {
 		ticker := time.NewTicker(d.config.Heartbeat)
 		defer ticker.Stop()
+		heartbeats := 0
 		for {
 			select {
 			case <-heartbeatCtx.Done():
@@ -164,8 +215,17 @@ func (d *Daemon) session(ctx context.Context) error {
 				return
 			case <-ticker.C:
 				if err := d.send(protocol.DaemonHeartbeat, protocol.HeartbeatPayload{DaemonID: d.config.ID, At: time.Now().UTC()}); err != nil {
+					d.disconnect()
 					heartbeatDone <- err
 					return
+				}
+				heartbeats++
+				if heartbeats%4 == 0 {
+					if err := d.sendResync(); err != nil {
+						d.disconnect()
+						heartbeatDone <- err
+						return
+					}
 				}
 			}
 		}
@@ -218,8 +278,44 @@ func (d *Daemon) handle(frame protocol.Envelope) error {
 		if err := protocol.DecodePayload(frame, &payload); err != nil {
 			return err
 		}
-		value, err := d.manager.CreateManagedSessionWithID(context.Background(), payload.SessionID, payload.CoordinationID, payload.Workspace, payload.DisplayName, payload.Role)
-		created := protocol.SessionCreatedPayload{SessionID: payload.SessionID}
+		var value session.Session
+		var err error
+		agent := payload.Agent
+		if agent == "" {
+			agent = "claude"
+		}
+		if payload.ResumeID != "" {
+			identity, identityErr := session.ParseSessionID(payload.SessionID)
+			if identityErr != nil {
+				err = identityErr
+			} else if identity.DaemonID != d.config.ID || identity.Agent != agent {
+				err = fmt.Errorf("session %s is not owned by daemon %s", payload.SessionID, d.config.ID)
+			} else {
+				value = session.Session{ID: payload.SessionID, CoordinationID: payload.CoordinationID, DaemonID: identity.DaemonID, Agent: identity.Agent, AgentSessionID: identity.AgentSessionID, Workspace: payload.Workspace, DisplayName: payload.DisplayName, Role: payload.Role, State: session.StateStarting, Source: session.SourceManaged, Capabilities: session.Capabilities{CanStart: true, CanResume: true, CanReadHistory: true}}
+				value.ClaudeSessionID = strings.TrimPrefix(identity.AgentSessionID, "claude://")
+				value, err = d.manager.ResumeSession(context.Background(), value)
+			}
+		} else {
+			provisional := "pending/" + protocol.NewID("session")
+			value, err = d.manager.CreateManagedSessionWithID(context.Background(), provisional, payload.CoordinationID, payload.Workspace, payload.DisplayName, payload.Role)
+			if err == nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				nativeID, waitErr := d.manager.WaitAgentSessionID(ctx, provisional)
+				cancel()
+				if waitErr != nil {
+					err = waitErr
+				} else {
+					uri := agent + "://" + nativeID
+					canonicalID, identityErr := session.NewSessionID(d.config.ID, agent, uri)
+					if identityErr != nil {
+						err = identityErr
+					} else if value, err = d.manager.SetAgentIdentity(context.Background(), provisional, agent, uri); err == nil {
+						value, err = d.manager.RekeySession(context.Background(), provisional, canonicalID)
+					}
+				}
+			}
+		}
+		created := protocol.SessionCreatedPayload{SessionID: value.ID, DaemonID: d.config.ID, Agent: value.Agent, AgentSessionID: value.AgentSessionID}
 		if err != nil {
 			created.Error = err.Error()
 			return d.sendResponse(protocol.SessionCreated, created, frame.RequestID)
@@ -227,20 +323,20 @@ func (d *Daemon) handle(frame protocol.Envelope) error {
 		created.PID = value.ProcessID
 		created.ClaudeSessionID = value.ClaudeSessionID
 		created.HistoryPath = value.HistoryPath
-		created.Capabilities = map[string]bool{"can_start": true, "can_attach": true, "can_observe": true, "can_send_input": true, "can_stream": true, "can_resume": true, "can_approve": false, "can_read_history": true}
+		created.Capabilities = map[string]bool{"can_start": true, "can_attach": true, "can_observe": true, "can_send_input": true, "can_stream": true, "can_interrupt": true, "can_resume": true, "can_approve": false, "can_read_history": true, "can_read_terminal": true}
 		if err := d.sendResponse(protocol.SessionCreated, created, frame.RequestID); err != nil {
 			return err
 		}
 		d.startEventBridge(value)
-		return d.send(protocol.SessionUpdate, protocol.SessionUpdatePayload{SessionID: payload.SessionID, ClaudeSessionID: value.ClaudeSessionID, State: value.State, Connection: value.Connection, PID: value.ProcessID, LastError: value.LastError})
+		return d.send(protocol.SessionUpdate, protocol.SessionUpdatePayload{SessionID: value.ID, DaemonID: d.config.ID, Agent: value.Agent, AgentSessionID: value.AgentSessionID, ClaudeSessionID: value.ClaudeSessionID, State: value.State, Connection: value.Connection, PID: value.ProcessID, LastError: value.LastError})
 	case protocol.SessionInput:
 		var payload protocol.InputPayload
 		if err := protocol.DecodePayload(frame, &payload); err != nil {
 			return err
 		}
-		value := mustSession(d.store, payload.SessionID)
+		value, valueErr := d.manager.GetSession(context.Background(), payload.SessionID)
 		result := protocol.InputResultPayload{SessionID: payload.SessionID}
-		if value.ID == "" {
+		if valueErr != nil {
 			result.Error = fmt.Sprintf("session %s not found", payload.SessionID)
 		} else if err := d.manager.Send(context.Background(), value, messageForInput(payload.Content)); err != nil {
 			result.Error = err.Error()
@@ -248,30 +344,55 @@ func (d *Daemon) handle(frame protocol.Envelope) error {
 			result.Accepted = true
 		}
 		return d.sendResponse(protocol.SessionInputResult, result, frame.RequestID)
+	case protocol.SessionStop:
+		var payload protocol.StopPayload
+		if err := protocol.DecodePayload(frame, &payload); err != nil {
+			return err
+		}
+		value, valueErr := d.manager.GetSession(context.Background(), payload.SessionID)
+		result := protocol.StopResultPayload{SessionID: payload.SessionID}
+		if valueErr != nil {
+			result.Error = fmt.Sprintf("session %s not found", payload.SessionID)
+		} else if err := d.manager.StopSession(value); err != nil {
+			result.Error = err.Error()
+		} else {
+			result.Accepted = true
+		}
+		return d.sendResponse(protocol.SessionStopResult, result, frame.RequestID)
 	case protocol.SessionHistoryRequest:
+		log.Printf("agora daemon: history request for %s", frame.RequestID)
 		var payload protocol.HistoryRequestPayload
 		if err := protocol.DecodePayload(frame, &payload); err != nil {
 			return err
 		}
 		response := protocol.HistoryResponsePayload{SessionID: payload.SessionID}
-		values, err := d.store.ListEvents(context.Background(), payload.SessionID)
-		if err != nil {
-			response.Error = err.Error()
-		} else {
-			limit := payload.Limit
-			if limit <= 0 || limit > len(values) {
-				limit = len(values)
-			}
-			if limit < len(values) {
-				values = values[len(values)-limit:]
-			}
-			body, marshalErr := json.Marshal(values)
-			if marshalErr != nil {
-				response.Error = marshalErr.Error()
-			} else {
-				response.Events = body
+		value, valueErr := d.manager.GetSession(context.Background(), payload.SessionID)
+		if valueErr != nil {
+			d.historyMu.RLock()
+			historySessions := append([]session.Session(nil), d.historySessions...)
+			d.historyMu.RUnlock()
+			for _, discovered := range historySessions {
+				if discovered.ID == payload.SessionID {
+					value = discovered
+					valueErr = nil
+					break
+				}
 			}
 		}
+		var values []event.Event
+		if valueErr != nil {
+			valueErr = fmt.Errorf("history session %s not found", payload.SessionID)
+		} else {
+			values, valueErr = d.manager.HistoryForSession(context.Background(), value, payload.Limit)
+		}
+		if valueErr != nil {
+			response.Error = valueErr.Error()
+		} else if body, marshalErr := json.Marshal(values); marshalErr != nil {
+			response.Error = marshalErr.Error()
+		} else {
+			response.Events = body
+		}
+		log.Printf("agora daemon: history response %s events=%d error=%q", frame.RequestID, len(values), response.Error)
 		return d.sendResponse(protocol.SessionHistoryResponse, response, frame.RequestID)
 	case protocol.SnapshotRequest:
 		var payload protocol.SnapshotPayload
@@ -293,24 +414,86 @@ func (d *Daemon) handle(frame protocol.Envelope) error {
 }
 
 func (d *Daemon) sendResync() error {
-	values, err := d.store.ListSessions(context.Background(), "")
+	values, err := d.manager.ListSessions(context.Background(), "")
 	if err != nil {
 		return err
 	}
 	payload := protocol.ResyncPayload{DaemonID: d.config.ID, Gap: d.outbox.Gap()}
+	managedClaudeIDs := make(map[string]struct{})
 	for _, value := range values {
 		if value.Source != session.SourceManaged {
 			continue
 		}
+		if value.ClaudeSessionID != "" {
+			managedClaudeIDs[value.ClaudeSessionID] = struct{}{}
+		}
+		if value.AgentSessionID == "" && value.ClaudeSessionID != "" {
+			value.AgentSessionID = "claude://" + value.ClaudeSessionID
+		}
 		payload.Sessions = append(payload.Sessions, protocol.SessionSummary{
-			SessionID:       value.ID,
-			ClaudeSessionID: value.ClaudeSessionID,
-			State:           value.State,
-			Connection:      value.Connection,
-			PID:             value.ProcessID,
+			SessionID: value.ID, DaemonID: d.config.ID, Agent: value.Agent,
+			AgentSessionID: value.AgentSessionID, ClaudeSessionID: value.ClaudeSessionID,
+			State: value.State, Connection: value.Connection, PID: value.ProcessID,
 		})
 	}
-	return d.send(protocol.DaemonResync, payload)
+	d.historyMu.RLock()
+	historySessions := append([]session.Session(nil), d.historySessions...)
+	d.historyMu.RUnlock()
+	for _, value := range historySessions {
+		if _, exists := managedClaudeIDs[value.AgentSessionID]; exists {
+			continue
+		}
+		payload.History = append(payload.History, protocol.HistorySessionSummary{SessionID: value.ID, DaemonID: d.config.ID, Agent: value.Agent, AgentSessionID: value.AgentSessionID, ClaudeSessionID: value.ClaudeSessionID, Workspace: value.Workspace, DisplayName: value.DisplayName, DisplayNameSource: value.DisplayNameSource, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt})
+	}
+	parts := splitResync(payload)
+	for index := range parts {
+		parts[index].Part = index
+		parts[index].Chunked = len(parts) > 1
+		parts[index].Final = index == len(parts)-1
+		if err := d.send(protocol.DaemonResync, parts[index]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+const resyncPartBudget = 512 * 1024
+
+func splitResync(payload protocol.ResyncPayload) []protocol.ResyncPayload {
+	all := make([]protocol.ResyncPayload, 0, len(payload.Sessions)+len(payload.History))
+	for _, value := range payload.Sessions {
+		all = append(all, protocol.ResyncPayload{DaemonID: payload.DaemonID, Sessions: []protocol.SessionSummary{value}, Gap: payload.Gap})
+	}
+	for _, value := range payload.History {
+		all = append(all, protocol.ResyncPayload{DaemonID: payload.DaemonID, History: []protocol.HistorySessionSummary{value}, Gap: payload.Gap})
+	}
+	if len(all) == 0 {
+		return []protocol.ResyncPayload{{DaemonID: payload.DaemonID, Gap: payload.Gap}}
+	}
+	parts := make([]protocol.ResyncPayload, 0)
+	current := protocol.ResyncPayload{DaemonID: payload.DaemonID, Gap: payload.Gap}
+	for _, item := range all {
+		candidate := current
+		candidate.Sessions = append(append([]protocol.SessionSummary(nil), current.Sessions...), item.Sessions...)
+		candidate.History = append(append([]protocol.HistorySessionSummary(nil), current.History...), item.History...)
+		body, _ := json.Marshal(candidate)
+		if len(body) > resyncPartBudget && (len(current.Sessions) > 0 || len(current.History) > 0) {
+			parts = append(parts, current)
+			current = item
+			continue
+		}
+		current = candidate
+	}
+	return append(parts, current)
+}
+
+func (d *Daemon) stopEventBridge(id string) {
+	d.eventMu.Lock()
+	if cancel := d.events[id]; cancel != nil {
+		cancel()
+		delete(d.events, id)
+	}
+	d.eventMu.Unlock()
 }
 
 func (d *Daemon) startEventBridge(value session.Session) {
@@ -384,6 +567,7 @@ func (d *Daemon) sendFrame(frame protocol.Envelope) error {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 	if err := conn.WriteJSON(frame); err != nil {
+		d.disconnect()
 		d.outbox.Add(frame)
 		return err
 	}
@@ -423,14 +607,6 @@ func (d *Daemon) disconnect() {
 
 func hostname() string {
 	value, _ := os.Hostname()
-	return value
-}
-
-func mustSession(db *store.Store, id string) session.Session {
-	value, err := db.GetSession(context.Background(), id)
-	if err != nil {
-		return session.Session{}
-	}
 	return value
 }
 

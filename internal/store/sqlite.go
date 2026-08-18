@@ -13,7 +13,6 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/delve8/agora/internal/coordination"
-	"github.com/delve8/agora/internal/event"
 	"github.com/delve8/agora/internal/message"
 	"github.com/delve8/agora/internal/session"
 )
@@ -60,12 +59,9 @@ func (s *Store) migrate(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS coordinations (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, coordination_id TEXT NOT NULL, agent TEXT NOT NULL, external_id TEXT NOT NULL, workspace TEXT NOT NULL, display_name TEXT NOT NULL, role TEXT NOT NULL, state TEXT NOT NULL, capabilities_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY (coordination_id) REFERENCES coordinations(id));
-CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, subtype TEXT NOT NULL, content TEXT NOT NULL, raw_json TEXT NOT NULL, created_at TEXT NOT NULL, FOREIGN KEY (session_id) REFERENCES sessions(id));
 CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, coordination_id TEXT NOT NULL, sender_type TEXT NOT NULL, sender_id TEXT NOT NULL, recipient_type TEXT NOT NULL, recipient_id TEXT NOT NULL, content TEXT NOT NULL, reply_to TEXT NOT NULL, status TEXT NOT NULL, error TEXT NOT NULL, created_at TEXT NOT NULL, FOREIGN KEY (coordination_id) REFERENCES coordinations(id));
 CREATE TABLE IF NOT EXISTS observation_cursors (session_id TEXT PRIMARY KEY, path TEXT NOT NULL, byte_offset INTEGER NOT NULL DEFAULT 0, line INTEGER NOT NULL DEFAULT 0, last_id TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, FOREIGN KEY (session_id) REFERENCES sessions(id));
-CREATE INDEX IF NOT EXISTS events_session_created ON events(session_id, created_at);
 CREATE INDEX IF NOT EXISTS messages_coord_created ON messages(coordination_id, created_at);
-UPDATE events SET session_id = (SELECT sessions.id FROM sessions WHERE sessions.external_id = events.session_id) WHERE EXISTS (SELECT 1 FROM sessions WHERE sessions.external_id = events.session_id);
 `)
 	if err != nil {
 		return err
@@ -80,14 +76,15 @@ UPDATE events SET session_id = (SELECT sessions.id FROM sessions WHERE sessions.
 		`ALTER TABLE sessions ADD COLUMN last_discovered_at TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sessions ADD COLUMN last_observed_at TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sessions ADD COLUMN last_error TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE events ADD COLUMN external_id TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE events ADD COLUMN source TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN display_name_source TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN daemon_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN agent_session_id TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, alterErr := s.db.ExecContext(ctx, statement); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column") {
 			return alterErr
 		}
 	}
-	_, err = s.db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS events_session_source_external ON events(session_id, source, external_id) WHERE external_id != ''`)
+	_, err = s.db.ExecContext(ctx, `DROP TABLE IF EXISTS events`)
 	return err
 }
 
@@ -165,15 +162,18 @@ func (s *Store) CreateSession(ctx context.Context, v session.Session) error {
 	if v.Source == "" {
 		v.Source = session.SourceManaged
 	}
+	if v.DisplayNameSource == "" {
+		v.DisplayNameSource = session.InitialDisplayNameSource(v.DisplayName)
+	}
 	return s.withBusyRetry(ctx, func() error {
-		_, err = s.db.ExecContext(ctx, `INSERT INTO sessions(id,coordination_id,agent,external_id,claude_session_id,workspace,display_name,role,state,source,connection,process_id,session_meta_path,history_path,last_discovered_at,last_observed_at,last_error,capabilities_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, v.ID, v.CoordinationID, v.Agent, v.ExternalID, v.ClaudeSessionID, v.Workspace, v.DisplayName, v.Role, v.State, v.Source, v.Connection, v.ProcessID, v.SessionMetaPath, v.HistoryPath, formatOptionalTime(v.LastDiscoveredAt), formatOptionalTime(v.LastObservedAt), v.LastError, string(caps), v.CreatedAt.UTC().Format(timeFormat), v.UpdatedAt.UTC().Format(timeFormat))
+		_, err = s.db.ExecContext(ctx, `INSERT INTO sessions(id,coordination_id,agent,external_id,claude_session_id,workspace,display_name,display_name_source,role,state,source,connection,process_id,session_meta_path,history_path,last_discovered_at,last_observed_at,last_error,capabilities_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, v.ID, v.CoordinationID, v.Agent, v.ExternalID, v.ClaudeSessionID, v.Workspace, v.DisplayName, v.DisplayNameSource, v.Role, v.State, v.Source, v.Connection, v.ProcessID, v.SessionMetaPath, v.HistoryPath, formatOptionalTime(v.LastDiscoveredAt), formatOptionalTime(v.LastObservedAt), v.LastError, string(caps), v.CreatedAt.UTC().Format(timeFormat), v.UpdatedAt.UTC().Format(timeFormat))
 		return err
 	})
 }
 func (s *Store) GetSession(ctx context.Context, id string) (session.Session, error) {
 	var v session.Session
 	var caps, t, u, discovered, observed string
-	err := s.db.QueryRowContext(ctx, `SELECT id,coordination_id,agent,external_id,claude_session_id,workspace,display_name,role,state,source,connection,process_id,session_meta_path,history_path,last_discovered_at,last_observed_at,last_error,capabilities_json,created_at,updated_at FROM sessions WHERE id=?`, id).Scan(&v.ID, &v.CoordinationID, &v.Agent, &v.ExternalID, &v.ClaudeSessionID, &v.Workspace, &v.DisplayName, &v.Role, &v.State, &v.Source, &v.Connection, &v.ProcessID, &v.SessionMetaPath, &v.HistoryPath, &discovered, &observed, &v.LastError, &caps, &t, &u)
+	err := s.db.QueryRowContext(ctx, `SELECT id,coordination_id,agent,external_id,claude_session_id,workspace,display_name,display_name_source,role,state,source,connection,process_id,session_meta_path,history_path,last_discovered_at,last_observed_at,last_error,capabilities_json,created_at,updated_at FROM sessions WHERE id=?`, id).Scan(&v.ID, &v.CoordinationID, &v.Agent, &v.ExternalID, &v.ClaudeSessionID, &v.Workspace, &v.DisplayName, &v.DisplayNameSource, &v.Role, &v.State, &v.Source, &v.Connection, &v.ProcessID, &v.SessionMetaPath, &v.HistoryPath, &discovered, &observed, &v.LastError, &caps, &t, &u)
 	if err != nil {
 		return v, err
 	}
@@ -233,6 +233,22 @@ func (s *Store) ListSessions(ctx context.Context, cid string) ([]session.Session
 	}
 	return result, nil
 }
+func (s *Store) DeleteSession(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE id=?`, id)
+	return err
+}
+
+func (s *Store) RekeySession(ctx context.Context, oldID string, value session.Session) error {
+	return fmt.Errorf("server store does not support runtime session rekey")
+}
+
+func (s *Store) UpdateSessionDisplayName(ctx context.Context, id, displayName, source string) error {
+	return s.withBusyRetry(ctx, func() error {
+		_, err := s.db.ExecContext(ctx, `UPDATE sessions SET display_name=?,display_name_source=?,updated_at=? WHERE id=?`, displayName, source, nowString(), id)
+		return err
+	})
+}
+
 func (s *Store) UpdateSessionState(ctx context.Context, id, state string) error {
 	return s.withBusyRetry(ctx, func() error {
 		_, err := s.db.ExecContext(ctx, `UPDATE sessions SET state=?,updated_at=? WHERE id=?`, state, nowString(), id)
@@ -256,58 +272,6 @@ func (s *Store) FindSessionByExternal(ctx context.Context, workspace, externalID
 	return s.GetSession(ctx, id)
 }
 
-func (s *Store) HasEvent(ctx context.Context, sessionID, source, externalID string) (bool, error) {
-	var value int
-	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM events WHERE session_id=? AND source=? AND external_id=? LIMIT 1`, sessionID, source, externalID).Scan(&value)
-	if err == sql.ErrNoRows {
-		return false, nil
-	}
-	return err == nil, err
-}
-
-func (s *Store) AppendEvent(ctx context.Context, v event.Event) error {
-	return s.withBusyRetry(ctx, func() error {
-		_, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO events(id,session_id,kind,subtype,content,raw_json,external_id,source,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, v.ID, v.SessionID, v.Kind, v.Subtype, v.Content, v.RawJSON, v.ExternalID, v.Source, v.CreatedAt.UTC().Format(timeFormat))
-		return err
-	})
-}
-
-// CountEvents reports the number of persisted events for a session. Used to
-// detect when a managed turn produced new output.
-func (s *Store) CountEvents(ctx context.Context, sessionID string) (int, error) {
-	var count int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE session_id=?`, sessionID).Scan(&count)
-	return count, err
-}
-func (s *Store) ListEvents(ctx context.Context, sid string) ([]event.Event, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,session_id,kind,subtype,content,raw_json,external_id,source,created_at FROM events WHERE session_id=? ORDER BY created_at`, sid)
-	if err != nil {
-		return nil, err
-	}
-	result := make([]event.Event, 0)
-	for rows.Next() {
-		var v event.Event
-		var t string
-		if err := rows.Scan(&v.ID, &v.SessionID, &v.Kind, &v.Subtype, &v.Content, &v.RawJSON, &v.ExternalID, &v.Source, &t); err != nil {
-			_ = rows.Close()
-			return nil, err
-		}
-		v.CreatedAt, err = parseTime(t)
-		if err != nil {
-			_ = rows.Close()
-			return nil, err
-		}
-		result = append(result, v)
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return nil, err
-	}
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
-	return result, nil
-}
 func (s *Store) GetObservationCursor(ctx context.Context, sessionID string) (ObservationCursor, error) {
 	var cursor ObservationCursor
 	var updated string

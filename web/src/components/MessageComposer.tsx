@@ -12,7 +12,18 @@ export function MessageComposer({ disabled, onSend }: { disabled: boolean; onSen
     try { await onSend(value); setContent(""); } finally { setSending(false); }
   };
   return <div className="composer">
-    <Input.TextArea value={content} disabled={disabled || sending} onChange={(event) => setContent(event.target.value)} onPressEnter={(event) => { if ((event.metaKey || event.ctrlKey) && !event.shiftKey) { event.preventDefault(); void submit(); } }} placeholder={disabled ? "Create a Claude Code session first" : "Ask Claude Code something… (⌘/Ctrl + Enter)"} autoSize={{ minRows: 1, maxRows: 6 }} />
+    <Input.TextArea
+      value={content}
+      disabled={disabled || sending}
+      onChange={(event) => setContent(event.target.value)}
+      onKeyDown={(event) => {
+        if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) return;
+        event.preventDefault();
+        void submit();
+      }}
+      placeholder={disabled ? "Create a Claude Code session first" : "Ask Claude Code something… Enter to send · Shift + Enter for a new line"}
+      autoSize={{ minRows: 1, maxRows: 5 }}
+    />
     <Space align="end"><Button type="primary" icon={<SendOutlined />} loading={sending} onClick={() => void submit()} disabled={disabled || !content.trim()}>Send</Button></Space>
   </div>;
 }

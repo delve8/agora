@@ -6,10 +6,10 @@ const POLL_INTERVAL_MS = 750;
 
 type PTYSnapshotState = { snapshot: PTYSnapshot | null; error: string; loading: boolean };
 
-export function usePTYSnapshot(sessionId: string) {
+export function usePTYSnapshot(sessionId: string, enabled = true) {
   const [state, setState] = useState<PTYSnapshotState>({ snapshot: null, error: "", loading: false });
   useEffect(() => {
-    if (!sessionId) { setState({ snapshot: null, error: "", loading: false }); return; }
+    if (!sessionId || !enabled) { setState({ snapshot: null, error: "", loading: false }); return; }
     let cancelled = false;
     let timer: number | undefined;
     const controller = new AbortController();
@@ -27,6 +27,6 @@ export function usePTYSnapshot(sessionId: string) {
     };
     void poll();
     return () => { cancelled = true; controller.abort(); if (timer !== undefined) window.clearTimeout(timer); };
-  }, [sessionId]);
+  }, [sessionId, enabled]);
   return state;
 }

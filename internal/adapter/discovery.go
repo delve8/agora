@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -45,7 +46,7 @@ func parseStartedAt(raw json.RawMessage) time.Time {
 	}
 	return time.Time{}
 }
-func processAlive(pid int) bool {
+func ProcessAlive(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
@@ -79,17 +80,198 @@ func FindHistoryBySessionID(homeDir, sessionID string) string {
 		homeDir, _ = os.UserHomeDir()
 	}
 	projects := filepath.Join(homeDir, ".claude", "projects")
-	var match string
-	_ = filepath.WalkDir(projects, func(path string, entry os.DirEntry, err error) error {
-		if err != nil || entry.IsDir() || match != "" {
-			return nil
+	entries, err := os.ReadDir(projects)
+	if err != nil {
+		return ""
+	}
+	for _, project := range entries {
+		if !project.IsDir() {
+			continue
 		}
-		if filepath.Ext(entry.Name()) == ".jsonl" && strings.TrimSuffix(entry.Name(), ".jsonl") == sessionID {
-			match = path
+		path := filepath.Join(projects, project.Name(), sessionID+".jsonl")
+		if info, err := os.Stat(path); err == nil && !info.IsDir() {
+			return path
 		}
-		return nil
-	})
-	return match
+	}
+	return ""
+}
+
+type HistorySummary struct {
+	SessionID        string
+	Path             string
+	Workspace        string
+	FirstUser        string
+	LatestAITitle    string
+	FirstEventAt     time.Time
+	LastEventAt      time.Time
+	ModifiedAt       time.Time
+	Size             int64
+	ProjectDirectory string
+	Meaningful       bool
+}
+
+type cachedHistorySummary struct {
+	size       int64
+	modifiedAt time.Time
+	summary    HistorySummary
+}
+
+type HistoryCatalog struct {
+	homeDir string
+	mu      sync.Mutex
+	cache   map[string]cachedHistorySummary
+}
+
+func NewHistoryCatalog(homeDir string) *HistoryCatalog {
+	if homeDir == "" {
+		homeDir, _ = os.UserHomeDir()
+	}
+	return &HistoryCatalog{homeDir: homeDir, cache: make(map[string]cachedHistorySummary)}
+}
+
+func (c *HistoryCatalog) List(ctx context.Context) ([]HistorySummary, error) {
+	projects := filepath.Join(c.homeDir, ".claude", "projects")
+	projectEntries, err := os.ReadDir(projects)
+	if os.IsNotExist(err) {
+		return []HistorySummary{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	seen := make(map[string]struct{})
+	result := make([]HistorySummary, 0)
+	for _, project := range projectEntries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if !project.IsDir() {
+			continue
+		}
+		projectPath := filepath.Join(projects, project.Name())
+		entries, readErr := os.ReadDir(projectPath)
+		if readErr != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || filepath.Ext(entry.Name()) != ".jsonl" {
+				continue
+			}
+			path := filepath.Join(projectPath, entry.Name())
+			info, statErr := entry.Info()
+			if statErr != nil {
+				continue
+			}
+			seen[path] = struct{}{}
+			cached, ok := c.cache[path]
+			if ok && cached.size == info.Size() && cached.modifiedAt.Equal(info.ModTime()) {
+				if cached.summary.Meaningful {
+					result = append(result, cached.summary)
+				}
+				continue
+			}
+			summary, scanErr := scanHistorySummary(ctx, path, project.Name(), info)
+			if scanErr != nil {
+				continue
+			}
+			c.cache[path] = cachedHistorySummary{size: info.Size(), modifiedAt: info.ModTime(), summary: summary}
+			if summary.Meaningful {
+				result = append(result, summary)
+			}
+		}
+	}
+	for path := range c.cache {
+		if _, ok := seen[path]; !ok {
+			delete(c.cache, path)
+		}
+	}
+	return result, nil
+}
+
+func scanHistorySummary(ctx context.Context, path, projectDirectory string, info os.FileInfo) (HistorySummary, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return HistorySummary{}, err
+	}
+	defer file.Close()
+
+	summary := HistorySummary{
+		SessionID:        strings.TrimSuffix(filepath.Base(path), ".jsonl"),
+		Path:             path,
+		ModifiedAt:       info.ModTime().UTC(),
+		Size:             info.Size(),
+		ProjectDirectory: projectDirectory,
+	}
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
+	for scanner.Scan() {
+		if err := ctx.Err(); err != nil {
+			return HistorySummary{}, err
+		}
+		line := scanner.Bytes()
+		if !json.Valid(line) {
+			continue
+		}
+		var raw map[string]any
+		if err := json.Unmarshal(line, &raw); err != nil {
+			continue
+		}
+		if summary.Workspace == "" {
+			if cwd, _ := raw["cwd"].(string); strings.TrimSpace(cwd) != "" {
+				summary.Workspace = cwd
+			}
+		}
+		if value, _ := raw["sessionId"].(string); strings.TrimSpace(value) != "" {
+			summary.SessionID = value
+		}
+		createdAt, hasTimestamp := historyTimestamp(raw)
+		if hasTimestamp {
+			if summary.FirstEventAt.IsZero() || createdAt.Before(summary.FirstEventAt) {
+				summary.FirstEventAt = createdAt
+			}
+			if summary.LastEventAt.IsZero() || createdAt.After(summary.LastEventAt) {
+				summary.LastEventAt = createdAt
+			}
+		}
+		typ, _ := raw["type"].(string)
+		switch typ {
+		case "user":
+			isMeta, _ := raw["isMeta"].(bool)
+			if !isMeta && !messageHasBlockType(raw, "tool_result") {
+				if content := strings.TrimSpace(historyContent(raw)); content != "" {
+					if summary.FirstUser == "" {
+						summary.FirstUser = content
+					}
+					if !isExitOnlyHistoryInput(content) {
+						summary.Meaningful = true
+					}
+				}
+			}
+		case "message", "assistant":
+			if strings.TrimSpace(historyContent(raw)) != "" || messageHasBlockType(raw, "tool_use") {
+				summary.Meaningful = true
+			}
+		case "tool_use", "tool_result", "tool":
+			summary.Meaningful = true
+		case "ai-title":
+			if title, _ := raw["aiTitle"].(string); strings.TrimSpace(title) != "" {
+				summary.LatestAITitle = title
+				summary.Meaningful = true
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return HistorySummary{}, err
+	}
+	if summary.LastEventAt.IsZero() || summary.LastEventAt.After(time.Now().Add(24*time.Hour)) {
+		summary.LastEventAt = summary.ModifiedAt
+	}
+	if summary.FirstEventAt.IsZero() {
+		summary.FirstEventAt = summary.LastEventAt
+	}
+	return summary, nil
 }
 
 type HistoryCursor struct {
@@ -104,7 +286,7 @@ type HistoryRecord struct {
 	Cursor HistoryCursor
 }
 
-// ReadHistory reads complete JSONL records after cursor. An incomplete trailing line is retained.
+// ReadHistory reads complete JSONL records after cursor. Malformed lines are skipped.
 func ReadHistory(ctx context.Context, cursor HistoryCursor, sessionID string) ([]HistoryRecord, error) {
 	file, err := os.Open(cursor.Path)
 	if err != nil {
@@ -131,7 +313,14 @@ func ReadHistory(ctx context.Context, cursor HistoryCursor, sessionID string) ([
 			return nil, err
 		}
 		line := scanner.Bytes()
-		cursor.ByteOffset += int64(len(line)) + 1
+		nextOffset := cursor.ByteOffset + int64(len(line)) + 1
+		if nextOffset > info.Size() {
+			if !json.Valid(line) {
+				break
+			}
+			nextOffset = info.Size()
+		}
+		cursor.ByteOffset = nextOffset
 		cursor.Line++
 		if len(strings.TrimSpace(string(line))) == 0 {
 			continue
@@ -147,6 +336,34 @@ func ReadHistory(ctx context.Context, cursor HistoryCursor, sessionID string) ([
 		return nil, err
 	}
 	return result, nil
+}
+
+func ReadAllHistory(ctx context.Context, path, sessionID string, limit int) ([]event.Event, error) {
+	records, err := ReadHistory(ctx, HistoryCursor{Path: path}, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if limit > 0 && len(records) > limit {
+		records = records[len(records)-limit:]
+	}
+	values := make([]event.Event, 0, len(records))
+	for _, record := range records {
+		values = append(values, record.Event)
+	}
+	return values, nil
+}
+
+func FirstUserHistoryEvent(ctx context.Context, path, sessionID string) (event.Event, bool, error) {
+	records, err := ReadHistory(ctx, HistoryCursor{Path: path}, sessionID)
+	if err != nil {
+		return event.Event{}, false, err
+	}
+	for _, record := range records {
+		if record.Event.Kind == event.KindUser && strings.TrimSpace(record.Event.Content) != "" {
+			return record.Event, true, nil
+		}
+	}
+	return event.Event{}, false, nil
 }
 
 func ParseHistoryEvent(sessionID string, data []byte) (HistoryRecord, error) {
@@ -168,10 +385,22 @@ func ParseHistoryEvent(sessionID string, data []byte) (HistoryRecord, error) {
 		kind = event.KindAssistant
 		semanticType = "text"
 		role = "assistant"
+		if messageHasBlockType(raw, "tool_use") {
+			kind = event.KindTool
+			semanticType = "tool_call"
+			role = "tool"
+		} else if messageHasBlockType(raw, "thinking") && !messageHasBlockType(raw, "text") {
+			semanticType = "thinking"
+		}
 	case "user":
 		kind = event.KindUser
 		semanticType = "text"
 		role = "user"
+		if messageHasBlockType(raw, "tool_result") {
+			kind = event.KindTool
+			semanticType = "tool_result"
+			role = "tool"
+		}
 	case "tool_use":
 		kind = event.KindTool
 		semanticType = "tool_call"
@@ -186,24 +415,112 @@ func ParseHistoryEvent(sessionID string, data []byte) (HistoryRecord, error) {
 	case "system":
 		kind = event.KindSystem
 		semanticType = "status"
+	case "ai-title":
+		kind = event.KindAITitle
+		semanticType = "metadata"
+	}
+	if isMeta, _ := raw["isMeta"].(bool); isMeta {
+		kind = event.KindSystem
+		semanticType = "metadata"
+		role = "system"
 	}
 	if isError, _ := raw["is_error"].(bool); isError {
 		kind = event.KindError
 	}
 	content := historyContent(raw)
-	createdAt := time.Now().UTC()
-	for _, key := range []string{"timestamp", "created_at", "createdAt"} {
-		if value, ok := raw[key].(string); ok {
-			if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
-				createdAt = parsed
-				break
+	if typ == "ai-title" {
+		content, _ = raw["aiTitle"].(string)
+	}
+	toolName := ""
+	toolInput := ""
+	toolOutput := ""
+	thinking := ""
+	if semanticType == "tool_call" {
+		toolName, toolInput = messageToolCall(raw)
+	}
+	if semanticType == "tool_result" {
+		toolOutput = content
+		if result, ok := raw["toolUseResult"].(map[string]any); ok {
+			if _, isWebSearch := result["query"]; isWebSearch {
+				toolName = "WebSearch"
 			}
 		}
+	}
+	if semanticType == "thinking" {
+		thinking = content
+	}
+	createdAt := time.Now().UTC()
+	if value, ok := historyTimestamp(raw); ok {
+		createdAt = value
 	}
 	if externalID == "" {
 		externalID = fmt.Sprintf("line-%x", stableHash(data))
 	}
-	return HistoryRecord{Event: event.Event{ID: "evt-" + strconv.FormatInt(time.Now().UnixNano(), 10), ExternalID: externalID, SessionID: sessionID, Source: event.SourceHistory, Kind: kind, Type: semanticType, Role: role, Subtype: subtype, Content: content, Summary: summarize(content), IsError: kind == event.KindError, RawJSON: string(data), CreatedAt: createdAt}, Cursor: HistoryCursor{Path: ""}}, nil
+	return HistoryRecord{Event: event.Event{ID: stableEventID(sessionID, externalID), ExternalID: externalID, SessionID: sessionID, Source: event.SourceHistory, Kind: kind, Type: semanticType, Role: role, Subtype: subtype, Content: content, Summary: summarize(content), ToolName: toolName, ToolInput: toolInput, ToolOutput: toolOutput, Thinking: thinking, IsError: kind == event.KindError, RawJSON: string(data), CreatedAt: createdAt}, Cursor: HistoryCursor{Path: ""}}, nil
+}
+
+func historyTimestamp(raw map[string]any) (time.Time, bool) {
+	for _, key := range []string{"timestamp", "created_at", "createdAt"} {
+		if value, ok := raw[key].(string); ok {
+			if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
+				return parsed, true
+			}
+		}
+	}
+	return time.Time{}, false
+}
+
+func messageToolCall(raw map[string]any) (string, string) {
+	message, ok := raw["message"].(map[string]any)
+	if !ok {
+		return "", ""
+	}
+	blocks, ok := message["content"].([]any)
+	if !ok {
+		return "", ""
+	}
+	for _, value := range blocks {
+		block, ok := value.(map[string]any)
+		if !ok || block["type"] != "tool_use" {
+			continue
+		}
+		name, _ := block["name"].(string)
+		input, _ := json.Marshal(block["input"])
+		if string(input) == "null" {
+			input = nil
+		}
+		return name, string(input)
+	}
+	return "", ""
+}
+
+func messageHasBlockType(raw map[string]any, blockType string) bool {
+	message, ok := raw["message"].(map[string]any)
+	if !ok {
+		return false
+	}
+	blocks, ok := message["content"].([]any)
+	if !ok {
+		return false
+	}
+	for _, value := range blocks {
+		block, ok := value.(map[string]any)
+		if ok && block["type"] == blockType {
+			return true
+		}
+	}
+	return false
+}
+
+func isExitOnlyHistoryInput(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.TrimRight(value, ".!。！？")
+	switch value {
+	case "/exit", "/quit", "/exiit":
+		return true
+	default:
+		return false
+	}
 }
 
 func summarize(value string) string {
@@ -251,29 +568,19 @@ func textFromBlocks(value any) []string {
 		}
 		return nil
 	case map[string]any:
+		typ, _ := typed["type"].(string)
 		switch {
 		case isString(typed["text"]):
 			return []string{typed["text"].(string)}
 		case isString(typed["thinking"]):
-			return []string{"[thinking] " + typed["thinking"].(string)}
-		case isString(typed["name"]), isString(typed["tool_name"]):
-			name, _ := typed["name"].(string)
-			if name == "" {
-				name, _ = typed["tool_name"].(string)
-			}
-			input, _ := json.Marshal(typed["input"])
-			if len(input) > 0 && string(input) != "null" {
-				return []string{"[" + name + "] " + string(input)}
-			}
-			return []string{"[" + name + "]"}
+			return []string{typed["thinking"].(string)}
+		case typ == "tool_use":
+			return nil
+		case typ == "tool_result":
+			return textFromBlocks(typed["content"])
 		default:
 			if parts := textFromBlocks(typed["content"]); len(parts) > 0 {
 				return parts
-			}
-			// Non-text block (e.g. web_search, reasoning): surface its type so
-			// the event is visible in the stream even without readable text.
-			if typ, ok := typed["type"].(string); ok && typ != "" {
-				return []string{"[" + typ + "]"}
 			}
 			return nil
 		}
@@ -291,6 +598,10 @@ func textFromBlocks(value any) []string {
 func isString(value any) bool {
 	_, ok := value.(string)
 	return ok
+}
+
+func stableEventID(sessionID, externalID string) string {
+	return fmt.Sprintf("evt-%x", stableHash([]byte(sessionID+"\x00"+externalID)))
 }
 
 func stableHash(data []byte) uint64 {

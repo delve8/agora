@@ -4,6 +4,7 @@ import "time"
 
 const (
 	KindSystem    = "system"
+	KindAITitle   = "ai-title"
 	KindAssistant = "assistant"
 	KindUser      = "user"
 	KindTool      = "tool"

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/delve8/agora/internal/adapter"
+	"github.com/delve8/agora/internal/config"
 	"github.com/delve8/agora/internal/daemon"
 	"github.com/delve8/agora/internal/runtime"
 	"github.com/delve8/agora/internal/server"
@@ -28,20 +29,23 @@ func runServer() error {
 	if addr == "" {
 		addr = "127.0.0.1:8080"
 	}
-	srv := server.New(addr, database, manager)
+	srv := server.NewWithWebDir(addr, database, manager, os.Getenv("AGORA_WEB_DIR"))
 	return runHTTPServer(srv, manager.Close)
 }
 
 func runDaemon() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	daemonID, err := config.ResolveDaemonID(os.Getenv("AGORA_DAEMON_ID"), os.Getenv("AGORA_CONFIG_PATH"))
+	if err != nil {
+		return err
+	}
 	d, err := daemon.New(daemon.Config{
-		ID:             os.Getenv("AGORA_DAEMON_ID"),
+		ID:             daemonID,
 		Version:        firstEnv("AGORA_VERSION", "dev"),
 		ServerURL:      daemonWSURL(firstEnv("AGORA_SERVER_URL", "http://127.0.0.1:8080")),
 		Credential:     os.Getenv("AGORA_DEVICE_CREDENTIAL"),
 		CredentialPath: os.Getenv("AGORA_DEVICE_CREDENTIAL_PATH"),
-		DatabasePath:   firstEnv("AGORA_DAEMON_DB", "AGORA_DB"),
 		ClaudeBinary:   os.Getenv("AGORA_CLAUDE_BINARY"),
 		HomeDir:        os.Getenv("HOME"),
 	})
@@ -85,10 +89,14 @@ func firstEnv(names ...string) string {
 
 func daemonWSURL(value string) string {
 	value = strings.TrimRight(strings.TrimSpace(value), "/")
-	value = strings.TrimPrefix(value, "http://")
-	value = strings.TrimPrefix(value, "https://")
 	if strings.HasPrefix(value, "ws://") || strings.HasPrefix(value, "wss://") {
 		return value + "/api/daemon/ws"
+	}
+	if strings.HasPrefix(value, "https://") {
+		return "wss://" + strings.TrimPrefix(value, "https://") + "/api/daemon/ws"
+	}
+	if strings.HasPrefix(value, "http://") {
+		return "ws://" + strings.TrimPrefix(value, "http://") + "/api/daemon/ws"
 	}
 	return "ws://" + value + "/api/daemon/ws"
 }

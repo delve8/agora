@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/creack/pty"
@@ -30,6 +32,14 @@ type PTYManager struct {
 
 	mu       sync.Mutex
 	sessions map[string]*PTYSession // keyed by Agora session id
+	onExit   func(PTYExit)
+}
+
+type PTYExit struct {
+	AgoraID       string
+	ClaudeSession string
+	ExitCode      int
+	Err           error
 }
 
 type PTYSession struct {
@@ -62,7 +72,7 @@ type rawFrame struct {
 const (
 	defaultPTYCols       = 120
 	defaultPTYRows       = 40
-	defaultRawFrameLimit = 256
+	defaultRawFrameLimit = 32
 )
 
 func newPTYObservation() *ptyObservation {
@@ -106,6 +116,18 @@ func NewPTYManager(binary, homeDir string) *PTYManager {
 		socketDir: filepath.Join(os.TempDir(), "agora-pty"),
 		sessions:  make(map[string]*PTYSession),
 	}
+}
+
+func (m *PTYManager) SetExitHandler(handler func(PTYExit)) {
+	m.mu.Lock()
+	m.onExit = handler
+	m.mu.Unlock()
+}
+
+func (m *PTYManager) IsRunning(agoraID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.sessions[agoraID] != nil
 }
 
 // Launch starts a Claude Code process for the given Agora session under a PTY.
@@ -185,12 +207,21 @@ func (m *PTYManager) Launch(agoraID, workspace, claudeSession string) (*PTYSessi
 	}
 
 	go func() {
-		_ = cmd.Wait()
+		waitErr := cmd.Wait()
+		exitCode := 0
+		if cmd.ProcessState != nil {
+			exitCode = cmd.ProcessState.ExitCode()
+		}
 		m.mu.Lock()
 		delete(m.sessions, agoraID)
+		handler := m.onExit
+		claudeSession := session.ClaudeSession
 		m.mu.Unlock()
 		_ = listener.Close()
 		_ = file.Close()
+		if handler != nil {
+			handler(PTYExit{AgoraID: agoraID, ClaudeSession: claudeSession, ExitCode: exitCode, Err: waitErr})
+		}
 		log.Printf("agora: managed session %s process exited", agoraID)
 	}()
 
@@ -210,6 +241,19 @@ func (m *PTYManager) Input(agoraID, content string) error {
 	}
 	_, err := io.WriteString(session.Master, content+"\r")
 	return err
+}
+
+func (m *PTYManager) Stop(agoraID string) error {
+	m.mu.Lock()
+	session := m.sessions[agoraID]
+	m.mu.Unlock()
+	if session == nil || session.Process == nil {
+		return fmt.Errorf("managed session %s is not running", agoraID)
+	}
+	if err := session.Process.Signal(syscall.SIGTERM); err != nil {
+		return fmt.Errorf("stop managed session %s: %w", agoraID, err)
+	}
+	return nil
 }
 
 // Snapshot returns a read-only view of the current terminal screen.
@@ -232,6 +276,45 @@ func (m *PTYManager) AttachAddr(agoraID string) (string, error) {
 		return "", fmt.Errorf("managed session %s is not running", agoraID)
 	}
 	return session.SocketPath, nil
+}
+
+func (m *PTYManager) WaitClaudeSessionID(ctx context.Context, agoraID string) (string, error) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if id := m.ClaudeSessionID(agoraID); id != "" {
+			return id, nil
+		}
+		m.mu.Lock()
+		running := m.sessions[agoraID] != nil
+		m.mu.Unlock()
+		if !running {
+			return "", fmt.Errorf("managed session %s exited before reporting agent session id", agoraID)
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+func (m *PTYManager) Rekey(oldID, newID string) error {
+	if oldID == "" || newID == "" || oldID == newID {
+		return fmt.Errorf("invalid PTY session rekey")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	value := m.sessions[oldID]
+	if value == nil {
+		return fmt.Errorf("managed session %s is not running", oldID)
+	}
+	if m.sessions[newID] != nil {
+		return fmt.Errorf("managed session %s already exists", newID)
+	}
+	value.AgoraID = newID
+	m.sessions[newID] = value
+	delete(m.sessions, oldID)
+	return nil
 }
 
 // ClaudeSessionID returns the recorded Claude session id for a managed session.

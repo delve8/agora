@@ -1,15 +1,432 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/delve8/agora/internal/adapter"
+	"github.com/delve8/agora/internal/coordination"
 	"github.com/delve8/agora/internal/runtime"
+	"github.com/delve8/agora/internal/session"
 	"github.com/delve8/agora/internal/store"
 )
+
+func TestStatePrefersLatestAITitle(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	content := "{\"type\":\"user\",\"uuid\":\"u1\",\"message\":{\"content\":\"first request\"}}\n" +
+		"{\"type\":\"ai-title\",\"aiTitle\":\"Old title\"}\n" +
+		"{\"type\":\"ai-title\",\"aiTitle\":\"\"}\n" +
+		"{\"type\":\"ai-title\",\"aiTitle\":\"Latest title\"}\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(filepath.Join(t.TempDir(), "agora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now().UTC()
+	coord := coordination.Coordination{ID: "coord-1", Name: "Test", CreatedAt: now}
+	if err := db.CreateCoordination(context.Background(), coord); err != nil {
+		t.Fatal(err)
+	}
+	value := session.Session{ID: "sess-1", CoordinationID: coord.ID, Agent: "claude-code", Workspace: t.TempDir(), DisplayName: "New session", State: session.StateWaiting, Source: session.SourceManaged, HistoryPath: path, Capabilities: session.Capabilities{CanReadHistory: true}, CreatedAt: now, UpdatedAt: now}
+	if err := db.CreateSession(context.Background(), value); err != nil {
+		t.Fatal(err)
+	}
+	manager := runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), runtime.NewPTYManager("", ""))
+	srv := New(":0", db, manager)
+	req := httptest.NewRequest(http.MethodGet, "/api/state", nil)
+	resp := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.Code, resp.Body.String())
+	}
+	stored, err := db.GetSession(context.Background(), value.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.DisplayName != "Latest title" || stored.DisplayNameSource != session.DisplayNameSourceAITitle {
+		t.Fatalf("unexpected stored name: %+v", stored)
+	}
+}
+
+func TestStatePreservesCustomDisplayName(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	if err := os.WriteFile(path, []byte("{\"type\":\"ai-title\",\"aiTitle\":\"Generated title\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(filepath.Join(t.TempDir(), "agora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now().UTC()
+	coord := coordination.Coordination{ID: "coord-1", Name: "Test", CreatedAt: now}
+	if err := db.CreateCoordination(context.Background(), coord); err != nil {
+		t.Fatal(err)
+	}
+	value := session.Session{ID: "sess-1", CoordinationID: coord.ID, Agent: "claude-code", Workspace: t.TempDir(), DisplayName: "My custom name", DisplayNameSource: session.DisplayNameSourceCustom, State: session.StateWaiting, Source: session.SourceManaged, HistoryPath: path, Capabilities: session.Capabilities{CanReadHistory: true}, CreatedAt: now, UpdatedAt: now}
+	if err := db.CreateSession(context.Background(), value); err != nil {
+		t.Fatal(err)
+	}
+	manager := runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), runtime.NewPTYManager("", ""))
+	srv := New(":0", db, manager)
+	req := httptest.NewRequest(http.MethodGet, "/api/state", nil)
+	resp := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.Code, resp.Body.String())
+	}
+	stored, err := db.GetSession(context.Background(), value.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.DisplayName != value.DisplayName || stored.DisplayNameSource != session.DisplayNameSourceCustom {
+		t.Fatalf("custom name changed: %+v", stored)
+	}
+}
+
+func TestGetEventsReadsManagedJSONL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	if err := os.WriteFile(path, []byte("{\"type\":\"user\",\"uuid\":\"u1\",\"timestamp\":\"2026-08-15T10:00:00Z\",\"message\":{\"content\":\"from jsonl\"}}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(filepath.Join(t.TempDir(), "agora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now().UTC()
+	coord := coordination.Coordination{ID: "coord-1", Name: "Test", CreatedAt: now}
+	if err := db.CreateCoordination(context.Background(), coord); err != nil {
+		t.Fatal(err)
+	}
+	value := session.Session{ID: "sess-1", CoordinationID: coord.ID, Agent: "claude-code", Workspace: t.TempDir(), DisplayName: "New session", State: session.StateWaiting, Source: session.SourceManaged, HistoryPath: path, Capabilities: session.Capabilities{CanReadHistory: true}, CreatedAt: now, UpdatedAt: now}
+	if err := db.CreateSession(context.Background(), value); err != nil {
+		t.Fatal(err)
+	}
+	manager := runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), runtime.NewPTYManager("", ""))
+	srv := New(":0", db, manager)
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/sess-1/events", nil)
+	resp := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.Code, resp.Body.String())
+	}
+	var values []map[string]any
+	if err := json.Unmarshal(resp.Body.Bytes(), &values); err != nil {
+		t.Fatal(err)
+	}
+	if len(values) != 1 || values[0]["content"] != "from jsonl" {
+		t.Fatalf("unexpected events: %+v", values)
+	}
+}
+
+func TestStateListsEphemeralHistoryWithoutPersisting(t *testing.T) {
+	home := t.TempDir()
+	project := filepath.Join(home, ".claude", "projects", "-tmp-history-workspace")
+	if err := os.MkdirAll(project, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(project, "claude-history.jsonl")
+	content := "{\"type\":\"user\",\"uuid\":\"u1\",\"timestamp\":\"2026-08-15T10:00:00Z\",\"cwd\":\"/tmp/history-workspace\",\"sessionId\":\"claude-history\",\"message\":{\"content\":\"history request\"}}\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(filepath.Join(t.TempDir(), "agora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	coord := coordination.Coordination{ID: "coord-1", Name: "Test", CreatedAt: time.Now().UTC()}
+	if err := db.CreateCoordination(context.Background(), coord); err != nil {
+		t.Fatal(err)
+	}
+	manager := runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), runtime.NewPTYManager("", home))
+	srv := New(":0", db, manager)
+	stateReq := httptest.NewRequest(http.MethodGet, "/api/state", nil)
+	stateResp := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(stateResp, stateReq)
+	if stateResp.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", stateResp.Code, stateResp.Body.String())
+	}
+	var state struct {
+		Sessions []session.Session `json:"sessions"`
+	}
+	if err := json.Unmarshal(stateResp.Body.Bytes(), &state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Sessions) != 1 || state.Sessions[0].Source != session.SourceHistory || state.Sessions[0].DisplayName != "history request" {
+		t.Fatalf("unexpected discovered sessions: %+v", state.Sessions)
+	}
+	value := state.Sessions[0]
+	if !value.Capabilities.CanReadHistory || !value.Capabilities.CanResume || value.Capabilities.CanStream || value.Capabilities.CanSendInput || value.Capabilities.CanReadTerminal {
+		t.Fatalf("unexpected history capabilities: %+v", value.Capabilities)
+	}
+	stored, err := db.ListSessions(context.Background(), coord.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 0 {
+		t.Fatalf("ephemeral history was persisted: %+v", stored)
+	}
+	eventsReq := httptest.NewRequest(http.MethodGet, "/api/sessions/"+value.ID+"/events", nil)
+	eventsResp := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(eventsResp, eventsReq)
+	if eventsResp.Code != http.StatusOK {
+		t.Fatalf("expected history 200, got %d: %s", eventsResp.Code, eventsResp.Body.String())
+	}
+	var events []map[string]any
+	if err := json.Unmarshal(eventsResp.Body.Bytes(), &events); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0]["content"] != "history request" {
+		t.Fatalf("unexpected history events: %+v", events)
+	}
+	streamReq := httptest.NewRequest(http.MethodGet, "/api/sessions/"+value.ID+"/events/stream", nil)
+	streamResp := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(streamResp, streamReq)
+	if streamResp.Code != http.StatusConflict {
+		t.Fatalf("expected stream conflict, got %d: %s", streamResp.Code, streamResp.Body.String())
+	}
+}
+
+func TestStateDeduplicatesManagedClaudeHistory(t *testing.T) {
+	home := t.TempDir()
+	project := filepath.Join(home, ".claude", "projects", "-tmp-workspace")
+	if err := os.MkdirAll(project, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(project, "claude-1.jsonl")
+	if err := os.WriteFile(path, []byte("{\"type\":\"user\",\"uuid\":\"u1\",\"sessionId\":\"claude-1\",\"cwd\":\"/tmp/workspace\",\"message\":{\"content\":\"hello\"}}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(filepath.Join(t.TempDir(), "agora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now().UTC()
+	coord := coordination.Coordination{ID: "coord-1", Name: "Test", CreatedAt: now}
+	if err := db.CreateCoordination(context.Background(), coord); err != nil {
+		t.Fatal(err)
+	}
+	managed := session.Session{ID: "managed-1", CoordinationID: coord.ID, ClaudeSessionID: "claude-1", Agent: "claude-code", Workspace: "/tmp/workspace", DisplayName: "Managed", DisplayNameSource: session.DisplayNameSourceCustom, State: session.StateWaiting, Source: session.SourceManaged, HistoryPath: path, CreatedAt: now, UpdatedAt: now}
+	if err := db.CreateSession(context.Background(), managed); err != nil {
+		t.Fatal(err)
+	}
+	srv := New(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), runtime.NewPTYManager("", home)))
+	req := httptest.NewRequest(http.MethodGet, "/api/state", nil)
+	resp := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(resp, req)
+	var state struct {
+		Sessions []session.Session `json:"sessions"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Sessions) != 1 || state.Sessions[0].ID != managed.ID {
+		t.Fatalf("managed history was duplicated: %+v", state.Sessions)
+	}
+}
+
+func TestStateReturnsStoppedManagedSessionAsResumable(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	project := filepath.Join(home, ".claude", "projects", "-workspace")
+	if err := os.MkdirAll(project, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(workspace, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(project, "claude-1.jsonl")
+	if err := os.WriteFile(path, []byte("{\"type\":\"user\",\"uuid\":\"u1\",\"sessionId\":\"claude-1\",\"cwd\":\""+workspace+"\",\"message\":{\"content\":\"hello\"}}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(filepath.Join(t.TempDir(), "agora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now().UTC()
+	coord := coordination.Coordination{ID: "coord-1", Name: "Test", CreatedAt: now}
+	if err := db.CreateCoordination(context.Background(), coord); err != nil {
+		t.Fatal(err)
+	}
+	managed := session.Session{ID: "managed-1", CoordinationID: coord.ID, ClaudeSessionID: "claude-1", Agent: "claude-code", Workspace: workspace, DisplayName: "Custom", DisplayNameSource: session.DisplayNameSourceCustom, State: session.StateRunning, Source: session.SourceManaged, ProcessID: 999999, HistoryPath: path, Capabilities: session.Capabilities{CanSendInput: true, CanStream: true, CanReadTerminal: true}, CreatedAt: now, UpdatedAt: now}
+	if err := db.CreateSession(context.Background(), managed); err != nil {
+		t.Fatal(err)
+	}
+	srv := New(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), runtime.NewPTYManager("", home)))
+	req := httptest.NewRequest(http.MethodGet, "/api/state", nil)
+	resp := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(resp, req)
+	var state struct {
+		Sessions []session.Session `json:"sessions"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Sessions) != 1 || state.Sessions[0].ID != managed.ID || state.Sessions[0].DisplayName != "Custom" {
+		t.Fatalf("unexpected stopped managed session: %+v", state.Sessions)
+	}
+	value := state.Sessions[0]
+	if value.State != session.StateStopped || value.ProcessID != 0 || !value.Capabilities.CanResume || value.Capabilities.CanStream || value.Capabilities.CanSendInput || value.Capabilities.CanReadTerminal {
+		t.Fatalf("stale managed session has live capabilities: %+v", value)
+	}
+}
+
+func TestStateReturnsExitedExternalSessionAsResumable(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "agora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now().UTC()
+	coord := coordination.Coordination{ID: "coord-1", Name: "Test", CreatedAt: now}
+	if err := db.CreateCoordination(context.Background(), coord); err != nil {
+		t.Fatal(err)
+	}
+	workspace := t.TempDir()
+	value := session.Session{ID: "external-1", CoordinationID: coord.ID, ClaudeSessionID: "claude-1", Agent: "claude-code", Workspace: workspace, DisplayName: "External", State: session.StateRunning, Source: session.SourceExternal, ProcessID: 999999, Capabilities: session.Capabilities{CanObserve: true, CanStream: true}, CreatedAt: now, UpdatedAt: now}
+	if err := db.CreateSession(context.Background(), value); err != nil {
+		t.Fatal(err)
+	}
+	srv := New(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), runtime.NewPTYManager("", t.TempDir())))
+	req := httptest.NewRequest(http.MethodGet, "/api/state", nil)
+	resp := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(resp, req)
+	var state struct {
+		Sessions []session.Session `json:"sessions"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Sessions) != 1 {
+		t.Fatalf("unexpected sessions: %+v", state.Sessions)
+	}
+	got := state.Sessions[0]
+	if got.State != session.StateStopped || got.ProcessID != 0 || got.Capabilities.CanStream || !got.Capabilities.CanResume {
+		t.Fatalf("exited external session still appears live: %+v", got)
+	}
+}
+
+func TestResumeEphemeralHistoryUsesSameID(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	project := filepath.Join(home, ".claude", "projects", "-workspace")
+	if err := os.MkdirAll(project, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(workspace, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(project, "claude-1.jsonl")
+	if err := os.WriteFile(path, []byte("{\"type\":\"user\",\"uuid\":\"u1\",\"sessionId\":\"claude-1\",\"cwd\":\""+workspace+"\",\"message\":{\"content\":\"hello\"}}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(home, "claude-test")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nsleep 2\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(filepath.Join(t.TempDir(), "agora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	coord := coordination.Coordination{ID: "coord-1", Name: "Test", CreatedAt: time.Now().UTC()}
+	if err := db.CreateCoordination(context.Background(), coord); err != nil {
+		t.Fatal(err)
+	}
+	manager := runtime.NewManager(db, adapter.NewClaudeCodeAdapter(binary), runtime.NewPTYManager(binary, home))
+	defer manager.Close()
+	srv := New(":0", db, manager)
+	stateReq := httptest.NewRequest(http.MethodGet, "/api/state", nil)
+	stateResp := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(stateResp, stateReq)
+	var state struct {
+		Sessions []session.Session `json:"sessions"`
+	}
+	if err := json.Unmarshal(stateResp.Body.Bytes(), &state); err != nil || len(state.Sessions) != 1 {
+		t.Fatalf("unexpected state: %+v, %v", state, err)
+	}
+	originalID := state.Sessions[0].ID
+	resumeReq := httptest.NewRequest(http.MethodPost, "/api/sessions/"+originalID+"/resume", nil)
+	resumeResp := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(resumeResp, resumeReq)
+	if resumeResp.Code != http.StatusOK {
+		t.Fatalf("expected resume 200, got %d: %s", resumeResp.Code, resumeResp.Body.String())
+	}
+	var resumed session.Session
+	if err := json.Unmarshal(resumeResp.Body.Bytes(), &resumed); err != nil {
+		t.Fatal(err)
+	}
+	if resumed.ID != originalID || resumed.Source != session.SourceManaged || !resumed.Capabilities.CanSendInput {
+		t.Fatalf("unexpected resumed session: %+v", resumed)
+	}
+	stored, err := db.ListSessions(context.Background(), coord.ID)
+	if err != nil || len(stored) != 1 || stored[0].ID != originalID {
+		t.Fatalf("resume created duplicate metadata: %+v, %v", stored, err)
+	}
+}
+
+func TestProxyEventsAreLiveOnlyAndDeduplicated(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "agora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now().UTC()
+	coord := coordination.Coordination{ID: "coord-1", Name: "Test", CreatedAt: now}
+	if err := db.CreateCoordination(context.Background(), coord); err != nil {
+		t.Fatal(err)
+	}
+	value := session.Session{ID: "sess-proxy", CoordinationID: coord.ID, Agent: "claude-code", DisplayName: "Proxy", State: session.StateRunning, Source: session.SourceProxy, Capabilities: session.Capabilities{CanObserve: true, CanStream: true}, CreatedAt: now, UpdatedAt: now}
+	if err := db.CreateSession(context.Background(), value); err != nil {
+		t.Fatal(err)
+	}
+	srv := New(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), runtime.NewPTYManager("", "")))
+	ch, unsubscribe := srv.daemons.Subscribe(value.ID)
+	defer unsubscribe()
+	body := []byte(`[{"id":"evt-1","external_id":"external-1","source":"stream","kind":"assistant","content":"live"}]`)
+	for index := 0; index < 2; index++ {
+		req := httptest.NewRequest(http.MethodPost, "/api/proxy/sessions/sess-proxy/events", bytes.NewReader(body))
+		req.RemoteAddr = "127.0.0.1:12345"
+		resp := httptest.NewRecorder()
+		srv.HTTP.Handler.ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", resp.Code, resp.Body.String())
+		}
+	}
+	select {
+	case item := <-ch:
+		if item.Content != "live" {
+			t.Fatalf("unexpected live event: %+v", item)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("live event was not published")
+	}
+	select {
+	case item := <-ch:
+		t.Fatalf("duplicate event was published: %+v", item)
+	case <-time.After(50 * time.Millisecond):
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/sessions/sess-proxy/events", nil)
+	resp := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK || resp.Body.String() != "[]\n" {
+		t.Fatalf("expected empty proxy history, got %d: %q", resp.Code, resp.Body.String())
+	}
+}
 
 func TestPTYSnapshotUnavailable(t *testing.T) {
 	db, err := store.Open("")
@@ -42,6 +459,70 @@ func TestHealthz(t *testing.T) {
 	srv.HTTP.Handler.ServeHTTP(resp, req)
 	if resp.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", resp.Code)
+	}
+	if err := srv.Shutdown(context.Background()); err != nil && err != http.ErrServerClosed {
+		t.Fatal(err)
+	}
+}
+
+func TestFrontendServesAssetsAndSPAFallback(t *testing.T) {
+	webDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(webDir, "index.html"), []byte("<html>Agora</html>"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(webDir, "assets"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(webDir, "assets", "app.js"), []byte("console.log('ok')"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	srv := NewWithWebDir(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), runtime.NewPTYManager("", "")), webDir)
+	for _, test := range []struct {
+		path string
+		want string
+	}{
+		{path: "/", want: "<html>Agora</html>"},
+		{path: "/assets/app.js", want: "console.log('ok')"},
+		{path: "/sessions/sess-1", want: "<html>Agora</html>"},
+	} {
+		req := httptest.NewRequest(http.MethodGet, test.path, nil)
+		resp := httptest.NewRecorder()
+		srv.HTTP.Handler.ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK || resp.Body.String() != test.want {
+			t.Fatalf("GET %s: status=%d body=%q", test.path, resp.Code, resp.Body.String())
+		}
+	}
+	missing := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(missing, httptest.NewRequest(http.MethodGet, "/missing.css", nil))
+	if missing.Code != http.StatusOK {
+		t.Fatalf("expected SPA fallback, got %d", missing.Code)
+	}
+	missingAsset := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(missingAsset, httptest.NewRequest(http.MethodGet, "/assets/missing.css", nil))
+	if missingAsset.Code != http.StatusNotFound {
+		t.Fatalf("expected missing asset 404, got %d", missingAsset.Code)
+	}
+	if err := srv.Shutdown(context.Background()); err != nil && err != http.ErrServerClosed {
+		t.Fatal(err)
+	}
+}
+
+func TestFrontendReturnsNotFoundWhenUnavailable(t *testing.T) {
+	db, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	srv := NewWithWebDir(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), runtime.NewPTYManager("", "")), filepath.Join(t.TempDir(), "missing"))
+	resp := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/", nil))
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", resp.Code)
 	}
 	if err := srv.Shutdown(context.Background()); err != nil && err != http.ErrServerClosed {
 		t.Fatal(err)

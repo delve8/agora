@@ -13,9 +13,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/delve8/agora/internal/adapter"
 	"github.com/delve8/agora/internal/coordination"
 	"github.com/delve8/agora/internal/event"
 	"github.com/delve8/agora/internal/message"
@@ -33,6 +35,13 @@ type Server struct {
 }
 
 func New(addr string, db *store.Store, manager *runtime.Manager) *Server {
+	return NewWithWebDir(addr, db, manager, "")
+}
+
+func NewWithWebDir(addr string, db *store.Store, manager *runtime.Manager, webDir string) *Server {
+	if strings.TrimSpace(webDir) == "" {
+		webDir = filepath.Join("web", "dist")
+	}
 	s := &Server{store: db, manager: manager, daemons: newDaemonHub()}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
@@ -42,6 +51,8 @@ func New(addr string, db *store.Store, manager *runtime.Manager) *Server {
 	mux.HandleFunc("GET /api/coordinations/{id}", s.getCoordination)
 	mux.HandleFunc("POST /api/coordinations/{id}/sessions", s.createSession)
 	mux.HandleFunc("GET /api/sessions/{id}", s.getSession)
+	mux.HandleFunc("POST /api/sessions/{id}/resume", s.resumeSession)
+	mux.HandleFunc("POST /api/sessions/{id}/stop", s.stopSession)
 	mux.HandleFunc("GET /api/sessions/{id}/events", s.getEvents)
 	mux.HandleFunc("GET /api/sessions/{id}/events/stream", s.streamEvents)
 	mux.HandleFunc("POST /api/sessions/{id}/messages", s.createMessage)
@@ -50,13 +61,125 @@ func New(addr string, db *store.Store, manager *runtime.Manager) *Server {
 	mux.HandleFunc("POST /api/proxy/sessions", s.registerProxySession)
 	mux.HandleFunc("POST /api/proxy/sessions/{id}/events", s.ingestProxyEvents)
 	mux.HandleFunc("POST /api/proxy/sessions/{id}/exit", s.reportProxyExit)
+	mux.Handle("/", s.frontendHandler(webDir))
 	s.HTTP = &http.Server{Addr: addr, Handler: mux}
 	return s
 }
 
+func (s *Server) frontendHandler(webDir string) http.Handler {
+	if strings.TrimSpace(webDir) == "" {
+		return http.NotFoundHandler()
+	}
+	files := http.FileServer(http.Dir(webDir))
+	indexPath := filepath.Join(webDir, "index.html")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/api" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.URL.Path == "/" {
+			if _, err := os.Stat(indexPath); err != nil {
+				http.NotFound(w, r)
+				return
+			}
+			http.ServeFile(w, r, indexPath)
+			return
+		}
+		relative := filepath.Clean(filepath.FromSlash(strings.TrimPrefix(r.URL.Path, "/")))
+		if relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			http.NotFound(w, r)
+			return
+		}
+		path := filepath.Join(webDir, relative)
+		if info, err := os.Stat(path); err == nil && !info.IsDir() {
+			files.ServeHTTP(w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/assets/") {
+			http.NotFound(w, r)
+			return
+		}
+		if _, err := os.Stat(indexPath); err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		http.ServeFile(w, r, indexPath)
+	})
+}
+
 func (s *Server) Addr() string                       { return s.HTTP.Addr }
+func (s *Server) Handler() http.Handler              { return s.HTTP.Handler }
 func (s *Server) ListenAndServe() error              { return s.HTTP.ListenAndServe() }
 func (s *Server) Shutdown(ctx context.Context) error { return s.HTTP.Shutdown(ctx) }
+
+type sessionLocation int
+
+const (
+	sessionLocationStored sessionLocation = iota
+	sessionLocationLocalHistory
+	sessionLocationDaemonHistory
+)
+
+func (s *Server) effectiveStoredSession(ctx context.Context, value session.Session) (session.Session, error) {
+	if value.Source == session.SourceManaged && s.manager != nil && s.manager.CanManageSessions() {
+		effective := s.manager.EffectiveSession(value)
+		if effective.State != value.State || effective.Connection != value.Connection || effective.ProcessID != value.ProcessID {
+			if err := s.store.UpdateSessionObservation(ctx, effective); err != nil {
+				return session.Session{}, err
+			}
+		}
+		return effective, nil
+	}
+	if value.Source == session.SourceManaged {
+		return s.daemons.effectiveSession(value), nil
+	}
+	if value.Source == session.SourceProxy || value.Source == session.SourceExternal {
+		if value.ProcessID > 0 && adapter.ProcessAlive(value.ProcessID) {
+			return value, nil
+		}
+		value.State = session.StateStopped
+		value.Connection = session.ConnectionUnavailable
+		value.ProcessID = 0
+		value.Capabilities = session.Capabilities{CanReadHistory: value.HistoryPath != "" || value.ClaudeSessionID != "", CanResume: value.ClaudeSessionID != "" && value.Workspace != "" && s.manager != nil && s.manager.CanManageSessions()}
+		if err := s.store.UpdateSessionObservation(ctx, value); err != nil {
+			return session.Session{}, err
+		}
+	}
+	return value, nil
+}
+
+func (s *Server) resolveSession(ctx context.Context, id string) (session.Session, sessionLocation, error) {
+	value, err := s.store.GetSession(ctx, id)
+	if err == nil {
+		value, err = s.effectiveStoredSession(ctx, value)
+		return value, sessionLocationStored, err
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return session.Session{}, sessionLocationStored, err
+	}
+	coordinations, coordErr := s.store.ListCoordinations(ctx)
+	if coordErr != nil {
+		return session.Session{}, sessionLocationStored, coordErr
+	}
+	coordinationID := ""
+	if len(coordinations) > 0 {
+		coordinationID = coordinations[0].ID
+	}
+	if s.manager != nil && s.manager.CanManageSessions() {
+		if value, ok, historyErr := s.manager.HistorySession(ctx, id, coordinationID, "local"); historyErr != nil {
+			return session.Session{}, sessionLocationLocalHistory, historyErr
+		} else if ok {
+			return value, sessionLocationLocalHistory, nil
+		}
+	}
+	if identity, identityErr := session.ParseSessionID(id); identityErr == nil {
+		if s.daemons.hasRoute(id) {
+			return session.Session{ID: id, CoordinationID: coordinationID, DaemonID: identity.DaemonID, Agent: identity.Agent, AgentSessionID: identity.AgentSessionID, DisplayName: identity.AgentSessionID, Role: "history", State: session.StateStopped, Source: session.SourceHistory, Connection: session.ConnectionObserved, Capabilities: session.Capabilities{CanReadHistory: true, CanResume: true}}, sessionLocationDaemonHistory, nil
+		}
+		return session.Session{ID: id, CoordinationID: coordinationID, DaemonID: identity.DaemonID, Agent: identity.Agent, AgentSessionID: identity.AgentSessionID, DisplayName: identity.AgentSessionID, Role: "history", State: session.StateStopped, Source: session.SourceHistory, Connection: session.ConnectionUnavailable, Capabilities: session.Capabilities{CanReadHistory: true, CanResume: true}}, sessionLocationDaemonHistory, nil
+	}
+	return session.Session{}, sessionLocationStored, sql.ErrNoRows
+}
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -82,7 +205,93 @@ func (s *Server) state(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	for index := range sessions {
+		sessions[index], err = s.effectiveStoredSession(r.Context(), sessions[index])
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		if sessions[index].DisplayNameSource == session.DisplayNameSourceCustom {
+			continue
+		}
+		var values []event.Event
+		if s.manager != nil && (s.manager.CanManageSessions() || sessions[index].Source == session.SourceProxy && sessions[index].HistoryPath != "") {
+			values, _ = s.manager.History(r.Context(), sessions[index].ID, 0)
+		} else if sessions[index].Source != session.SourceProxy && s.daemons.hasRoute(sessions[index].ID) {
+			values, _ = s.requestDaemonHistory(r.Context(), sessions[index].ID, 0)
+		}
+		name, source, apply := session.ResolveDerivedDisplayName(sessions[index], values)
+		if !apply || name == sessions[index].DisplayName && source == sessions[index].DisplayNameSource {
+			continue
+		}
+		sessions[index].DisplayName = name
+		sessions[index].DisplayNameSource = source
+		if err := s.store.UpdateSessionDisplayName(r.Context(), sessions[index].ID, name, source); err != nil {
+			writeError(w, err)
+			return
+		}
+	}
+	persistedClaudeIDs := make(map[string]int, len(sessions))
+	for index, value := range sessions {
+		if value.ClaudeSessionID != "" {
+			persistedClaudeIDs[value.ClaudeSessionID] = index
+		}
+	}
+	mergeDiscovered := func(value session.Session) {
+		if index, exists := persistedClaudeIDs[value.ClaudeSessionID]; exists {
+			if sessions[index].HistoryPath == "" {
+				sessions[index].HistoryPath = value.HistoryPath
+			}
+			if sessions[index].Workspace == "" {
+				sessions[index].Workspace = value.Workspace
+			}
+			if value.UpdatedAt.After(sessions[index].UpdatedAt) {
+				sessions[index].UpdatedAt = value.UpdatedAt
+			}
+			if !sessions[index].Capabilities.CanSendInput {
+				sessions[index].Capabilities.CanReadHistory = true
+				sessions[index].Capabilities.CanResume = value.Capabilities.CanResume
+			}
+			return
+		}
+		sessions = append(sessions, value)
+		persistedClaudeIDs[value.ClaudeSessionID] = len(sessions) - 1
+	}
+	if s.manager != nil && s.manager.CanManageSessions() {
+		discovered, historyErr := s.manager.HistorySessions(r.Context(), coord.ID, "local")
+		if historyErr != nil {
+			writeError(w, historyErr)
+			return
+		}
+		for _, value := range discovered {
+			mergeDiscovered(value)
+		}
+	}
+	for _, value := range s.daemons.historySessions(coord.ID) {
+		mergeDiscovered(value)
+	}
+	// A live session is actively working even when it has not yet written a new
+	// JSONL record (thinking, waiting on a tool, etc.). Lift its sort timestamp
+	// to "now" so recently-active conversations outrank stale-but-later history.
+	now := time.Now().UTC()
+	for index := range sessions {
+		if isLiveSession(sessions[index]) {
+			sessions[index].UpdatedAt = now
+		}
+	}
+	sort.SliceStable(sessions, func(i, j int) bool { return sessions[i].UpdatedAt.After(sessions[j].UpdatedAt) })
 	writeJSON(w, http.StatusOK, map[string]any{"coordination": coord, "sessions": sessions})
+}
+
+func isLiveSession(value session.Session) bool {
+	if value.ProcessID <= 0 {
+		return false
+	}
+	switch value.State {
+	case session.StateRunning, session.StateWaiting, session.StateStarting:
+		return true
+	}
+	return false
 }
 
 func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
@@ -95,6 +304,7 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 		Workspace   string `json:"workspace"`
 		DisplayName string `json:"display_name"`
 		Role        string `json:"role"`
+		Agent       string `json:"agent"`
 	}
 	if err := decodeJSON(r, &input); err != nil {
 		writeErrorStatus(w, http.StatusBadRequest, err)
@@ -105,7 +315,7 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 		writeErrorStatus(w, http.StatusBadRequest, fmt.Errorf("workspace is required"))
 		return
 	}
-	if s.manager != nil {
+	if s.manager != nil && s.manager.CanManageSessions() {
 		var err error
 		workspace, err = filepath.Abs(workspace)
 		if err != nil {
@@ -118,7 +328,7 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if s.manager != nil {
+	if s.manager != nil && s.manager.CanManageSessions() {
 		value, err := s.manager.CreateManagedSessionWithID(r.Context(), newID("sess"), coordinationID, workspace, input.DisplayName, input.Role)
 		if err != nil {
 			writeErrorStatus(w, http.StatusInternalServerError, err)
@@ -127,21 +337,25 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusCreated, value)
 		return
 	}
-	value := session.Session{ID: newID("sess"), CoordinationID: coordinationID, Agent: "claude-code", Workspace: workspace, DisplayName: input.DisplayName, Role: input.Role, State: session.StateStarting, Source: session.SourceManaged, Connection: session.ConnectionUnavailable, Capabilities: session.Capabilities{CanStart: true, CanSendInput: true, CanStream: true, CanResume: true, CanReadHistory: true, CanObserve: true}, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	displayName := strings.TrimSpace(input.DisplayName)
+	if displayName == "" {
+		displayName = "New session"
+	}
+	if s.daemons == nil {
+		writeErrorStatus(w, http.StatusServiceUnavailable, fmt.Errorf("daemon service is unavailable"))
+		return
+	}
+	result, err := s.daemons.createSession(r.Context(), protocol.SessionCreatePayload{CoordinationID: coordinationID, Workspace: workspace, DisplayName: displayName, Role: input.Role, Agent: input.Agent})
+	if err != nil {
+		writeErrorStatus(w, http.StatusBadGateway, err)
+		return
+	}
+	value := session.Session{ID: result.SessionID, CoordinationID: coordinationID, DaemonID: result.DaemonID, Agent: result.Agent, AgentSessionID: result.AgentSessionID, Workspace: workspace, DisplayName: displayName, DisplayNameSource: session.InitialDisplayNameSource(displayName), Role: input.Role, State: session.StateRunning, Source: session.SourceManaged, Connection: session.ConnectionObserved, Capabilities: session.Capabilities{CanStart: true, CanSendInput: true, CanStream: true, CanInterrupt: true, CanResume: true, CanReadHistory: true, CanReadTerminal: true, CanObserve: true}, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
 	if err := s.store.CreateSession(r.Context(), value); err != nil {
 		writeError(w, err)
 		return
 	}
-	frame, err := protocol.NewEnvelope(protocol.SessionCreate, protocol.SessionCreatePayload{SessionID: value.ID, CoordinationID: coordinationID, Workspace: workspace, DisplayName: input.DisplayName, Role: input.Role})
-	if err != nil || s.daemons == nil {
-		writeErrorStatus(w, http.StatusServiceUnavailable, fmt.Errorf("daemon service is unavailable"))
-		return
-	}
-	if err := s.daemons.broadcast(frame); err != nil {
-		writeErrorStatus(w, http.StatusServiceUnavailable, err)
-		return
-	}
-	writeJSON(w, http.StatusAccepted, value)
+	writeJSON(w, http.StatusCreated, value)
 }
 
 func (s *Server) createCoordination(w http.ResponseWriter, r *http.Request) {
@@ -183,8 +397,77 @@ func (s *Server) getCoordination(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"coordination": value, "sessions": sessions})
 }
 
+func (s *Server) resumeSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	value, location, err := s.resolveSession(r.Context(), id)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeErrorStatus(w, http.StatusNotFound, err)
+		return
+	}
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if !value.Capabilities.CanResume {
+		writeErrorStatus(w, http.StatusConflict, fmt.Errorf("session cannot be resumed"))
+		return
+	}
+	if location == sessionLocationDaemonHistory || s.manager == nil || !s.manager.CanManageSessions() {
+		resumed, resumeErr := s.daemons.resumeSession(r.Context(), value)
+		if resumeErr != nil {
+			writeErrorStatus(w, http.StatusBadGateway, resumeErr)
+			return
+		}
+		if _, getErr := s.store.GetSession(r.Context(), resumed.ID); errors.Is(getErr, sql.ErrNoRows) {
+			if createErr := s.store.CreateSession(r.Context(), resumed); createErr != nil {
+				writeError(w, createErr)
+				return
+			}
+		} else if getErr == nil {
+			_ = s.store.UpdateSessionObservation(r.Context(), resumed)
+		} else {
+			writeError(w, getErr)
+			return
+		}
+		writeJSON(w, http.StatusOK, resumed)
+		return
+	}
+	resumed, err := s.manager.ResumeSession(r.Context(), value)
+	if err != nil {
+		writeErrorStatus(w, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, resumed)
+}
+
+func (s *Server) stopSession(w http.ResponseWriter, r *http.Request) {
+	value, _, err := s.resolveSession(r.Context(), r.PathValue("id"))
+	if errors.Is(err, sql.ErrNoRows) {
+		writeErrorStatus(w, http.StatusNotFound, err)
+		return
+	}
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if !value.Capabilities.CanInterrupt {
+		writeErrorStatus(w, http.StatusConflict, fmt.Errorf("session cannot be stopped"))
+		return
+	}
+	if s.manager != nil && s.manager.IsRunning(value.ID) {
+		err = s.manager.StopSession(value)
+	} else {
+		err = s.daemons.stopSession(r.Context(), value)
+	}
+	if err != nil {
+		writeErrorStatus(w, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]bool{"accepted": true})
+}
+
 func (s *Server) getSession(w http.ResponseWriter, r *http.Request) {
-	value, err := s.store.GetSession(r.Context(), r.PathValue("id"))
+	value, _, err := s.resolveSession(r.Context(), r.PathValue("id"))
 	if errors.Is(err, sql.ErrNoRows) {
 		writeErrorStatus(w, http.StatusNotFound, err)
 		return
@@ -198,44 +481,93 @@ func (s *Server) getSession(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) getEvents(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.PathValue("id")
-	if s.manager == nil {
-		frame, err := s.daemons.request(r.Context(), sessionID, protocol.SessionHistoryRequest, protocol.HistoryRequestPayload{SessionID: sessionID, Limit: 1000}, protocol.SessionHistoryResponse)
-		if err != nil {
-			writeErrorStatus(w, http.StatusBadGateway, err)
-			return
-		}
-		var response protocol.HistoryResponsePayload
-		if err := protocol.DecodePayload(frame, &response); err != nil {
-			writeErrorStatus(w, http.StatusBadGateway, err)
-			return
-		}
-		if response.Error != "" {
-			writeErrorStatus(w, http.StatusBadGateway, errors.New(response.Error))
-			return
-		}
-		if len(response.Events) == 0 {
-			response.Events = json.RawMessage("[]")
-		}
-		writeRawJSON(w, http.StatusOK, response.Events)
-		return
-	}
-	values, err := s.store.ListEvents(r.Context(), sessionID)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, values)
-}
-
-func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
-	sessionID := r.PathValue("id")
-	value, err := s.store.GetSession(r.Context(), sessionID)
+	value, location, err := s.resolveSession(r.Context(), sessionID)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeErrorStatus(w, http.StatusNotFound, err)
 		return
 	}
 	if err != nil {
 		writeError(w, err)
+		return
+	}
+	if !value.Capabilities.CanReadHistory {
+		writeJSON(w, http.StatusOK, []event.Event{})
+		return
+	}
+	if location == sessionLocationLocalHistory {
+		values, err := s.manager.HistoryForSession(r.Context(), value, 0)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, values)
+		return
+	}
+	if location == sessionLocationDaemonHistory {
+		values, err := s.requestDaemonHistory(r.Context(), sessionID, 1000)
+		if err != nil {
+			writeErrorStatus(w, http.StatusBadGateway, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, values)
+		return
+	}
+	if s.manager != nil && (s.manager.CanManageSessions() || value.Source == session.SourceProxy && value.HistoryPath != "") {
+		values, err := s.manager.History(r.Context(), sessionID, 0)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, values)
+		return
+	}
+	if value.Source == session.SourceProxy {
+		writeJSON(w, http.StatusOK, []event.Event{})
+		return
+	}
+	values, err := s.requestDaemonHistory(r.Context(), sessionID, 1000)
+	if err != nil {
+		writeErrorStatus(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, values)
+}
+
+func (s *Server) requestDaemonHistory(ctx context.Context, sessionID string, limit int) ([]event.Event, error) {
+	frame, err := s.daemons.request(ctx, sessionID, protocol.SessionHistoryRequest, protocol.HistoryRequestPayload{SessionID: sessionID, Limit: limit}, protocol.SessionHistoryResponse)
+	if err != nil {
+		return nil, err
+	}
+	var response protocol.HistoryResponsePayload
+	if err := protocol.DecodePayload(frame, &response); err != nil {
+		return nil, err
+	}
+	if response.Error != "" {
+		return nil, errors.New(response.Error)
+	}
+	if len(response.Events) == 0 {
+		return []event.Event{}, nil
+	}
+	var values []event.Event
+	if err := json.Unmarshal(response.Events, &values); err != nil {
+		return nil, err
+	}
+	return values, nil
+}
+
+func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("id")
+	value, _, err := s.resolveSession(r.Context(), sessionID)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeErrorStatus(w, http.StatusNotFound, err)
+		return
+	}
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if !value.Capabilities.CanStream {
+		writeErrorStatus(w, http.StatusConflict, fmt.Errorf("session does not provide a live event stream"))
 		return
 	}
 	flusher, ok := w.(http.Flusher)
@@ -250,7 +582,7 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 	var ch <-chan event.Event
 	var unsubscribe func()
-	if s.manager != nil {
+	if s.manager != nil && s.manager.CanManageSessions() && value.Source != session.SourceProxy {
 		ch, unsubscribe = s.manager.Subscribe(value.CoordinationID)
 	} else {
 		ch, unsubscribe = s.daemons.Subscribe(sessionID)
@@ -279,8 +611,17 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) attachAddr(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if _, err := s.store.GetSession(r.Context(), id); err != nil {
+	value, _, err := s.resolveSession(r.Context(), id)
+	if errors.Is(err, sql.ErrNoRows) {
 		writeErrorStatus(w, http.StatusNotFound, err)
+		return
+	}
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if !value.Capabilities.CanAttach {
+		writeErrorStatus(w, http.StatusConflict, fmt.Errorf("session does not provide a terminal attachment"))
 		return
 	}
 	addr, err := s.manager.AttachAddr(id)
@@ -293,15 +634,20 @@ func (s *Server) attachAddr(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) ptySnapshot(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if _, err := s.store.GetSession(r.Context(), id); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			writeErrorStatus(w, http.StatusNotFound, err)
-			return
-		}
+	value, _, err := s.resolveSession(r.Context(), id)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeErrorStatus(w, http.StatusNotFound, err)
+		return
+	}
+	if err != nil {
 		writeError(w, err)
 		return
 	}
-	if s.manager == nil {
+	if !value.Capabilities.CanReadTerminal {
+		writeErrorStatus(w, http.StatusConflict, fmt.Errorf("session does not provide terminal snapshots"))
+		return
+	}
+	if s.manager == nil || !s.manager.CanManageSessions() {
 		frame, err := s.daemons.request(r.Context(), id, protocol.SnapshotRequest, protocol.SnapshotPayload{SessionID: id}, protocol.SnapshotResponse)
 		if err != nil {
 			writeErrorStatus(w, http.StatusBadGateway, err)
@@ -328,7 +674,7 @@ func (s *Server) ptySnapshot(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) createMessage(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	value, err := s.store.GetSession(r.Context(), id)
+	value, _, err := s.resolveSession(r.Context(), id)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeErrorStatus(w, http.StatusNotFound, err)
 		return
@@ -337,8 +683,8 @@ func (s *Server) createMessage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if value.Source == session.SourceExternal || !value.Capabilities.CanSendInput {
-		writeErrorStatus(w, http.StatusConflict, fmt.Errorf("session is observed-only; send input directly in Claude Code"))
+	if !value.Capabilities.CanSendInput {
+		writeErrorStatus(w, http.StatusConflict, fmt.Errorf("session is not running; resume it before sending input"))
 		return
 	}
 	var input struct {
@@ -360,7 +706,7 @@ func (s *Server) createMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var sendErr error
-	if s.manager != nil {
+	if s.manager != nil && s.manager.CanManageSessions() {
 		sendErr = s.manager.Send(r.Context(), value, msg)
 	} else {
 		sendErr = s.daemons.sessionInput(r.Context(), value, input.Content)
@@ -416,20 +762,22 @@ func (s *Server) registerProxySession(w http.ResponseWriter, r *http.Request) {
 	}
 	displayName := strings.TrimSpace(input.DisplayName)
 	if displayName == "" {
-		displayName = "Claude Code Proxy"
+		displayName = "New session"
 	}
 	now := time.Now().UTC()
 	value := session.Session{
-		ID:             newID("sess"),
-		CoordinationID: coordinationID,
-		Agent:          "claude-code",
-		ExternalID:     strings.TrimSpace(input.ResumeID),
-		Workspace:      workspace,
-		DisplayName:    displayName,
-		State:          session.StateRunning,
-		Source:         session.SourceProxy,
-		Connection:     session.ConnectionObserved,
-		ProcessID:      input.RealPID,
+		ID:                newID("sess"),
+		CoordinationID:    coordinationID,
+		Agent:             "claude-code",
+		ExternalID:        strings.TrimSpace(input.ResumeID),
+		ClaudeSessionID:   strings.TrimSpace(input.ResumeID),
+		Workspace:         workspace,
+		DisplayName:       displayName,
+		DisplayNameSource: session.InitialDisplayNameSource(displayName),
+		State:             session.StateRunning,
+		Source:            session.SourceProxy,
+		Connection:        session.ConnectionObserved,
+		ProcessID:         input.RealPID,
 		Capabilities: session.Capabilities{
 			CanObserve: true,
 			CanStream:  true,
@@ -439,6 +787,10 @@ func (s *Server) registerProxySession(w http.ResponseWriter, r *http.Request) {
 	}
 	if value.ProcessID == 0 {
 		value.ProcessID = input.WrapperPID
+	}
+	if value.ClaudeSessionID != "" && s.manager != nil {
+		value.HistoryPath = adapter.FindHistoryBySessionID("", value.ClaudeSessionID)
+		value.Capabilities.CanReadHistory = value.HistoryPath != ""
 	}
 	if err := s.store.CreateSession(r.Context(), value); err != nil {
 		writeError(w, err)
@@ -475,38 +827,26 @@ func (s *Server) ingestProxyEvents(w http.ResponseWriter, r *http.Request) {
 		writeErrorStatus(w, http.StatusRequestEntityTooLarge, fmt.Errorf("event batch is too large"))
 		return
 	}
-	inserted := 0
-	for _, item := range values {
-		item.SessionID = sessionID
-		if item.Source == "" {
-			item.Source = event.SourceStream
+	for index := range values {
+		values[index].SessionID = sessionID
+		if values[index].Source == "" {
+			values[index].Source = event.SourceStream
 		}
-		if item.ExternalID != "" {
-			exists, err := s.store.HasEvent(r.Context(), sessionID, item.Source, item.ExternalID)
-			if err != nil {
-				writeError(w, err)
-				return
+		if values[index].ID == "" {
+			identity := values[index].ExternalID
+			if identity == "" {
+				identity = values[index].RawJSON
 			}
-			if exists {
-				continue
+			if identity == "" {
+				identity = values[index].Kind + "\x00" + values[index].Content
 			}
+			values[index].ID = stableProxyEventID(sessionID, identity)
 		}
-		if item.ID == "" {
-			item.ID = newID("evt")
+		if values[index].CreatedAt.IsZero() {
+			values[index].CreatedAt = time.Now().UTC()
 		}
-		if item.CreatedAt.IsZero() {
-			item.CreatedAt = time.Now().UTC()
-		}
-		if err := s.store.AppendEvent(r.Context(), item); err != nil {
-			writeError(w, err)
-			return
-		}
-		if err := s.manager.PublishEvent(r.Context(), sessionID, item); err != nil {
-			writeError(w, err)
-			return
-		}
-		inserted++
 	}
+	inserted := s.daemons.Publish(sessionID, values)
 	writeJSON(w, http.StatusOK, map[string]int{"ingested": inserted})
 }
 
@@ -596,6 +936,15 @@ func writeError(w http.ResponseWriter, err error) {
 func writeErrorStatus(w http.ResponseWriter, status int, err error) {
 	writeJSON(w, status, map[string]string{"error": err.Error()})
 }
+func stableProxyEventID(sessionID, identity string) string {
+	var hash uint64 = 14695981039346656037
+	for _, value := range []byte(sessionID + "\x00" + identity) {
+		hash ^= uint64(value)
+		hash *= 1099511628211
+	}
+	return fmt.Sprintf("evt-%x", hash)
+}
+
 func newID(prefix string) string { return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano()) }
 func newUUID() string {
 	var value [16]byte

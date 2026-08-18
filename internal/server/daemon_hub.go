@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -22,21 +23,32 @@ import (
 
 const (
 	defaultDaemonHeartbeatTimeout = 45 * time.Second
-	maxDaemonFrameSize            = 1 << 20
+	maxDaemonFrameSize            = protocol.MaxFrameSize
+	maxSeenEvents                 = 4096
 )
 
 type daemonHub struct {
-	mu       sync.RWMutex
-	devices  map[string]*daemonConnection
-	routes   map[string]string
-	seen     map[string]time.Time
-	subs     map[string]map[chan event.Event]struct{}
-	pending  map[string]chan protocol.Envelope
-	timeout  time.Duration
-	token    string
-	upgrader websocket.Upgrader
+	mu          sync.RWMutex
+	devices     map[string]*daemonConnection
+	routes      map[string]string
+	sessions    map[string]map[string]protocol.SessionSummary
+	history     map[string]map[string]protocol.HistorySessionSummary
+	seen        map[string]time.Time
+	seenOrder   []string
+	subs        map[string]map[chan event.Event]struct{}
+	resyncParts map[string]resyncAccumulator
+	pending     map[string]chan protocol.Envelope
+	timeout     time.Duration
+	token       string
+	upgrader    websocket.Upgrader
 }
 
+type resyncAccumulator struct {
+	part     int
+	sessions []protocol.SessionSummary
+	history  []protocol.HistorySessionSummary
+	gap      bool
+}
 type daemonConnection struct {
 	id       string
 	conn     *websocket.Conn
@@ -48,12 +60,15 @@ type daemonConnection struct {
 
 func newDaemonHub() *daemonHub {
 	h := &daemonHub{
-		devices: make(map[string]*daemonConnection),
-		routes:  make(map[string]string),
-		seen:    make(map[string]time.Time),
-		subs:    make(map[string]map[chan event.Event]struct{}),
-		pending: make(map[string]chan protocol.Envelope),
-		timeout: defaultDaemonHeartbeatTimeout,
+		devices:     make(map[string]*daemonConnection),
+		routes:      make(map[string]string),
+		sessions:    make(map[string]map[string]protocol.SessionSummary),
+		history:     make(map[string]map[string]protocol.HistorySessionSummary),
+		seen:        make(map[string]time.Time),
+		subs:        make(map[string]map[chan event.Event]struct{}),
+		resyncParts: make(map[string]resyncAccumulator),
+		pending:     make(map[string]chan protocol.Envelope),
+		timeout:     defaultDaemonHeartbeatTimeout,
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  4096,
 			WriteBufferSize: 4096,
@@ -90,6 +105,7 @@ func (h *daemonHub) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	for {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
+			log.Printf("agora server: daemon websocket read failed: %v", err)
 			return
 		}
 		var frame protocol.Envelope
@@ -113,6 +129,7 @@ func (h *daemonHub) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			registered = &daemonConnection{id: payload.DaemonID, conn: conn, send: make(chan protocol.Envelope, 128), lastSeen: time.Now().UTC()}
 			h.register(registered)
+			go registered.writeLoop()
 			response, _ := protocol.NewEnvelope(protocol.DaemonRegistered, map[string]any{"protocol_version": "1", "resync_required": true})
 			response.RequestID = frame.RequestID
 			if err := registered.write(response); err != nil {
@@ -139,6 +156,8 @@ func (h *daemonHub) remove(c *daemonConnection) {
 	h.mu.Lock()
 	if current := h.devices[c.id]; current == c {
 		delete(h.devices, c.id)
+		delete(h.sessions, c.id)
+		delete(h.history, c.id)
 		for sid, did := range h.routes {
 			if did == c.id {
 				delete(h.routes, sid)
@@ -150,6 +169,7 @@ func (h *daemonHub) remove(c *daemonConnection) {
 }
 
 func (h *daemonHub) handleFrame(c *daemonConnection, frame protocol.Envelope) error {
+	log.Printf("agora server: frame %s request %s from daemon %s", frame.Type, frame.RequestID, c.id)
 	h.mu.Lock()
 	c.lastSeen = time.Now().UTC()
 	h.mu.Unlock()
@@ -163,10 +183,51 @@ func (h *daemonHub) handleFrame(c *daemonConnection, frame protocol.Envelope) er
 		if err := protocol.DecodePayload(frame, &payload); err != nil {
 			return err
 		}
+		if payload.DaemonID != "" && payload.DaemonID != c.id {
+			return fmt.Errorf("resync daemon id %q does not match connection %q", payload.DaemonID, c.id)
+		}
 		h.mu.Lock()
-		for _, item := range payload.Sessions {
+		acc := h.resyncParts[c.id]
+		if !payload.Chunked {
+			acc = resyncAccumulator{part: payload.Part, gap: payload.Gap, sessions: append([]protocol.SessionSummary(nil), payload.Sessions...), history: append([]protocol.HistorySessionSummary(nil), payload.History...)}
+			payload.Final = true
+		} else {
+			if payload.Part == 0 {
+				acc = resyncAccumulator{part: 0, gap: payload.Gap}
+			}
+			if payload.Part != acc.part {
+				h.mu.Unlock()
+				return fmt.Errorf("out-of-order resync part %d, expected %d", payload.Part, acc.part)
+			}
+			acc.sessions = append(acc.sessions, payload.Sessions...)
+			acc.history = append(acc.history, payload.History...)
+			acc.part++
+			if !payload.Final {
+				h.resyncParts[c.id] = acc
+				h.mu.Unlock()
+				return nil
+			}
+		}
+		delete(h.resyncParts, c.id)
+		for sid, did := range h.routes {
+			if did == c.id {
+				delete(h.routes, sid)
+			}
+		}
+		sessions := make(map[string]protocol.SessionSummary, len(acc.sessions))
+		history := make(map[string]protocol.HistorySessionSummary, len(acc.history))
+		for _, item := range acc.sessions {
+			sessions[item.SessionID] = item
 			h.routes[item.SessionID] = c.id
 		}
+		for _, item := range acc.history {
+			if item.SessionID != "" {
+				history[item.SessionID] = item
+				h.routes[item.SessionID] = c.id
+			}
+		}
+		h.sessions[c.id] = sessions
+		h.history[c.id] = history
 		h.mu.Unlock()
 		return nil
 	case protocol.SessionUpdate:
@@ -177,12 +238,17 @@ func (h *daemonHub) handleFrame(c *daemonConnection, frame protocol.Envelope) er
 		if payload.SessionID != "" {
 			h.mu.Lock()
 			h.routes[payload.SessionID] = c.id
+			if h.sessions[c.id] == nil {
+				h.sessions[c.id] = make(map[string]protocol.SessionSummary)
+			}
+			h.sessions[c.id][payload.SessionID] = protocol.SessionSummary{SessionID: payload.SessionID, ClaudeSessionID: payload.ClaudeSessionID, State: payload.State, Connection: payload.Connection, PID: payload.PID}
 			h.mu.Unlock()
 		}
 		return nil
 	case protocol.EventBatch:
 		return h.handleEventBatch(c, frame)
-	case protocol.SessionInputResult, protocol.SessionHistoryResponse, protocol.SnapshotResponse:
+	case protocol.SessionInputResult, protocol.SessionStopResult, protocol.SessionHistoryResponse, protocol.SnapshotResponse, protocol.SessionCreated:
+		log.Printf("agora server: response %s request %s", frame.Type, frame.RequestID)
 		if frame.RequestID == "" {
 			return nil
 		}
@@ -206,12 +272,68 @@ func (h *daemonHub) handleFrame(c *daemonConnection, frame protocol.Envelope) er
 		if payload.SessionID != "" {
 			h.mu.Lock()
 			h.routes[payload.SessionID] = c.id
+			if h.sessions[c.id] == nil {
+				h.sessions[c.id] = make(map[string]protocol.SessionSummary)
+			}
+			current := h.sessions[c.id][payload.SessionID]
+			current.SessionID = payload.SessionID
+			current.State = session.StateStopped
+			current.Connection = session.ConnectionUnavailable
+			current.PID = 0
+			h.sessions[c.id][payload.SessionID] = current
 			h.mu.Unlock()
 		}
 		return nil
 	default:
 		return fmt.Errorf("message type %q is not valid from daemon", frame.Type)
 	}
+}
+
+func (h *daemonHub) rememberSeenLocked(key string) bool {
+	if key == "" {
+		return false
+	}
+	if !h.seen[key].IsZero() {
+		return true
+	}
+	h.seen[key] = time.Now().UTC()
+	h.seenOrder = append(h.seenOrder, key)
+	if len(h.seenOrder) > maxSeenEvents {
+		oldest := h.seenOrder[0]
+		h.seenOrder = h.seenOrder[1:]
+		delete(h.seen, oldest)
+	}
+	return false
+}
+
+func eventSeenKey(sessionID string, item event.Event) string {
+	if item.ID != "" {
+		return sessionID + "\x00id\x00" + item.ID
+	}
+	if item.ExternalID != "" {
+		return sessionID + "\x00" + item.Source + "\x00" + item.ExternalID
+	}
+	return ""
+}
+
+func (h *daemonHub) Publish(sessionID string, values []event.Event) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	fresh := 0
+	for _, item := range values {
+		item.SessionID = sessionID
+		if h.rememberSeenLocked(eventSeenKey(sessionID, item)) {
+			continue
+		}
+		fresh++
+		for ch := range h.subs[sessionID] {
+			select {
+			case ch <- item:
+			default:
+			}
+		}
+	}
+	return fresh
 }
 
 func (h *daemonHub) handleEventBatch(c *daemonConnection, frame protocol.Envelope) error {
@@ -227,13 +349,9 @@ func (h *daemonHub) handleEventBatch(c *daemonConnection, frame protocol.Envelop
 	}
 	h.mu.Lock()
 	h.routes[payload.SessionID] = c.id
-	duplicate := frame.MessageID != "" && !h.seen[frame.MessageID].IsZero()
-	if frame.MessageID != "" && !duplicate {
-		h.seen[frame.MessageID] = time.Now().UTC()
-	}
-	subs := make([]chan event.Event, 0, len(h.subs[payload.SessionID]))
-	for ch := range h.subs[payload.SessionID] {
-		subs = append(subs, ch)
+	duplicate := false
+	if frame.MessageID != "" {
+		duplicate = h.rememberSeenLocked("message\x00" + frame.MessageID)
 	}
 	h.mu.Unlock()
 	if frame.MessageID != "" {
@@ -245,15 +363,7 @@ func (h *daemonHub) handleEventBatch(c *daemonConnection, frame protocol.Envelop
 	if duplicate {
 		return nil
 	}
-	for _, item := range payload.Events {
-		item.SessionID = payload.SessionID
-		for _, ch := range subs {
-			select {
-			case ch <- item:
-			default:
-			}
-		}
-	}
+	h.Publish(payload.SessionID, payload.Events)
 	return nil
 }
 
@@ -278,6 +388,19 @@ func (h *daemonHub) Subscribe(sessionID string) (<-chan event.Event, func()) {
 	}
 }
 
+func (h *daemonHub) daemonForSession(sessionID string) (*daemonConnection, error) {
+	identity, err := session.ParseSessionID(sessionID)
+	if err != nil {
+		return nil, err
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	connection := h.devices[identity.DaemonID]
+	if connection == nil {
+		return nil, fmt.Errorf("daemon %s is offline", identity.DaemonID)
+	}
+	return connection, nil
+}
 func (h *daemonHub) broadcast(frame protocol.Envelope) error {
 	h.mu.RLock()
 	connections := make([]*daemonConnection, 0, len(h.devices))
@@ -296,10 +419,117 @@ func (h *daemonHub) broadcast(frame protocol.Envelope) error {
 	return nil
 }
 
-func (h *daemonHub) sendToSession(sessionID string, frame protocol.Envelope) error {
+func (h *daemonHub) effectiveSession(value session.Session) session.Session {
 	h.mu.RLock()
-	daemonID := h.routes[sessionID]
-	c := h.devices[daemonID]
+	defer h.mu.RUnlock()
+	identity, err := session.ParseSessionID(value.ID)
+	if err != nil {
+		daemonID := h.routes[value.ID]
+		if h.devices[daemonID] == nil {
+			value.State = session.StateStopped
+			value.Connection = session.ConnectionUnavailable
+			value.ProcessID = 0
+			return value
+		}
+		identity = session.SessionIdentity{DaemonID: daemonID}
+	}
+	if h.devices[identity.DaemonID] == nil {
+		value.State = session.StateStopped
+		value.Connection = session.ConnectionUnavailable
+		value.ProcessID = 0
+		value.Capabilities = session.Capabilities{CanReadHistory: value.ClaudeSessionID != "", CanResume: false}
+		return value
+	}
+	summary, ok := h.sessions[identity.DaemonID][value.ID]
+	if ok && summary.ClaudeSessionID != "" {
+		value.ClaudeSessionID = summary.ClaudeSessionID
+	}
+	if ok && (summary.State == session.StateRunning || summary.State == session.StateWaiting || summary.State == session.StateStarting) && summary.PID > 0 {
+		value.State = summary.State
+		value.Connection = summary.Connection
+		value.ProcessID = summary.PID
+		value.ClaudeSessionID = summary.ClaudeSessionID
+		value.Capabilities = session.Capabilities{CanStart: true, CanAttach: true, CanObserve: true, CanSendInput: true, CanStream: true, CanInterrupt: true, CanResume: true, CanReadHistory: true, CanReadTerminal: true}
+		return value
+	}
+	value.State = session.StateStopped
+	value.Connection = session.ConnectionUnavailable
+	value.ProcessID = 0
+	value.Capabilities = session.Capabilities{CanReadHistory: value.ClaudeSessionID != "", CanResume: value.ClaudeSessionID != "" && value.Workspace != ""}
+	return value
+}
+
+func (h *daemonHub) historySessions(coordinationID string) []session.Session {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	values := make([]session.Session, 0)
+	for daemonID, summaries := range h.history {
+		if h.devices[daemonID] == nil {
+			continue
+		}
+		for _, summary := range summaries {
+			values = append(values, historySummarySession(summary, coordinationID))
+		}
+	}
+	return values
+}
+
+func (h *daemonHub) historySession(id, coordinationID string) (session.Session, bool) {
+	identity, err := session.ParseSessionID(id)
+	if err != nil {
+		h.mu.RLock()
+		defer h.mu.RUnlock()
+		daemonID := h.routes[id]
+		if h.devices[daemonID] == nil {
+			return session.Session{}, false
+		}
+		summary, ok := h.history[daemonID][id]
+		if !ok {
+			return session.Session{}, false
+		}
+		return historySummarySession(summary, coordinationID), true
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if h.devices[identity.DaemonID] == nil {
+		return session.Session{}, false
+	}
+	summary, ok := h.history[identity.DaemonID][id]
+	if !ok {
+		return session.Session{}, false
+	}
+	return historySummarySession(summary, coordinationID), true
+}
+
+func historySummarySession(summary protocol.HistorySessionSummary, coordinationID string) session.Session {
+	agent := summary.Agent
+	if agent == "" {
+		agent = "claude"
+	}
+	agentSessionID := summary.AgentSessionID
+	if agentSessionID == "" && summary.ClaudeSessionID != "" {
+		agentSessionID = agent + "://" + summary.ClaudeSessionID
+	}
+	return session.Session{ID: summary.SessionID, CoordinationID: coordinationID, DaemonID: summary.DaemonID, Agent: agent, AgentSessionID: agentSessionID, ClaudeSessionID: summary.ClaudeSessionID, ExternalID: summary.ClaudeSessionID, Workspace: summary.Workspace, DisplayName: summary.DisplayName, DisplayNameSource: summary.DisplayNameSource, Role: "history", State: session.StateStopped, Source: session.SourceHistory, Connection: session.ConnectionUnavailable, Capabilities: session.Capabilities{CanReadHistory: true, CanResume: agentSessionID != "" && summary.Workspace != ""}, CreatedAt: summary.CreatedAt, UpdatedAt: summary.UpdatedAt}
+}
+
+func (h *daemonHub) hasRoute(sessionID string) bool {
+	identity, err := session.ParseSessionID(sessionID)
+	if err != nil {
+		return false
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.devices[identity.DaemonID] != nil
+}
+
+func (h *daemonHub) sendToSession(sessionID string, frame protocol.Envelope) error {
+	identity, err := session.ParseSessionID(sessionID)
+	if err != nil {
+		return fmt.Errorf("invalid session %s: %w", sessionID, err)
+	}
+	h.mu.RLock()
+	c := h.devices[identity.DaemonID]
 	h.mu.RUnlock()
 	if c == nil {
 		return fmt.Errorf("session %s is offline", sessionID)
@@ -307,7 +537,17 @@ func (h *daemonHub) sendToSession(sessionID string, frame protocol.Envelope) err
 	return c.write(frame)
 }
 
-func (h *daemonHub) request(ctx context.Context, sessionID, typ string, payload any, responseType string) (protocol.Envelope, error) {
+func (h *daemonHub) requestAny(ctx context.Context, typ string, payload any, responseType string) (protocol.Envelope, error) {
+	h.mu.RLock()
+	var connection *daemonConnection
+	for _, candidate := range h.devices {
+		connection = candidate
+		break
+	}
+	h.mu.RUnlock()
+	if connection == nil {
+		return protocol.Envelope{}, errors.New("no daemon is connected")
+	}
 	frame, err := protocol.NewEnvelope(typ, payload)
 	if err != nil {
 		return protocol.Envelope{}, err
@@ -322,7 +562,60 @@ func (h *daemonHub) request(ctx context.Context, sessionID, typ string, payload 
 		delete(h.pending, frame.RequestID)
 		h.mu.Unlock()
 	}()
-	if err := h.sendToSession(sessionID, frame); err != nil {
+	if err := connection.write(frame); err != nil {
+		return protocol.Envelope{}, err
+	}
+	// The peer may respond immediately; pending is installed before enqueue.
+	timer := time.NewTimer(h.timeout)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return protocol.Envelope{}, ctx.Err()
+	case <-timer.C:
+		return protocol.Envelope{}, fmt.Errorf("daemon request timed out")
+	case result := <-response:
+		if result.Type != responseType {
+			return protocol.Envelope{}, fmt.Errorf("unexpected daemon response %q", result.Type)
+		}
+		return result, nil
+	}
+}
+
+func (h *daemonHub) createSession(ctx context.Context, payload protocol.SessionCreatePayload) (protocol.SessionCreatedPayload, error) {
+	frame, err := h.requestAny(ctx, protocol.SessionCreate, payload, protocol.SessionCreated)
+	if err != nil {
+		return protocol.SessionCreatedPayload{}, err
+	}
+	var result protocol.SessionCreatedPayload
+	if err := protocol.DecodePayload(frame, &result); err != nil {
+		return protocol.SessionCreatedPayload{}, err
+	}
+	if result.Error != "" {
+		return result, errors.New(result.Error)
+	}
+	return result, nil
+}
+
+func (h *daemonHub) request(ctx context.Context, sessionID, typ string, payload any, responseType string) (protocol.Envelope, error) {
+	connection, err := h.daemonForSession(sessionID)
+	if err != nil {
+		return protocol.Envelope{}, err
+	}
+	frame, err := protocol.NewEnvelope(typ, payload)
+	if err != nil {
+		return protocol.Envelope{}, err
+	}
+	frame.RequestID = protocol.NewID("req")
+	response := make(chan protocol.Envelope, 1)
+	h.mu.Lock()
+	h.pending[frame.RequestID] = response
+	h.mu.Unlock()
+	defer func() {
+		h.mu.Lock()
+		delete(h.pending, frame.RequestID)
+		h.mu.Unlock()
+	}()
+	if err := connection.write(frame); err != nil {
 		return protocol.Envelope{}, err
 	}
 	timer := time.NewTimer(h.timeout)
@@ -338,6 +631,43 @@ func (h *daemonHub) request(ctx context.Context, sessionID, typ string, payload 
 		}
 		return result, nil
 	}
+}
+func (h *daemonHub) resumeSession(ctx context.Context, value session.Session) (session.Session, error) {
+	frame, err := h.request(ctx, value.ID, protocol.SessionCreate, protocol.SessionCreatePayload{
+		SessionID: value.ID, CoordinationID: value.CoordinationID, Workspace: value.Workspace,
+		DisplayName: value.DisplayName, Role: value.Role, Agent: value.Agent, ResumeID: value.AgentSessionID,
+	}, protocol.SessionCreated)
+	if err != nil {
+		return session.Session{}, err
+	}
+	var result protocol.SessionCreatedPayload
+	if err := protocol.DecodePayload(frame, &result); err != nil {
+		return session.Session{}, err
+	}
+	if result.Error != "" {
+		return session.Session{}, errors.New(result.Error)
+	}
+	value.Source = session.SourceManaged
+	value.State = session.StateRunning
+	value.Connection = session.ConnectionObserved
+	value.ProcessID = result.PID
+	value.Capabilities = session.Capabilities{CanStart: true, CanAttach: true, CanObserve: true, CanSendInput: true, CanStream: true, CanInterrupt: true, CanResume: true, CanReadHistory: true, CanReadTerminal: true}
+	return value, nil
+}
+
+func (h *daemonHub) stopSession(ctx context.Context, value session.Session) error {
+	frame, err := h.request(ctx, value.ID, protocol.SessionStop, protocol.StopPayload{SessionID: value.ID}, protocol.SessionStopResult)
+	if err != nil {
+		return err
+	}
+	var result protocol.StopResultPayload
+	if err := protocol.DecodePayload(frame, &result); err != nil {
+		return err
+	}
+	if !result.Accepted {
+		return errors.New(result.Error)
+	}
+	return nil
 }
 
 func (h *daemonHub) sessionInput(ctx context.Context, value session.Session, content string) error {
@@ -363,17 +693,24 @@ func (c *daemonConnection) write(frame protocol.Envelope) error {
 	}
 	select {
 	case c.send <- frame:
+		return nil
 	default:
 		return errors.New("daemon connection queue is full")
 	}
-	for {
-		select {
-		case next := <-c.send:
-			if err := c.conn.WriteJSON(next); err != nil {
-				return err
-			}
-		default:
-			return nil
+}
+
+func (c *daemonConnection) writeLoop() {
+	for frame := range c.send {
+		c.mu.Lock()
+		closed := c.closed
+		c.mu.Unlock()
+		if closed {
+			return
+		}
+		if err := c.conn.WriteJSON(frame); err != nil {
+			log.Printf("agora server: daemon %s write failed: %v", c.id, err)
+			c.close()
+			return
 		}
 	}
 }
@@ -382,7 +719,9 @@ func (c *daemonConnection) close() {
 	c.mu.Lock()
 	if !c.closed {
 		c.closed = true
-		_ = c.conn.Close()
+		if c.conn != nil {
+			_ = c.conn.Close()
+		}
 	}
 	c.mu.Unlock()
 }

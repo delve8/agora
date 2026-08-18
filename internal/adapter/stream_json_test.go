@@ -2,6 +2,21 @@ package adapter
 
 import "testing"
 
+func TestStreamAndHistoryUseSameStableID(t *testing.T) {
+	data := []byte(`{"type":"assistant","uuid":"a1","message":{"content":[{"type":"text","text":"hello"}]}}`)
+	stream, err := ParseStreamEvent("sess-1", data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	history, err := ParseHistoryEvent("sess-1", data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stream.Event.ID != history.Event.ID {
+		t.Fatalf("stream ID %q differs from history ID %q", stream.Event.ID, history.Event.ID)
+	}
+}
+
 func TestParseStreamEvent(t *testing.T) {
 	tests := []struct {
 		name    string

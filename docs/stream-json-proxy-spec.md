@@ -288,7 +288,7 @@ proxy session 至少记录：
 - wrapper PID 和 real Claude PID（如果可得）；
 - `--resume` 值（只作为关联信息，不改写）；
 - running/stopped/failed 状态；
-- 事件和退出信息；
+- 事件和退出信息（事件默认仅实时转发；有可定位的 Claude JSONL 时才支持历史回读）；
 - 创建与结束时间。
 
 proxy session 的输入能力默认是：
@@ -313,7 +313,7 @@ CanApprove = false
 - `RawJSON = 原始事件行`；
 - `Kind/Content/Subtype` 复用现有 parser 结果。
 
-事件写入 Store 后，通过现有 manager/SSE 发布。proxy 不需要 JSONL observer 才能实时观察；如果 Claude 同时写入 JSONL，JSONL 仍是独立的可选历史来源，不得造成重复事件。
+事件通过有界内存去重后直接发布到现有 SSE，不写入 SQLite。proxy 不需要 JSONL observer 才能实时观察；如果 `--resume` 对应的 Claude JSONL 可定位，历史请求可以按需解析该原始文件。无法定位 JSONL 的 proxy session 是 live-only，进程或 Agora 重启后不提供历史回放。
 
 ## 8. Agora server side-channel
 
@@ -348,9 +348,9 @@ POST /api/proxy/sessions/{id}/exit
 事件上报可以批量发送。批量大小和 flush 时间必须有界。服务端：
 
 - 校验 session 存在；
-- 持久化事件；
-- 使用 `ExternalID + Source` 做幂等；
-- 发布现有 SSE；
+- 使用有界内存中的 `ExternalID + Source` 做进程生命周期内幂等；
+- 直接发布现有 SSE；
+- 不把事件写入 SQLite；
 - 不把事件转发给其他 Claude session；
 - 不把旁路事件解释成用户授权。
 

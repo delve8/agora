@@ -13,7 +13,7 @@ export function MemberPanel({ session, selected, onSelect }: { session?: Session
       <Descriptions.Item label="Agent">{session.agent}</Descriptions.Item>
       <Descriptions.Item label="Role">{session.role || "unassigned"}</Descriptions.Item>
       <Descriptions.Item label="Workspace"><Text ellipsis={{ tooltip: session.workspace }}>{session.workspace}</Text></Descriptions.Item>
-      {session.process_id ? <Descriptions.Item label="Process">{session.process_id}</Descriptions.Item> : null}
+      <Descriptions.Item label="Session ID"><Text copyable={{ text: session.claude_session_id || session.id }} ellipsis={{ tooltip: session.claude_session_id || session.id }}>{session.claude_session_id || session.id}</Text></Descriptions.Item>
     </Descriptions>
     {session.last_error && <Text type="danger">{session.last_error}</Text>}
   </Card>;

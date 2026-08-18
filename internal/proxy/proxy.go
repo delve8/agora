@@ -274,7 +274,7 @@ type registration struct {
 func register(ctx context.Context, opts Options, realPID int) (string, error) {
 	body := map[string]any{
 		"workspace":    currentWorkspace(),
-		"display_name": "Claude Code Proxy",
+		"display_name": "New session",
 		"wrapper_pid":  os.Getpid(),
 		"real_pid":     realPID,
 		"resume_id":    resumeID(opts.Args),
