@@ -76,6 +76,8 @@ button, input, textarea { font: inherit; }
 .setup-card { box-shadow: 0 12px 36px rgba(31, 41, 55, .08); }
 .setup-form { margin-top: 24px; }
 .loading-screen { min-height: 100vh; display: grid; place-items: center; color: #86909c; background: #f5f7fa; }
+.auth-signout { position: fixed; right: 12px; bottom: 10px; display: flex; align-items: center; gap: 8px; color: #86909c; font-size: 12px; background: rgba(245, 247, 250, .85); border-radius: 6px; padding: 0 4px; }
+.auth-identity { max-width: 42vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mobile-menu-button { display: none; }
 
 @media (max-width: 900px) {

@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -18,6 +19,8 @@ import (
 	"time"
 
 	"github.com/delve8/agora/internal/adapter"
+	"github.com/delve8/agora/internal/auth"
+	"github.com/delve8/agora/internal/config"
 	"github.com/delve8/agora/internal/coordination"
 	"github.com/delve8/agora/internal/event"
 	"github.com/delve8/agora/internal/message"
@@ -32,20 +35,43 @@ type Server struct {
 	store   *store.Store
 	manager *runtime.Manager
 	daemons *daemonHub
+	auth    *auth.Authenticator
 }
 
 func New(addr string, db *store.Store, manager *runtime.Manager) *Server {
-	return NewWithWebDir(addr, db, manager, "")
+	return NewWithWebDirAndAuth(addr, db, manager, "", config.ServerAuthConfig{Mode: config.AuthModeLocal})
 }
 
 func NewWithWebDir(addr string, db *store.Store, manager *runtime.Manager, webDir string) *Server {
+	return NewWithWebDirAndAuth(addr, db, manager, webDir, config.ServerAuthConfig{Mode: config.AuthModeLocal})
+}
+
+func NewWithWebDirAndAuth(addr string, db *store.Store, manager *runtime.Manager, webDir string, authConfig config.ServerAuthConfig) *Server {
 	if strings.TrimSpace(webDir) == "" {
 		webDir = filepath.Join("web", "dist")
 	}
-	s := &Server{store: db, manager: manager, daemons: newDaemonHub()}
+	if authConfig.Mode == "" {
+		authConfig.Mode = config.AuthModeLocal
+	}
+	var validator auth.TokenValidator
+	if authConfig.Mode == config.AuthModeLogto {
+		validator, _ = auth.NewLogtoTokenValidator(auth.LogtoValidatorOptions{Issuer: authConfig.Issuer, Audience: authConfig.Audience})
+	}
+	local := auth.Principal{UserID: "local", Provider: auth.ProviderLocal, DisplayName: "Local"}
+	if db != nil {
+		if principal, err := db.GetOrCreateLocalUser(context.Background()); err == nil {
+			local = principal
+		}
+	}
+	s := &Server{store: db, manager: manager, daemons: newDaemonHub(db, authConfig.Mode), auth: auth.NewAuthenticatorWithProvisioning(authConfig.Mode, validator, db, local, authConfig.Provisioning)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /api/daemon/ws", s.daemons.serveHTTP)
+	mux.HandleFunc("POST /api/daemon/pair", s.pairDaemon)
+	mux.HandleFunc("GET /api/me", s.me)
+	mux.HandleFunc("POST /api/devices/pair-codes", s.createPairCode)
+	mux.HandleFunc("GET /api/devices", s.listDevices)
+	mux.HandleFunc("POST /api/devices/{id}/revoke", s.revokeDevice)
 	mux.HandleFunc("GET /api/state", s.state)
 	mux.HandleFunc("POST /api/coordinations", s.createCoordination)
 	mux.HandleFunc("GET /api/coordinations/{id}", s.getCoordination)
@@ -62,7 +88,7 @@ func NewWithWebDir(addr string, db *store.Store, manager *runtime.Manager, webDi
 	mux.HandleFunc("POST /api/proxy/sessions/{id}/events", s.ingestProxyEvents)
 	mux.HandleFunc("POST /api/proxy/sessions/{id}/exit", s.reportProxyExit)
 	mux.Handle("/", s.frontendHandler(webDir))
-	s.HTTP = &http.Server{Addr: addr, Handler: mux}
+	s.HTTP = &http.Server{Addr: addr, Handler: s.authMiddleware(mux)}
 	return s
 }
 
@@ -151,6 +177,12 @@ func (s *Server) effectiveStoredSession(ctx context.Context, value session.Sessi
 func (s *Server) resolveSession(ctx context.Context, id string) (session.Session, sessionLocation, error) {
 	value, err := s.store.GetSession(ctx, id)
 	if err == nil {
+		if err := s.authorizeSession(ctx, value); err != nil {
+			if errors.Is(err, errForbidden) {
+				return session.Session{}, sessionLocationStored, err
+			}
+			return session.Session{}, sessionLocationStored, err
+		}
 		value, err = s.effectiveStoredSession(ctx, value)
 		return value, sessionLocationStored, err
 	}
@@ -169,20 +201,193 @@ func (s *Server) resolveSession(ctx context.Context, id string) (session.Session
 		if value, ok, historyErr := s.manager.HistorySession(ctx, id, coordinationID, "local"); historyErr != nil {
 			return session.Session{}, sessionLocationLocalHistory, historyErr
 		} else if ok {
+			if err := s.authorizeSession(ctx, value); err != nil {
+				return session.Session{}, sessionLocationLocalHistory, err
+			}
 			return value, sessionLocationLocalHistory, nil
 		}
 	}
 	if identity, identityErr := session.ParseSessionID(id); identityErr == nil {
-		if s.daemons.hasRoute(id) {
-			return session.Session{ID: id, CoordinationID: coordinationID, DaemonID: identity.DaemonID, Agent: identity.Agent, AgentSessionID: identity.AgentSessionID, DisplayName: identity.AgentSessionID, Role: "history", State: session.StateStopped, Source: session.SourceHistory, Connection: session.ConnectionObserved, Capabilities: session.Capabilities{CanReadHistory: true, CanResume: true}}, sessionLocationDaemonHistory, nil
+		value := session.Session{ID: id, CoordinationID: coordinationID, DaemonID: identity.DaemonID, Agent: identity.Agent, AgentSessionID: identity.AgentSessionID, DisplayName: identity.AgentSessionID, Role: "history", State: session.StateStopped, Source: session.SourceHistory, Connection: session.ConnectionObserved, Capabilities: session.Capabilities{CanReadHistory: true, CanResume: true}}
+		if err := s.authorizeSession(ctx, value); err != nil {
+			return session.Session{}, sessionLocationDaemonHistory, err
 		}
-		return session.Session{ID: id, CoordinationID: coordinationID, DaemonID: identity.DaemonID, Agent: identity.Agent, AgentSessionID: identity.AgentSessionID, DisplayName: identity.AgentSessionID, Role: "history", State: session.StateStopped, Source: session.SourceHistory, Connection: session.ConnectionUnavailable, Capabilities: session.Capabilities{CanReadHistory: true, CanResume: true}}, sessionLocationDaemonHistory, nil
+		if s.daemons.hasRoute(id) {
+			return value, sessionLocationDaemonHistory, nil
+		}
+		value.Connection = session.ConnectionUnavailable
+		return value, sessionLocationDaemonHistory, nil
 	}
 	return session.Session{}, sessionLocationStored, sql.ErrNoRows
 }
 
+var errForbidden = errors.New("forbidden")
+
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) authorizeSession(ctx context.Context, value session.Session) error {
+	principal, err := auth.RequirePrincipal(ctx)
+	if err != nil {
+		return err
+	}
+	if s.auth.Mode() == config.AuthModeLocal {
+		return nil
+	}
+	daemonID := value.DaemonID
+	if daemonID == "" {
+		if identity, parseErr := value.Identity(); parseErr == nil {
+			daemonID = identity.DaemonID
+		}
+	}
+	if daemonID == "" {
+		return errors.New("session has no daemon ownership")
+	}
+	owned, err := s.store.UserOwnsDaemon(ctx, principal.UserID, daemonID)
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return errForbidden
+	}
+	return nil
+}
+
+func (s *Server) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" || r.URL.Path == "/api/daemon/ws" || r.URL.Path == "/api/daemon/pair" || !strings.HasPrefix(r.URL.Path, "/api/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if r.Method != http.MethodGet && !sameOriginRequest(r) {
+			writeErrorStatus(w, http.StatusForbidden, errors.New("cross-origin request is not allowed"))
+			return
+		}
+		principal, err := s.auth.Authenticate(r.Context(), auth.ExtractBearer(r.Header.Get("Authorization")))
+		if err != nil {
+			writeErrorStatus(w, http.StatusUnauthorized, err)
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(auth.WithPrincipal(r.Context(), principal)))
+	})
+}
+
+func sameOriginRequest(r *http.Request) bool {
+	for _, header := range []string{"Origin", "Referer"} {
+		value := strings.TrimSpace(r.Header.Get(header))
+		if value == "" {
+			continue
+		}
+		u, err := url.Parse(value)
+		if err != nil || u.Host == "" || !sameHost(u.Host, r.Host) {
+			return false
+		}
+	}
+	return true
+}
+
+func sameHost(a, b string) bool {
+	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
+}
+
+func (s *Server) me(w http.ResponseWriter, r *http.Request) {
+	principal, err := auth.RequirePrincipal(r.Context())
+	if err != nil {
+		writeErrorStatus(w, http.StatusUnauthorized, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"principal": principal, "auth_mode": s.auth.Mode()})
+}
+
+func (s *Server) createPairCode(w http.ResponseWriter, r *http.Request) {
+	principal, err := auth.RequirePrincipal(r.Context())
+	if err != nil {
+		writeErrorStatus(w, http.StatusUnauthorized, err)
+		return
+	}
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		writeError(w, err)
+		return
+	}
+	code := fmt.Sprintf("%x", raw[:])
+	expires := time.Now().UTC().Add(10 * time.Minute)
+	if err := s.store.CreatePairCode(r.Context(), principal.UserID, store.HashSecret(code), expires); err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"code": code, "expires_at": expires})
+}
+
+func (s *Server) pairDaemon(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Code string `json:"code"`
+		Name string `json:"name"`
+	}
+	if err := decodeJSON(r, &input); err != nil {
+		writeErrorStatus(w, http.StatusBadRequest, err)
+		return
+	}
+	code := strings.TrimSpace(input.Code)
+	if code == "" {
+		writeErrorStatus(w, http.StatusBadRequest, errors.New("code is required"))
+		return
+	}
+	userID, err := s.store.ConsumePairCode(r.Context(), store.HashSecret(code), time.Now().UTC())
+	if err != nil {
+		writeErrorStatus(w, http.StatusUnauthorized, errors.New("invalid or expired pairing code"))
+		return
+	}
+	var credentialBytes [32]byte
+	if _, err := rand.Read(credentialBytes[:]); err != nil {
+		writeError(w, err)
+		return
+	}
+	credential := fmt.Sprintf("%x", credentialBytes[:])
+	deviceID := newID("device")
+	if err := s.store.CreateDevice(r.Context(), store.Device{ID: deviceID, UserID: userID, CredentialHash: store.HashSecret(credential), Name: strings.TrimSpace(input.Name), CreatedAt: time.Now().UTC()}); err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]string{"device_id": deviceID, "credential": credential})
+}
+
+func (s *Server) listDevices(w http.ResponseWriter, r *http.Request) {
+	principal, err := auth.RequirePrincipal(r.Context())
+	if err != nil {
+		writeErrorStatus(w, http.StatusUnauthorized, err)
+		return
+	}
+	values, err := s.store.ListDevices(r.Context(), principal.UserID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, values)
+}
+
+func (s *Server) revokeDevice(w http.ResponseWriter, r *http.Request) {
+	principal, err := auth.RequirePrincipal(r.Context())
+	if err != nil {
+		writeErrorStatus(w, http.StatusUnauthorized, err)
+		return
+	}
+	deviceID := r.PathValue("id")
+	owned, err := s.store.UserOwnsDaemon(r.Context(), principal.UserID, deviceID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if !owned {
+		writeErrorStatus(w, http.StatusNotFound, sql.ErrNoRows)
+		return
+	}
+	if err := s.store.RevokeDevice(r.Context(), deviceID, time.Now().UTC()); err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"revoked": true})
 }
 
 func (s *Server) state(w http.ResponseWriter, r *http.Request) {
@@ -683,6 +888,11 @@ func (s *Server) createMessage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	principal, err := auth.RequirePrincipal(r.Context())
+	if err != nil {
+		writeErrorStatus(w, http.StatusUnauthorized, err)
+		return
+	}
 	if !value.Capabilities.CanSendInput {
 		writeErrorStatus(w, http.StatusConflict, fmt.Errorf("session is not running; resume it before sending input"))
 		return
@@ -700,7 +910,7 @@ func (s *Server) createMessage(w http.ResponseWriter, r *http.Request) {
 		writeErrorStatus(w, http.StatusBadRequest, fmt.Errorf("content is required"))
 		return
 	}
-	msg := message.Message{ID: newID("msg"), CoordinationID: value.CoordinationID, Sender: message.Endpoint{Type: "human", ID: "local"}, Recipient: message.Endpoint{Type: "session", ID: id}, Content: input.Content, ReplyTo: input.ReplyTo, Status: message.StatusPending, CreatedAt: time.Now().UTC()}
+	msg := message.Message{ID: newID("msg"), CoordinationID: value.CoordinationID, Sender: message.Endpoint{Type: "human", ID: principal.UserID}, Recipient: message.Endpoint{Type: "session", ID: id}, Content: input.Content, ReplyTo: input.ReplyTo, Status: message.StatusPending, CreatedAt: time.Now().UTC()}
 	if err := s.store.CreateMessage(r.Context(), msg); err != nil {
 		writeError(w, err)
 		return
@@ -931,6 +1141,10 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 func writeError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errForbidden) {
+		writeErrorStatus(w, http.StatusForbidden, err)
+		return
+	}
 	writeErrorStatus(w, http.StatusInternalServerError, err)
 }
 func writeErrorStatus(w http.ResponseWriter, status int, err error) {

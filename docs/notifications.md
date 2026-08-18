@@ -180,25 +180,61 @@ URL 的要求：
 - 如果持久化配置，使用加密配置或系统安全存储；
 - 一期不支持通过 IM 入站 webhook 反向控制 Agent。
 
-## 7. Deep link
+## 7. Deep link 与 capability link
 
-通知链接形态：
+通知可以携带两种不同的 Web 链接，provider adapter 必须按 Server 当前认证模式选择：
+
+### 7.1 普通登录 Session URL
 
 ```text
 https://agora.example/sessions/<session-id>
 ```
 
-链接只定位指定 Session 的 Web 观察页：
+该 URL 不包含秘密。用户打开后按正常 Web 认证流程（Logto 登录或已有 Web session）进入，Server 再检查当前 principal 是否拥有目标 Session。`focus=terminal` 等参数只改变展示位置，不改变权限。
 
-- 不授予 PTY attach 写入；
-- 不授予审批能力；
-- 不允许访问其他 Session；
-- 不替代 Web 认证。
+### 7.2 只读 notification capability link
 
-没有可用的公开 Server Web 地址时：
+如果产品要求用户点开 IM 链接后无需再次输入登录信息，Server 应签发专用 capability link：
 
-- 通知明确提示“请在 Agora 所在机器打开”；或
-- 省略链接。
+```text
+https://agora.example/auth/notification-link?token=<opaque-token>
+```
+
+签发和兑换规则：
+
+- 只能由已认证且拥有目标 Session 读取权限的用户触发签发；
+- token 高熵不可预测，Server 只保存哈希或使用带密钥的签名结构；
+- grant 绑定 `user_id`、单个 `session_id`、`scope=read_observation`、`issued_at`、`expires_at` 和撤销依据；
+- 推荐 TTL 为 10 分钟；
+- 专用 endpoint 验证成功后设置 `HttpOnly + Secure + SameSite` 的受限 cookie，再 302 到不带 token 的 Session URL；
+- 响应设置 `Referrer-Policy: no-referrer`，页面和静态资源不得传播 token；
+- 兑换后的 cookie 生命周期不超过 grant TTL，且不能作为通用 API Bearer credential。
+
+`read_observation` 只允许：
+
+- 指定 Session metadata；
+- 指定 Session history；
+- 指定 Session SSE event stream；
+- 指定 Session 只读 PTY snapshot。
+
+它不允许：
+
+- `POST /api/sessions/{id}/messages`；
+- resume、stop、PTY attach 写入；
+- 设备配对、设备撤销、webhook 配置；
+- 其他 Session 或未来审批接口。
+
+这不是完整登录凭证。token 泄露的后果是持有者在 TTL 内可以观察绑定 Session，因此 IM 群、频道、邮箱等通知 target 是可信接收边界。通知正文仍不得包含完整 transcript、PTY raw bytes、credential、完整 workspace 或敏感工具参数。
+
+IM provider、邮件客户端和安全扫描器可能预取链接；实现不得依赖“首次 GET 立即永久消费”作为唯一防重放机制。优先使用短 TTL、scope 限制、撤销/授权版本和兑换后清理 URL。若未来需要严格一次性消费，应另行设计预览/确认流程。
+
+### 7.3 本地地址
+
+- trust-local 模式自动使用 `local` 用户，不要求登录或 capability cookie；
+- `127.0.0.1`/`localhost` 链接只适用于 Agora 所在机器；
+- 没有公开 HTTPS 地址时，通知应提示“请在 Agora 所在机器打开”或省略链接；
+- `local` 模式禁止把 Server 绑定到非 loopback；跨设备通知链接必须使用认证模式和 HTTPS。
+
 
 ## 8. 隐私与生命周期
 

@@ -28,7 +28,15 @@ func main() {
 	case "server":
 		err = runServer()
 	case "daemon":
-		err = runDaemon()
+		pairCode := ""
+		if len(os.Args) == 4 && os.Args[2] == "--pair" {
+			pairCode = os.Args[3]
+		} else if len(os.Args) > 2 {
+			err = fmt.Errorf("daemon supports only --pair <code>")
+		}
+		if err == nil {
+			err = runDaemon(pairCode)
+		}
 	case "pty":
 		err = runPTY(os.Args[2:])
 	case "attach":

@@ -16,9 +16,11 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/delve8/agora/internal/auth"
 	"github.com/delve8/agora/internal/event"
 	"github.com/delve8/agora/internal/protocol"
 	"github.com/delve8/agora/internal/session"
+	"github.com/delve8/agora/internal/store"
 )
 
 const (
@@ -29,6 +31,8 @@ const (
 
 type daemonHub struct {
 	mu          sync.RWMutex
+	store       *store.Store
+	authMode    string
 	devices     map[string]*daemonConnection
 	routes      map[string]string
 	sessions    map[string]map[string]protocol.SessionSummary
@@ -51,6 +55,7 @@ type resyncAccumulator struct {
 }
 type daemonConnection struct {
 	id       string
+	userID   string
 	conn     *websocket.Conn
 	send     chan protocol.Envelope
 	lastSeen time.Time
@@ -58,8 +63,18 @@ type daemonConnection struct {
 	closed   bool
 }
 
-func newDaemonHub() *daemonHub {
+func newDaemonHub(args ...any) *daemonHub {
+	var db *store.Store
+	authMode := "local"
+	if len(args) > 0 {
+		db, _ = args[0].(*store.Store)
+	}
+	if len(args) > 1 {
+		authMode, _ = args[1].(string)
+	}
 	h := &daemonHub{
+		store:       db,
+		authMode:    authMode,
 		devices:     make(map[string]*daemonConnection),
 		routes:      make(map[string]string),
 		sessions:    make(map[string]map[string]protocol.SessionSummary),
@@ -83,8 +98,21 @@ func newDaemonHub() *daemonHub {
 }
 
 func (h *daemonHub) serveHTTP(w http.ResponseWriter, r *http.Request) {
-	if h.token != "" {
-		provided := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+	var device store.Device
+	if h.authMode == "logto" {
+		provided := auth.ExtractBearer(r.Header.Get("Authorization"))
+		if provided == "" || h.store == nil {
+			http.Error(w, "daemon authentication required", http.StatusUnauthorized)
+			return
+		}
+		var err error
+		device, err = h.store.GetDeviceByCredentialHash(r.Context(), store.HashSecret(provided))
+		if err != nil || device.RevokedAt != nil {
+			http.Error(w, "daemon authentication required", http.StatusUnauthorized)
+			return
+		}
+	} else if h.token != "" {
+		provided := auth.ExtractBearer(r.Header.Get("Authorization"))
 		if provided == "" || hashCredential(provided) != hashCredential(h.token) {
 			http.Error(w, "daemon authentication required", http.StatusUnauthorized)
 			return
@@ -127,7 +155,14 @@ func (h *daemonHub) serveHTTP(w http.ResponseWriter, r *http.Request) {
 				_ = writeEnvelope(conn, errorEnvelope("invalid_register", "daemon_id is required", frame.RequestID))
 				continue
 			}
-			registered = &daemonConnection{id: payload.DaemonID, conn: conn, send: make(chan protocol.Envelope, 128), lastSeen: time.Now().UTC()}
+			if h.authMode == "logto" && payload.DaemonID != device.ID {
+				_ = writeEnvelope(conn, errorEnvelope("invalid_register", "daemon_id does not match credential", frame.RequestID))
+				continue
+			}
+			registered = &daemonConnection{id: payload.DaemonID, userID: device.UserID, conn: conn, send: make(chan protocol.Envelope, 128), lastSeen: time.Now().UTC()}
+			if h.authMode == "logto" && h.store != nil {
+				_ = h.store.TouchDevice(r.Context(), payload.DaemonID, time.Now().UTC())
+			}
 			h.register(registered)
 			go registered.writeLoop()
 			response, _ := protocol.NewEnvelope(protocol.DaemonRegistered, map[string]any{"protocol_version": "1", "resync_required": true})
@@ -175,6 +210,9 @@ func (h *daemonHub) handleFrame(c *daemonConnection, frame protocol.Envelope) er
 	h.mu.Unlock()
 	switch frame.Type {
 	case protocol.DaemonHeartbeat:
+		if h.authMode == "logto" && h.store != nil {
+			_ = h.store.TouchDevice(context.Background(), c.id, time.Now().UTC())
+		}
 		response, _ := protocol.NewEnvelope(protocol.DaemonHeartbeatAck, map[string]any{"at": time.Now().UTC()})
 		response.RequestID = frame.RequestID
 		return c.write(response)

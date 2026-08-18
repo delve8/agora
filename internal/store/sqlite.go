@@ -61,6 +61,12 @@ CREATE TABLE IF NOT EXISTS coordinations (id TEXT PRIMARY KEY, name TEXT NOT NUL
 CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, coordination_id TEXT NOT NULL, agent TEXT NOT NULL, external_id TEXT NOT NULL, workspace TEXT NOT NULL, display_name TEXT NOT NULL, role TEXT NOT NULL, state TEXT NOT NULL, capabilities_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY (coordination_id) REFERENCES coordinations(id));
 CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, coordination_id TEXT NOT NULL, sender_type TEXT NOT NULL, sender_id TEXT NOT NULL, recipient_type TEXT NOT NULL, recipient_id TEXT NOT NULL, content TEXT NOT NULL, reply_to TEXT NOT NULL, status TEXT NOT NULL, error TEXT NOT NULL, created_at TEXT NOT NULL, FOREIGN KEY (coordination_id) REFERENCES coordinations(id));
 CREATE TABLE IF NOT EXISTS observation_cursors (session_id TEXT PRIMARY KEY, path TEXT NOT NULL, byte_offset INTEGER NOT NULL DEFAULT 0, line INTEGER NOT NULL DEFAULT 0, last_id TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, FOREIGN KEY (session_id) REFERENCES sessions(id));
+CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, display_name TEXT NOT NULL, email TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, created_at TEXT NOT NULL, last_seen_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS user_identities (user_id TEXT NOT NULL, provider TEXT NOT NULL, subject TEXT NOT NULL, PRIMARY KEY (provider, subject), FOREIGN KEY (user_id) REFERENCES users(id));
+CREATE TABLE IF NOT EXISTS devices (device_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, credential_hash TEXT NOT NULL UNIQUE, name TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, last_seen_at TEXT NOT NULL DEFAULT '', revoked_at TEXT NOT NULL DEFAULT '', FOREIGN KEY (user_id) REFERENCES users(id));
+CREATE TABLE IF NOT EXISTS pair_codes (code_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at TEXT NOT NULL, consumed_at TEXT NOT NULL DEFAULT '', FOREIGN KEY (user_id) REFERENCES users(id));
+CREATE INDEX IF NOT EXISTS devices_user_id ON devices(user_id);
+CREATE INDEX IF NOT EXISTS pair_codes_user_id ON pair_codes(user_id);
 CREATE INDEX IF NOT EXISTS messages_coord_created ON messages(coordination_id, created_at);
 `)
 	if err != nil {
