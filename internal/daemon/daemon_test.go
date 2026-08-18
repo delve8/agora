@@ -4,7 +4,26 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/delve8/agora/internal/runtime"
+	"github.com/delve8/agora/internal/session"
 )
+
+func TestResolveWorkspacePrefersRuntimeThenHistory(t *testing.T) {
+	runtimeStore := runtime.NewMemoryStore()
+	_ = runtimeStore.CreateSession(context.Background(), session.Session{ID: "daemon/daemon-1/claude://claude-1", Workspace: "/from/runtime"})
+	manager := runtime.NewManager(runtimeStore, nil, nil)
+	d := &Daemon{manager: manager, historySessions: []session.Session{{ID: "daemon/daemon-1/claude://claude-1", Workspace: "/from/history"}, {ID: "daemon/daemon-1/claude://claude-2", Workspace: "/second"}}}
+	if got := d.resolveWorkspace("daemon/daemon-1/claude://claude-1"); got != "/from/runtime" {
+		t.Fatalf("runtime workspace = %q", got)
+	}
+	if got := d.resolveWorkspace("daemon/daemon-1/claude://claude-2"); got != "/second" {
+		t.Fatalf("history workspace = %q", got)
+	}
+	if got := d.resolveWorkspace("daemon/daemon-1/claude://missing"); got != "" {
+		t.Fatalf("missing workspace = %q", got)
+	}
+}
 
 func TestReconnectDelayIsBounded(t *testing.T) {
 	if got := reconnectDelay(0); got != time.Second {

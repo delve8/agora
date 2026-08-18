@@ -145,6 +145,7 @@ type SessionCreatedPayload struct {
 	AgentSessionID string `json:"agent_session_id,omitempty"`
 	// Deprecated compatibility field.
 	ClaudeSessionID string          `json:"claude_session_id,omitempty"`
+	Workspace       string          `json:"workspace,omitempty"`
 	PID             int             `json:"pid,omitempty"`
 	HistoryPath     string          `json:"history_path,omitempty"`
 	Capabilities    map[string]bool `json:"capabilities,omitempty"`

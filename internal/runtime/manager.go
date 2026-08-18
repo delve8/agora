@@ -59,6 +59,9 @@ func (m *Manager) ListSessions(ctx context.Context, coordinationID string) ([]se
 }
 
 func (m *Manager) GetSession(ctx context.Context, id string) (session.Session, error) {
+	if m == nil || m.store == nil {
+		return session.Session{}, errSessionNotFound
+	}
 	return m.store.GetSession(ctx, id)
 }
 
@@ -385,6 +388,18 @@ func (m *Manager) ResumeManagedSessions(ctx context.Context) error {
 	return nil
 }
 
+func isSessionNotFound(err error) bool {
+	return errors.Is(err, sql.ErrNoRows) || errors.Is(err, errSessionNotFound)
+}
+
+func isCursorNotFound(err error) bool {
+	return errors.Is(err, sql.ErrNoRows) || errors.Is(err, errCursorNotFound)
+}
+
+func managedRunningCapabilities() session.Capabilities {
+	return session.Capabilities{CanStart: true, CanAttach: true, CanObserve: true, CanSendInput: true, CanStream: true, CanInterrupt: true, CanResume: true, CanReadHistory: true, CanReadTerminal: true}
+}
+
 func (m *Manager) ResumeSession(ctx context.Context, value session.Session) (session.Session, error) {
 	if m.pty == nil {
 		return session.Session{}, fmt.Errorf("session manager is unavailable")
@@ -401,13 +416,17 @@ func (m *Manager) ResumeSession(ctx context.Context, value session.Session) (ses
 		return session.Session{}, fmt.Errorf("workspace must be an existing directory")
 	}
 	value.Workspace = workspace
+	if value.AgentSessionID == "" && value.ClaudeSessionID != "" {
+		value.AgentSessionID = "claude://" + value.ClaudeSessionID
+	}
 	if m.IsRunning(value.ID) {
 		if stored, getErr := m.store.GetSession(ctx, value.ID); getErr == nil {
 			return m.EffectiveSession(stored), nil
 		}
 		return m.EffectiveSession(value), nil
 	}
-	if _, err := m.store.GetSession(ctx, value.ID); errors.Is(err, sql.ErrNoRows) {
+	_, err = m.store.GetSession(ctx, value.ID)
+	if isSessionNotFound(err) {
 		value.Source = session.SourceManaged
 		value.State = session.StateStarting
 		value.Connection = session.ConnectionUnavailable
@@ -437,6 +456,7 @@ func (m *Manager) ResumeSession(ctx context.Context, value session.Session) (ses
 	value.HistoryPath = adapter.FindHistoryBySessionID(m.homeDir, value.ClaudeSessionID)
 	value.State = session.StateRunning
 	value.Connection = session.ConnectionObserved
+	value.Capabilities = managedRunningCapabilities()
 	value.LastError = ""
 	if err := m.store.UpdateSessionObservation(ctx, value); err != nil {
 		return session.Session{}, err
@@ -518,7 +538,7 @@ func (m *Manager) ReconcileObservers(ctx context.Context) error {
 func (m *Manager) observe(ctx context.Context, value session.Session) {
 	defer m.StopObserver(value.ID)
 	cursor, err := m.store.GetObservationCursor(ctx, value.ID)
-	if err == sql.ErrNoRows {
+	if isCursorNotFound(err) {
 		cursor = store.ObservationCursor{SessionID: value.ID, Path: value.HistoryPath}
 	} else if err != nil {
 		m.markObservationError(value, err)

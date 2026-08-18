@@ -10,6 +10,7 @@ import (
 
 	"github.com/delve8/agora/internal/adapter"
 	"github.com/delve8/agora/internal/coordination"
+	"github.com/delve8/agora/internal/message"
 	"github.com/delve8/agora/internal/session"
 	"github.com/delve8/agora/internal/store"
 	"github.com/delve8/agora/internal/terminal"
@@ -89,7 +90,7 @@ func TestManagerResumeUsesSameSessionAndPersistsExit(t *testing.T) {
 	}
 	argsPath := filepath.Join(home, "args.txt")
 	binary := filepath.Join(home, "claude-test")
-	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + argsPath + "\nsleep 0.2\n"
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + argsPath + "\nsleep 2\n"
 	if err := os.WriteFile(binary, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -138,6 +139,149 @@ func TestManagerResumeUsesSameSessionAndPersistsExit(t *testing.T) {
 	}
 	stored, _ := db.GetSession(context.Background(), original.ID)
 	t.Fatalf("exit state was not persisted: %+v", stored)
+}
+
+func TestManagerResumeUsesMemoryStoreForHistorySession(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	if err := os.MkdirAll(workspace, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	argsPath := filepath.Join(home, "args.txt")
+	binary := filepath.Join(home, "claude-test")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + argsPath + "\nsleep 2\n"
+	if err := os.WriteFile(binary, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	manager := NewManager(NewMemoryStore(), adapter.NewClaudeCodeAdapter(binary), NewPTYManager(binary, home))
+	defer manager.Close()
+	original := session.Session{
+		ID:              "daemon/daemon-1/claude://claude-1",
+		DaemonID:        "daemon-1",
+		Agent:           "claude",
+		AgentSessionID:  "claude://claude-1",
+		ClaudeSessionID: "claude-1",
+		Workspace:       workspace,
+		DisplayName:     "History session",
+		State:           session.StateStopped,
+		Source:          session.SourceHistory,
+		Capabilities:    session.Capabilities{CanReadHistory: true, CanResume: true},
+	}
+	resumed, err := manager.ResumeSession(context.Background(), original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed.ID != original.ID || resumed.Source != session.SourceManaged || !resumed.Capabilities.CanSendInput || !manager.IsRunning(original.ID) {
+		t.Fatalf("unexpected resumed session: %+v", resumed)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		data, readErr := os.ReadFile(argsPath)
+		if readErr == nil && strings.TrimSpace(string(data)) == "--resume\nclaude-1" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	data, err := os.ReadFile(argsPath)
+	if err != nil || strings.TrimSpace(string(data)) != "--resume\nclaude-1" {
+		t.Fatalf("unexpected resume arguments %q: %v", data, err)
+	}
+	stored, err := manager.GetSession(context.Background(), original.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stored.Capabilities.CanSendInput {
+		t.Fatalf("stored resumed session cannot accept input: %+v", stored.Capabilities)
+	}
+	if err := manager.Send(context.Background(), stored, message.Message{ID: "msg-1", Content: "hello"}); err != nil {
+		t.Fatalf("send after resume failed: %v", err)
+	}
+	stored, err = manager.GetSession(context.Background(), original.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ClaudeSessionID != original.ClaudeSessionID || stored.Workspace != workspace {
+		t.Fatalf("resume metadata was not preserved: %+v", stored)
+	}
+}
+
+func TestObserverUsesMemoryStoreCursorForResumedSession(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	if err := os.MkdirAll(workspace, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	project := filepath.Join(home, ".claude", "projects", "-workspace")
+	if err := os.MkdirAll(project, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	historyPath := filepath.Join(project, "claude-2.jsonl")
+	if err := os.WriteFile(historyPath, []byte("{\"type\":\"user\",\"uuid\":\"u1\",\"sessionId\":\"claude-2\",\"cwd\":"+quote(workspace)+",\"message\":{\"content\":\"old\"}}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	argsPath := filepath.Join(home, "args.txt")
+	binary := filepath.Join(home, "claude-test")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + argsPath + "\nsleep 2\n"
+	if err := os.WriteFile(binary, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	manager := NewManager(NewMemoryStore(), adapter.NewClaudeCodeAdapter(binary), NewPTYManager(binary, home))
+	defer manager.Close()
+	original := session.Session{
+		ID:              "daemon/daemon-2/claude://claude-2",
+		DaemonID:        "daemon-2",
+		Agent:           "claude",
+		AgentSessionID:  "claude://claude-2",
+		ClaudeSessionID: "claude-2",
+		Workspace:       workspace,
+		DisplayName:     "History session",
+		State:           session.StateStopped,
+		Source:          session.SourceHistory,
+		Capabilities:    session.Capabilities{CanReadHistory: true, CanResume: true},
+	}
+	resumed, err := manager.ResumeSession(context.Background(), original)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ch, unsubscribe := manager.Subscribe(resumed.CoordinationID)
+	defer unsubscribe()
+	file, err := os.OpenFile(historyPath, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("{\"type\":\"user\",\"uuid\":\"u2\",\"sessionId\":\"claude-2\",\"cwd\":" + quote(workspace) + ",\"message\":{\"content\":\"new\"}}\n"); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case item, ok := <-ch:
+			if !ok {
+				t.Fatal("subscription channel was closed")
+			}
+			if item.SessionID == resumed.ID && item.Content == "new" {
+				stored, storedErr := manager.GetSession(context.Background(), resumed.ID)
+				if storedErr != nil {
+					t.Fatal(storedErr)
+				}
+				if stored.State == session.StateStopped || stored.Connection == session.ConnectionUnavailable {
+					t.Fatalf("observation state was not updated: %+v", stored)
+				}
+				return
+			}
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	t.Fatal("observer did not publish appended JSONL event")
 }
 
 func quote(value string) string {

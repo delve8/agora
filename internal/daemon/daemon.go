@@ -291,9 +291,17 @@ func (d *Daemon) handle(frame protocol.Envelope) error {
 			} else if identity.DaemonID != d.config.ID || identity.Agent != agent {
 				err = fmt.Errorf("session %s is not owned by daemon %s", payload.SessionID, d.config.ID)
 			} else {
-				value = session.Session{ID: payload.SessionID, CoordinationID: payload.CoordinationID, DaemonID: identity.DaemonID, Agent: identity.Agent, AgentSessionID: identity.AgentSessionID, Workspace: payload.Workspace, DisplayName: payload.DisplayName, Role: payload.Role, State: session.StateStarting, Source: session.SourceManaged, Capabilities: session.Capabilities{CanStart: true, CanResume: true, CanReadHistory: true}}
-				value.ClaudeSessionID = strings.TrimPrefix(identity.AgentSessionID, "claude://")
-				value, err = d.manager.ResumeSession(context.Background(), value)
+				workspace := strings.TrimSpace(payload.Workspace)
+				if workspace == "" {
+					workspace = d.resolveWorkspace(payload.SessionID)
+				}
+				if workspace == "" {
+					err = fmt.Errorf("session %s workspace not found in daemon", payload.SessionID)
+				} else {
+					value = session.Session{ID: payload.SessionID, CoordinationID: payload.CoordinationID, DaemonID: identity.DaemonID, Agent: identity.Agent, AgentSessionID: identity.AgentSessionID, Workspace: workspace, DisplayName: payload.DisplayName, Role: payload.Role, State: session.StateStarting, Source: session.SourceManaged, Capabilities: session.Capabilities{CanStart: true, CanResume: true, CanReadHistory: true}}
+					value.ClaudeSessionID = strings.TrimPrefix(identity.AgentSessionID, "claude://")
+					value, err = d.manager.ResumeSession(context.Background(), value)
+				}
 			}
 		} else {
 			provisional := "pending/" + protocol.NewID("session")
@@ -315,7 +323,7 @@ func (d *Daemon) handle(frame protocol.Envelope) error {
 				}
 			}
 		}
-		created := protocol.SessionCreatedPayload{SessionID: value.ID, DaemonID: d.config.ID, Agent: value.Agent, AgentSessionID: value.AgentSessionID}
+		created := protocol.SessionCreatedPayload{SessionID: value.ID, DaemonID: d.config.ID, Agent: value.Agent, AgentSessionID: value.AgentSessionID, Workspace: value.Workspace}
 		if err != nil {
 			created.Error = err.Error()
 			return d.sendResponse(protocol.SessionCreated, created, frame.RequestID)
@@ -324,10 +332,10 @@ func (d *Daemon) handle(frame protocol.Envelope) error {
 		created.ClaudeSessionID = value.ClaudeSessionID
 		created.HistoryPath = value.HistoryPath
 		created.Capabilities = map[string]bool{"can_start": true, "can_attach": true, "can_observe": true, "can_send_input": true, "can_stream": true, "can_interrupt": true, "can_resume": true, "can_approve": false, "can_read_history": true, "can_read_terminal": true}
+		d.startEventBridge(value)
 		if err := d.sendResponse(protocol.SessionCreated, created, frame.RequestID); err != nil {
 			return err
 		}
-		d.startEventBridge(value)
 		return d.send(protocol.SessionUpdate, protocol.SessionUpdatePayload{SessionID: value.ID, DaemonID: d.config.ID, Agent: value.Agent, AgentSessionID: value.AgentSessionID, ClaudeSessionID: value.ClaudeSessionID, State: value.State, Connection: value.Connection, PID: value.ProcessID, LastError: value.LastError})
 	case protocol.SessionInput:
 		var payload protocol.InputPayload
@@ -411,6 +419,21 @@ func (d *Daemon) handle(frame protocol.Envelope) error {
 	default:
 		return fmt.Errorf("unsupported server message %q", frame.Type)
 	}
+}
+
+func (d *Daemon) resolveWorkspace(sessionID string) string {
+	if value, err := d.manager.GetSession(context.Background(), sessionID); err == nil && strings.TrimSpace(value.Workspace) != "" {
+		return value.Workspace
+	}
+	d.historyMu.RLock()
+	historySessions := append([]session.Session(nil), d.historySessions...)
+	d.historyMu.RUnlock()
+	for _, value := range historySessions {
+		if value.ID == sessionID {
+			return value.Workspace
+		}
+	}
+	return ""
 }
 
 func (d *Daemon) sendResync() error {

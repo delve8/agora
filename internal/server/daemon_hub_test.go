@@ -13,18 +13,19 @@ func TestDaemonRuntimeSummaryTracksExit(t *testing.T) {
 	hub := newDaemonHub()
 	connection := &daemonConnection{id: "daemon-1", lastSeen: time.Now().UTC()}
 	hub.devices[connection.id] = connection
-	resync, err := protocol.NewEnvelope(protocol.DaemonResync, protocol.ResyncPayload{DaemonID: connection.id, Sessions: []protocol.SessionSummary{{SessionID: "sess-1", ClaudeSessionID: "claude-1", State: session.StateRunning, Connection: session.ConnectionObserved, PID: 42}}})
+	sessionID := "daemon/daemon-1/claude://claude-1"
+	resync, err := protocol.NewEnvelope(protocol.DaemonResync, protocol.ResyncPayload{DaemonID: connection.id, Sessions: []protocol.SessionSummary{{SessionID: sessionID, DaemonID: connection.id, Agent: "claude", AgentSessionID: "claude://claude-1", ClaudeSessionID: "claude-1", State: session.StateRunning, Connection: session.ConnectionObserved, PID: 42}}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := hub.handleFrame(connection, resync); err != nil {
 		t.Fatal(err)
 	}
-	value := hub.effectiveSession(session.Session{ID: "sess-1", ClaudeSessionID: "claude-1", Workspace: "/tmp", Source: session.SourceManaged})
+	value := hub.effectiveSession(session.Session{ID: sessionID, Workspace: "/tmp", Source: session.SourceManaged})
 	if !value.Capabilities.CanSendInput || !value.Capabilities.CanInterrupt || !value.Capabilities.CanReadTerminal || value.ProcessID != 42 {
 		t.Fatalf("runtime summary was not applied: %+v", value)
 	}
-	exit, err := protocol.NewEnvelope(protocol.SessionExit, protocol.ExitPayload{SessionID: "sess-1", State: session.StateStopped})
+	exit, err := protocol.NewEnvelope(protocol.SessionExit, protocol.ExitPayload{SessionID: sessionID, State: session.StateStopped})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,6 +35,14 @@ func TestDaemonRuntimeSummaryTracksExit(t *testing.T) {
 	value = hub.effectiveSession(value)
 	if value.State != session.StateStopped || value.ProcessID != 0 || value.Capabilities.CanSendInput || !value.Capabilities.CanResume {
 		t.Fatalf("exit summary was not applied: %+v", value)
+	}
+}
+
+func TestDaemonOfflineCanonicalSessionRemainsResumable(t *testing.T) {
+	hub := newDaemonHub()
+	value := hub.effectiveSession(session.Session{ID: "daemon/daemon-1/claude://claude-1", Workspace: "/tmp", Source: session.SourceManaged})
+	if value.State != session.StateStopped || value.ProcessID != 0 || !value.Capabilities.CanResume || value.Capabilities.CanSendInput {
+		t.Fatalf("offline canonical session capabilities are wrong: %+v", value)
 	}
 }
 

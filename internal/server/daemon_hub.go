@@ -241,7 +241,24 @@ func (h *daemonHub) handleFrame(c *daemonConnection, frame protocol.Envelope) er
 			if h.sessions[c.id] == nil {
 				h.sessions[c.id] = make(map[string]protocol.SessionSummary)
 			}
-			h.sessions[c.id][payload.SessionID] = protocol.SessionSummary{SessionID: payload.SessionID, ClaudeSessionID: payload.ClaudeSessionID, State: payload.State, Connection: payload.Connection, PID: payload.PID}
+			existing := h.sessions[c.id][payload.SessionID]
+			existing.SessionID = payload.SessionID
+			if payload.DaemonID != "" {
+				existing.DaemonID = payload.DaemonID
+			}
+			if payload.Agent != "" {
+				existing.Agent = payload.Agent
+			}
+			if payload.AgentSessionID != "" {
+				existing.AgentSessionID = payload.AgentSessionID
+			}
+			if payload.ClaudeSessionID != "" {
+				existing.ClaudeSessionID = payload.ClaudeSessionID
+			}
+			existing.State = payload.State
+			existing.Connection = payload.Connection
+			existing.PID = payload.PID
+			h.sessions[c.id][payload.SessionID] = existing
 			h.mu.Unlock()
 		}
 		return nil
@@ -424,20 +441,24 @@ func (h *daemonHub) effectiveSession(value session.Session) session.Session {
 	defer h.mu.RUnlock()
 	identity, err := session.ParseSessionID(value.ID)
 	if err != nil {
-		daemonID := h.routes[value.ID]
-		if h.devices[daemonID] == nil {
-			value.State = session.StateStopped
-			value.Connection = session.ConnectionUnavailable
-			value.ProcessID = 0
-			return value
-		}
-		identity = session.SessionIdentity{DaemonID: daemonID}
+		value.State = session.StateStopped
+		value.Connection = session.ConnectionUnavailable
+		value.ProcessID = 0
+		value.Capabilities = session.Capabilities{}
+		return value
 	}
+	value.DaemonID = identity.DaemonID
+	value.Agent = identity.Agent
+	value.AgentSessionID = identity.AgentSessionID
+	if identity.Agent == "claude" {
+		value.ClaudeSessionID = strings.TrimPrefix(identity.AgentSessionID, "claude://")
+	}
+	resumable := value.Workspace != ""
 	if h.devices[identity.DaemonID] == nil {
 		value.State = session.StateStopped
 		value.Connection = session.ConnectionUnavailable
 		value.ProcessID = 0
-		value.Capabilities = session.Capabilities{CanReadHistory: value.ClaudeSessionID != "", CanResume: false}
+		value.Capabilities = session.Capabilities{CanReadHistory: resumable, CanResume: resumable}
 		return value
 	}
 	summary, ok := h.sessions[identity.DaemonID][value.ID]
@@ -448,14 +469,13 @@ func (h *daemonHub) effectiveSession(value session.Session) session.Session {
 		value.State = summary.State
 		value.Connection = summary.Connection
 		value.ProcessID = summary.PID
-		value.ClaudeSessionID = summary.ClaudeSessionID
 		value.Capabilities = session.Capabilities{CanStart: true, CanAttach: true, CanObserve: true, CanSendInput: true, CanStream: true, CanInterrupt: true, CanResume: true, CanReadHistory: true, CanReadTerminal: true}
 		return value
 	}
 	value.State = session.StateStopped
 	value.Connection = session.ConnectionUnavailable
 	value.ProcessID = 0
-	value.Capabilities = session.Capabilities{CanReadHistory: value.ClaudeSessionID != "", CanResume: value.ClaudeSessionID != "" && value.Workspace != ""}
+	value.Capabilities = session.Capabilities{CanReadHistory: resumable, CanResume: resumable}
 	return value
 }
 
@@ -633,9 +653,19 @@ func (h *daemonHub) request(ctx context.Context, sessionID, typ string, payload 
 	}
 }
 func (h *daemonHub) resumeSession(ctx context.Context, value session.Session) (session.Session, error) {
+	identity, err := session.ParseSessionID(value.ID)
+	if err != nil {
+		return session.Session{}, fmt.Errorf("session %s does not have a canonical session id", value.ID)
+	}
+	value.DaemonID = identity.DaemonID
+	value.Agent = identity.Agent
+	value.AgentSessionID = identity.AgentSessionID
+	if identity.Agent == "claude" {
+		value.ClaudeSessionID = strings.TrimPrefix(identity.AgentSessionID, "claude://")
+	}
 	frame, err := h.request(ctx, value.ID, protocol.SessionCreate, protocol.SessionCreatePayload{
 		SessionID: value.ID, CoordinationID: value.CoordinationID, Workspace: value.Workspace,
-		DisplayName: value.DisplayName, Role: value.Role, Agent: value.Agent, ResumeID: value.AgentSessionID,
+		DisplayName: value.DisplayName, Role: value.Role, Agent: identity.Agent, ResumeID: identity.AgentSessionID,
 	}, protocol.SessionCreated)
 	if err != nil {
 		return session.Session{}, err
@@ -646,6 +676,9 @@ func (h *daemonHub) resumeSession(ctx context.Context, value session.Session) (s
 	}
 	if result.Error != "" {
 		return session.Session{}, errors.New(result.Error)
+	}
+	if result.Workspace != "" {
+		value.Workspace = result.Workspace
 	}
 	value.Source = session.SourceManaged
 	value.State = session.StateRunning
