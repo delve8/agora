@@ -58,6 +58,8 @@ Agora 不是新的 Agent SDK、LLM 编排框架，也不是单纯的终端窗口
 - 自建密码、社交登录或多 provider 登录页面；认证由 Logto/OIDC 等身份服务提供；
 - admin 角色、复杂 RBAC 或跨用户管理；v1 只做用户自身设备与 Session 的授权；
 - 在 trust-local 模式下把 Server 暴露到非 loopback 地址；
+- Windows Daemon 原生支持、Server 的工作站安装，以及 Daemon 自更新；
+- 把 `agora daemon install` 作为产品化一期的终端用户安装入口。
 
 这些能力可以在真实使用证明有需要之后再设计。
 
@@ -499,6 +501,40 @@ Observation / History adapters → Daemon → Server 内存 SSE/通知 → Web
 - `agora wrapper` / `agora attach`：Claude PTY 的终端渲染端，不是所有 Agent 的必需 surface；
 - 暂不引入 NATS、RabbitMQ 或其他分布式消息基础设施；
 - A2A 和 MCP 暂不作为 MVP 的前置依赖。
+
+### 7.2 Daemon 部署与安装边界
+
+Daemon 只部署在运行 Agent 的用户工作站上。Server 是远程控制面，不属于本节的工作站安装范围；用户不需要在 Daemon 工作站上安装或启动 Server。
+
+产品化一期的 Daemon 平台边界如下：
+
+| 平台 | 一期方案 | 用户会话下的后台托管 |
+|---|---|---|
+| Linux | 原生支持 | `systemd --user` service |
+| macOS | 原生支持 | `launchd` `LaunchAgent` |
+| Windows | 暂不支持 | 不提供 Windows Daemon 安装路径 |
+
+产品化一期的目标入口由 Server Web UI 提供，而不是要求用户先安装 Agora 再执行独立安装命令。用户在 Web UI 中添加设备后，Server 提供固定 HTTPS 安装脚本入口和一次性 pairing code；目标工作站执行的命令形态为：
+
+```bash
+curl -fsSL https://agora.example.com/download/install.sh \\
+  | sh -s -- \\
+  --server https://agora.example.com \\
+  --pair <one-time-code>
+```
+
+安装脚本是计划中的产品化能力，目标职责依次为：
+
+1. 检测操作系统和 CPU 架构；
+2. 下载对应 Daemon 发行包，并校验 checksum 或签名；
+3. 使用 pairing code 完成设备配对；
+4. 将 Server URL、`device_id` 和 device credential 写入当前用户的配置目录；
+5. 在 Linux 生成并启用 `systemd --user` service，在 macOS 生成并加载 `LaunchAgent`；
+6. 以当前用户身份启动 Daemon，并等待连接状态确认。
+
+脚本只做用户目录安装，不默认提权或写入系统级服务。长期 credential 不得进入命令行参数、服务环境变量、普通日志或 Web UI；pairing code 只能短期、一次性使用。后续升级必须保留用户配置和 credential，并由发行包/安装脚本负责替换和重启，不在一期引入 Daemon 自更新。
+
+`agora daemon` 仍是前台运行入口；现有 `agora daemon --pair <code>` 可以保留为底层开发、调试和自动化测试能力，但 `agora daemon install` 不作为产品化一期的终端用户入口。安装脚本、下载端点、发行包校验和服务注册在实现完成前均属于目标方案，不应视为当前仓库已经提供的功能。
 
 ## 8. 用户界面
 

@@ -25,8 +25,23 @@ Server 有两种运行模式，通过启动配置切换：
 
 | 模式 | `AGORA_AUTH_MODE` | 监听 | Web 登录 | Daemon 认证 | 说明 |
 |---|---|---|---|---|---|
-| trust-local | `local`（默认） | **强制 `127.0.0.1`** | 不需要，全部请求视为 `local` 用户 | 不需要 device credential | 本地单机开箱即用 |
+| trust-local | `local`（默认） | **强制 `127.0.0.1`** | 不需要，全部请求视为 `local` 用户 | 不需要 device credential | 本地单机显式逃生模式；`make server AGORA_AUTH_MODE=local` 使用此模式 |
 | auth | `logto` | 可任意，但必须 TLS | 通过 Logto 授权码 + PKCE | pairing code → device credential | 远程 / 跨设备 / 多人共享 |
+
+`make server` 默认不是 trust-local 模式：它会用 Podman 启动本地 Logto
+和 PostgreSQL，自动初始化默认 tenant 的 Agora API resource、Web SPA 和
+bootstrap 用户，再以 `AGORA_AUTH_MODE=logto` 启动 Server。生成的本地配置和
+bootstrap 密码保存在 `.agora/logto/`，该目录已被 Git 忽略。默认 OIDC
+endpoint 是 `http://127.0.0.1:3003`，管理台是 `http://127.0.0.1:3004`，默认
+bootstrap 用户名是 `agora_admin`。
+
+可以使用 `make logto-status` 查看容器，使用 `make logto-down` 停止容器但
+保留数据库 volume，或使用 `make logto-purge` 连同数据库 volume 一并删除。
+明确运行 `make server AGORA_AUTH_MODE=local` 可完全跳过 Logto。若同时提供
+`AGORA_LOGTO_ISSUER`、`AGORA_LOGTO_AUDIENCE`、`VITE_LOGTO_ENDPOINT` 和
+`VITE_LOGTO_APP_ID`，`make server` 会跳过本地 Podman 栈并使用外部 Logto。
+本地 HTTP/明文密码仅用于开发；生产部署必须使用外部 Logto、HTTPS/WSS，并
+使用独立的生产数据库和凭证。
 
 ### 2.1 trust-local 模式
 
@@ -133,17 +148,22 @@ web_auth_sessions                 # 后续 BFF/session-cookie 演进
 
 ## 6. Daemon 设备归属与配对
 
-### 6.1 配对流程
+### 6.1 安装与配对流程
 
-配对 code 必须由**已认证且已登录**的用户签发，并绑定该用户：
+配对 code 必须由**已认证且已登录**的用户签发，并绑定该用户。产品化一期的默认用户入口是由 Server Web UI 提供的一次性安装脚本；用户不需要先安装 Agora，也不需要手工编写 systemd 或 launchd 配置：
 
-1. 用户在 Web UI（已登录）点击"添加设备"；
+1. 用户在 Web UI（已登录）点击“添加设备”；
 2. Server 生成一次性 pairing code，`pair_codes` 记录 `code_hash -> user_id`，短时效（如 10 分钟）；
-3. 用户在目标机器运行 `agora daemon --pair <code>`（或首次运行向导输入）；
-4. Daemon 调用配对接口；
+3. Web UI 展示固定 HTTPS 安装脚本和一次性 code，用户在目标工作站执行类似 `curl -fsSL https://agora.example.com/download/install.sh | sh -s -- --server https://agora.example.com --pair <one-time-code>` 的命令；
+4. 安装脚本检测 Linux/macOS 及 CPU 架构，下载并校验对应 Daemon 发行包，然后消费 pairing code 调用配对接口；
 5. Server 验证 code 未过期、未消费，创建 `device_id -> user_id` 并发放随机高熵 device credential；
-6. Daemon 将 credential 保存到 `~/.agora/device.credential`，文件权限 `0600`；
-7. 之后所有 WebSocket 连接使用该 credential。
+6. 安装脚本将 Server URL、credential 和配对返回的 `device_id` 写入当前用户配置目录。当前实现的底层配对入口会将 credential 保存到 `~/.agora/device.credential`（`0600`），并把 `device_id` 写入 `~/.agora/config.json` 作为 daemon 身份；之后每次重连 `daemon.register` 的 `daemon_id` 恒等于该 `device_id`，满足 §6.2 的一致性要求；
+7. 安装脚本在 Linux 生成并启用 `systemd --user` service，在 macOS 生成并加载 `LaunchAgent`，以当前用户身份启动 Daemon 并等待连接确认；
+8. 之后所有 WebSocket 连接使用该 credential。
+
+安装脚本只做用户目录安装，不默认提权或写入系统级服务。pairing code 只能短期、一次性使用；长期 credential 不得进入命令行参数、服务环境变量、普通日志或 Web UI。Linux 和 macOS 是产品化一期的原生 Daemon 平台，Windows Daemon 暂不支持。
+
+`agora daemon --pair <code>` 可以保留为底层开发、调试和自动化测试入口，但不是产品化一期面向终端用户的默认安装方式；`agora daemon install` 也不作为一期用户入口。上述下载脚本、发行包校验和服务注册在实现完成前均属于目标流程。
 
 **归属在配对时决定，连接时只验证。** 陌生 Daemon 无法自证归属；归属只能由已认证用户在配对时声明。
 
@@ -155,9 +175,20 @@ web_auth_sessions                 # 后续 BFF/session-cookie 演进
 
 ### 6.3 撤销与轮换
 
-- 删除/撤销设备即删除或失效其 credential，重连被拒；
-- 支持 credential 轮换（重新配对或主动换发）；
+- 删除/撤销设备会立即写入 `revoked_at`，并关闭 Server 当前持有的该 daemon WebSocket；服务端同时清除该连接的运行会话、历史目录和路由，后续状态列表不再展示这些旧 daemon 会话。
+- 撤销不会物理删除设备记录或历史数据；设备仍会在设备管理列表中显示为“已撤销”，便于确认和审计，但不能用于新建会话、重命名或设备筛选。
+- 在 logto per-device credential 模式下，重连会再次校验 `revoked_at` 并被拒绝；trust-local/共享 token 模式没有 per-device credential，撤销主要保证 Server 侧连接和状态立即清理。
+- 支持 credential 轮换（重新配对或主动换发）；重新配对会创建新的设备身份。
 - 日志和错误响应不得记录 credential 明文。
+
+### 6.4 设备命名与别名
+
+设备名是**显示用别名，不参与身份验证**——身份永远是 `device_id`，改名不会改变 `daemon.register` 的绑定关系。
+
+- 配对时 `name` 缺省取 daemon 所在机器 hostname；存量空名设备会在下一次 register 时用 register 帧携带的 hostname 自动回填。
+- `GET /api/devices` 返回当前用户的设备列表（`device_id`、`name`、`connected`、`created_at`、`last_seen_at`、`revoked_at`），**绝不含凭证或内部 user_id**。
+- `POST /api/devices/{id}/name` 重命名设备（仅归属该设备的用户可调用，`name` 非空、≤64 字符）。
+- `POST /api/devices/{id}/revoke` 撤销设备（既有）。
 
 ## 7. Session 授权
 
@@ -264,15 +295,8 @@ IM provider、邮件客户端、安全扫描器可能预取链接。因此：
 
 当前代码状态：
 
-- Server HTTP API 无认证；Daemon WebSocket 仅支持可选的共享 `AGORA_DAEMON_TOKEN`；
-- `docs/protocol.md` 的 pairing 设计未实现；`device.credential` 仅有路径占位；
-- Web 登录、`users/devices` 表、通知链接均未实现。
-
-建议落地顺序：
-
-1. trust-local 默认行为与启动强制规则（`local` 模式 + loopback 校验 + Origin 中间件 + `local` principal 注入）；
-2. `users` / `user_identities` / `devices` / `pair_codes` 表与配对接口；
-3. Logto 接入（`AGORA_AUTH_MODE=logto`、JWKS 校验、provisioning）；
-4. Session 归属授权检查；
-5. 通知链接签发与兑换端点；
-6. BFF/session-cookie 演进与设备撤销/轮换管理界面。
+- Server 默认仍可使用 trust-local；`make server` 默认通过 Podman 启动并初始化本地 Logto，然后以 `AGORA_AUTH_MODE=logto` 运行。
+- Server HTTP API 已支持 Bearer access token、`/api/me` 和基于用户/设备归属的 Session 授权；Daemon 已支持 pairing code 与 per-device credential。
+- Web 使用 Logto 授权码 + PKCE，并以 Bearer token 调用 API；SSE 通过 `fetch` + `ReadableStream` 携带 Authorization header。
+- 本地 Logto 的 `make server` 工作流已自动创建 default tenant 的 API resource、SPA application 和 bootstrap user，并将配置写入 `.agora/logto/`。
+- 通知链接、BFF/session-cookie 演进和更细粒度 RBAC 仍未实现。
