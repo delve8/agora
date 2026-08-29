@@ -30,8 +30,9 @@ Agora Web          = 完整历史、事件流、PTY screen snapshot 和普通 Se
 - 为一个 Coordination 或其中的 Session 配置出站通知目标；
 - 在高价值状态变化时发送一条简短通知；
 - 通知能标识 Coordination、Session、状态和最近动作；
-- 通知包含打开 Agora Web Session 详情页的链接；
-- 用户打开链接后，可以使用现有 Web UI 查看 JSONL/history 和只读 PTY snapshot；
+- 提供一个普通登录 Session URL，或在认证模式下提供短期 read-only notification capability link；
+- 认证模式下，用户点击有效 capability link 后无需再次输入登录信息即可打开指定 Session 的只读观察页；
+- capability link 不能调用输入、resume、stop、attach、设备管理或审批接口；
 - 通知失败、重复和暂时不可达时，不破坏 Session、历史事件或 Web UI。
 
 第一阶段可以先实现 generic webhook，再接入一个真实 IM provider。provider-specific 的卡片、按钮和富文本格式属于 adapter 层，不应进入核心 Session 模型。
@@ -177,9 +178,12 @@ resumed
 
 ## 5. Deep link 与访问模型
 
-### 5.1 链接语义
+通知中的 Web 入口有两种不同语义，不能混用：
 
-通知链接定位动态 Session，而不是静态复制通知内容：
+1. **普通登录 Session URL**：不携带秘密，适合用户已经登录 Web 的场景；打开后按正常 Web 认证和 Session 授权处理。
+2. **只读 notification capability link**：短期、不可预测、绑定单个 Session 的 bearer capability；用户点击后可以不再输入登录信息，但兑换出的权限严格限制为该 Session 的只读观察。
+
+### 5.1 普通登录链接
 
 ```text
 https://agora.example/sessions/<session-id>
@@ -191,31 +195,71 @@ https://agora.example/sessions/<session-id>
 https://agora.example/sessions/<session-id>?focus=terminal
 ```
 
-`focus=terminal` 只影响 Web UI 初始展示位置，不能授予额外权限，也不能触发键盘输入或审批。
+`focus=terminal` 只影响 Web UI 初始展示位置，不能授予额外权限，也不能触发键盘输入或审批。认证模式下，普通 URL 仍需 Logto 登录（或现有 Web 会话），Server 再检查当前用户是否拥有目标 Session。
 
-### 5.2 本地运行
+### 5.2 只读 notification capability link
+
+当通知需要让用户点击后无需再次登录时，Server 生成专用链接：
+
+```text
+https://agora.example/auth/notification-link?token=<opaque-token>
+```
+
+签发条件：
+
+- 签发者已通过 Logto（或其他配置的身份服务）认证；
+- 签发者拥有目标 Session 的读取权限；
+- token 绑定 `session_id`、`user_id`、`scope=read_observation`、签发时间和过期时间；
+- token 高熵不可预测，Server 只保存哈希或使用带密钥的签名结构；
+- 推荐 TTL 为 10 分钟，并支持服务端撤销/授权版本失效。
+
+兑换流程：
+
+```text
+IM link
+  │
+  ▼
+专用 notification-link endpoint
+  │ 验证 token、Session 归属、scope、TTL、撤销状态
+  ▼
+设置受限 HttpOnly + Secure + SameSite cookie
+  │
+  ▼
+302 到不含 token 的 /sessions/<session-id>
+```
+
+兑换响应必须设置 `Referrer-Policy: no-referrer`；页面和静态资源不得把 token 继续传播。兑换后的 cookie 生命周期不超过 grant TTL，且只对指定 Session 的观察接口有效。
+
+capability 允许：
+
+- 指定 Session metadata；
+- 指定 Session history；
+- 指定 Session SSE event stream；
+- 指定 Session 的只读 PTY snapshot。
+
+capability 禁止：
+
+- `POST /api/sessions/{id}/messages`；
+- resume、stop、PTY attach 写入；
+- 设备配对、设备撤销、webhook 配置；
+- 访问其他 Session；
+- 任何未来审批接口。
+
+这不是完整用户登录凭证，也不能作为通用 `Authorization: Bearer` token 调用所有 API。token 泄露的明确后果是：持有者在 TTL 内可以观察绑定的 Session；通知 target（IM 群、频道或邮箱）因此必须被视为可信接收边界。
+
+由于 IM provider、邮件客户端和安全产品可能预取链接，不把“首次 GET 立即永久消费”作为唯一防重放机制。优先使用短 TTL、scope 限制、撤销/授权版本和兑换后清理 URL；严格一次性消费若未来需要，另行设计预览/确认流程。
+
+### 5.3 本地运行
 
 当前 Agora 默认监听 `127.0.0.1`。因此：
 
+- trust-local 模式下默认使用 `local` 用户，不需要登录或 notification capability cookie；
 - `localhost` 链接只适用于 IM 客户端与 Agora 位于同一台机器的场景；
 - 手机、另一台电脑或远程 IM 客户端不能依赖远端设备上的 `localhost`；
+- `local` 模式禁止绑定非 loopback 地址；
 - 不应仅为了让链接可点击就把本地 API 直接暴露到公网。
 
-跨设备访问应通过 VPN、Tailscale、受控 HTTPS reverse proxy 或后续的 Web gateway，并保持认证和 Session 授权检查。
-
-### 5.3 深链接安全
-
-如果部署需要免登录打开链接，可以使用短期 signed link，但必须满足：
-
-- 绑定指定 Session，不能只绑定 Coordination 或全局 Agora；
-- 具有明确的 `read_observation`/只读 scope；
-- 有过期时间和不可预测的签名 token；
-- 服务端仍检查 Session 是否存在、用户是否有权访问；
-- token 不能调用 `POST /messages`、PTY attach 写入、审批或其他控制接口；
-- 日志和通知模板避免泄露完整 workspace、秘密参数或 token；
-- token 泄露后的撤销/失效策略在真正实现前明确记录。
-
-更推荐普通 Web 登录后使用无秘密的 Session URL。深链接不是身份认证的替代品，也不是控制凭证。
+跨设备访问应通过 VPN、Tailscale、受控 HTTPS reverse proxy 或 Logto auth 模式的 Web gateway，并保持 TLS、认证和 Session 授权检查。
 
 ## 6. 与现有信息流的关系
 
@@ -311,8 +355,10 @@ Provider adapter 不负责：
 - IM 不提供审批按钮；
 - 任意 IM 文本都不会自动解释为 approve/reject 或 PTY 按键；
 - HIL 通知不会把 `can_approve` 改为 `true`；
-- deep link 不绕过 Web 认证，也不授予写入、attach 或审批权限；
-- 通知摘要不会默认泄露完整工具参数、workspace 私密信息或签名 token。
+- 认证模式下，有效 notification capability link 可以让用户无需再次登录打开绑定 Session 的只读观察页；
+- 无效、过期、撤销或跨 Session 的 capability link 必须失败，不能回退为其他 Session 的访问；
+- capability link 不授予写入、attach、resume、stop、设备管理或审批权限；
+- trust-local 模式不要求登录或 capability link cookie；
 
 ### 降级行为
 

@@ -1,7 +1,9 @@
 package server
 
 import (
+	"context"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,18 +15,19 @@ func TestDaemonRuntimeSummaryTracksExit(t *testing.T) {
 	hub := newDaemonHub()
 	connection := &daemonConnection{id: "daemon-1", lastSeen: time.Now().UTC()}
 	hub.devices[connection.id] = connection
-	resync, err := protocol.NewEnvelope(protocol.DaemonResync, protocol.ResyncPayload{DaemonID: connection.id, Sessions: []protocol.SessionSummary{{SessionID: "sess-1", ClaudeSessionID: "claude-1", State: session.StateRunning, Connection: session.ConnectionObserved, PID: 42}}})
+	sessionID := "daemon/daemon-1/claude://claude-1"
+	resync, err := protocol.NewEnvelope(protocol.DaemonResync, protocol.ResyncPayload{DaemonID: connection.id, Sessions: []protocol.SessionSummary{{SessionID: sessionID, DaemonID: connection.id, Agent: "claude", AgentSessionID: "claude://claude-1", ClaudeSessionID: "claude-1", State: session.StateRunning, Connection: session.ConnectionObserved, PID: 42}}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := hub.handleFrame(connection, resync); err != nil {
 		t.Fatal(err)
 	}
-	value := hub.effectiveSession(session.Session{ID: "sess-1", ClaudeSessionID: "claude-1", Workspace: "/tmp", Source: session.SourceManaged})
+	value := hub.effectiveSession(session.Session{ID: sessionID, Workspace: "/tmp", Source: session.SourceManaged})
 	if !value.Capabilities.CanSendInput || !value.Capabilities.CanInterrupt || !value.Capabilities.CanReadTerminal || value.ProcessID != 42 {
 		t.Fatalf("runtime summary was not applied: %+v", value)
 	}
-	exit, err := protocol.NewEnvelope(protocol.SessionExit, protocol.ExitPayload{SessionID: "sess-1", State: session.StateStopped})
+	exit, err := protocol.NewEnvelope(protocol.SessionExit, protocol.ExitPayload{SessionID: sessionID, State: session.StateStopped})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,6 +37,14 @@ func TestDaemonRuntimeSummaryTracksExit(t *testing.T) {
 	value = hub.effectiveSession(value)
 	if value.State != session.StateStopped || value.ProcessID != 0 || value.Capabilities.CanSendInput || !value.Capabilities.CanResume {
 		t.Fatalf("exit summary was not applied: %+v", value)
+	}
+}
+
+func TestDaemonOfflineCanonicalSessionRemainsResumable(t *testing.T) {
+	hub := newDaemonHub()
+	value := hub.effectiveSession(session.Session{ID: "daemon/daemon-1/claude://claude-1", Workspace: "/tmp", Source: session.SourceManaged})
+	if value.State != session.StateStopped || value.ProcessID != 0 || !value.Capabilities.CanResume || value.Capabilities.CanSendInput {
+		t.Fatalf("offline canonical session capabilities are wrong: %+v", value)
 	}
 }
 
@@ -77,5 +88,78 @@ func TestSameHostOrigin(t *testing.T) {
 	}
 	if sameHostOrigin(req, "https://attacker.example") {
 		t.Fatal("unexpected cross origin acceptance")
+	}
+}
+
+func TestDaemonIsConnected(t *testing.T) {
+	hub := newDaemonHub()
+	if hub.isConnected("daemon-1") {
+		t.Fatal("expected not connected before registration")
+	}
+	connection := &daemonConnection{id: "daemon-1", lastSeen: time.Now().UTC()}
+	hub.devices[connection.id] = connection
+	if !hub.isConnected("daemon-1") {
+		t.Fatal("expected connected after registration")
+	}
+	hub.remove(connection)
+	if hub.isConnected("daemon-1") {
+		t.Fatal("expected disconnected after removal")
+	}
+}
+
+func TestDaemonDisconnectClearsRuntimeState(t *testing.T) {
+	hub := newDaemonHub()
+	connection := &daemonConnection{id: "daemon-1"}
+	hub.devices[connection.id] = connection
+	hub.sessions[connection.id] = map[string]protocol.SessionSummary{"session-1": {SessionID: "session-1"}}
+	hub.history[connection.id] = map[string]protocol.HistorySessionSummary{"history-1": {SessionID: "history-1"}}
+	hub.routes["session-1"] = connection.id
+	hub.routes["history-1"] = connection.id
+
+	hub.disconnectDaemon(connection.id)
+	if hub.isConnected(connection.id) {
+		t.Fatal("daemon remained connected after explicit disconnect")
+	}
+	hub.mu.RLock()
+	_, hasSessions := hub.sessions[connection.id]
+	_, hasHistory := hub.history[connection.id]
+	_, hasSessionRoute := hub.routes["session-1"]
+	_, hasHistoryRoute := hub.routes["history-1"]
+	hub.mu.RUnlock()
+	if hasSessions || hasHistory || hasSessionRoute || hasHistoryRoute {
+		t.Fatalf("disconnect left runtime state: sessions=%v history=%v session-route=%v history-route=%v", hasSessions, hasHistory, hasSessionRoute, hasHistoryRoute)
+	}
+
+	// Repeating cleanup for an already-offline daemon is a safe no-op.
+	hub.disconnectDaemon(connection.id)
+}
+func TestRequestToDaemonOffline(t *testing.T) {
+	hub := newDaemonHub()
+	if _, err := hub.requestToDaemon(context.Background(), "daemon-1", protocol.SessionCreate, protocol.SessionCreatePayload{}, protocol.SessionCreated); err == nil || !strings.Contains(err.Error(), "offline") {
+		t.Fatalf("expected offline error, got %v", err)
+	}
+}
+
+func TestCreateSessionTargetOfflineDaemon(t *testing.T) {
+	hub := newDaemonHub()
+	if _, err := hub.createSession(context.Background(), protocol.SessionCreatePayload{}, "daemon-1"); err == nil || !strings.Contains(err.Error(), "offline") {
+		t.Fatalf("expected offline error, got %v", err)
+	}
+	// Without a target, session creation still requires some connected daemon.
+	if _, err := hub.createSession(context.Background(), protocol.SessionCreatePayload{}, ""); err == nil || !strings.Contains(err.Error(), "no daemon is connected") {
+		t.Fatalf("expected no-daemon error, got %v", err)
+	}
+}
+
+func TestSanitizeDeviceName(t *testing.T) {
+	if got := sanitizeDeviceName("  hello  "); got != "hello" {
+		t.Fatalf("sanitize = %q, want hello", got)
+	}
+	if got := sanitizeDeviceName(""); got != "" {
+		t.Fatalf("empty sanitize = %q, want empty", got)
+	}
+	long := "x" + strings.Repeat("y", 200)
+	if got := sanitizeDeviceName(long); len([]rune(got)) != maxDeviceNameLength {
+		t.Fatalf("expected truncation to %d, got %d", maxDeviceNameLength, len([]rune(got)))
 	}
 }

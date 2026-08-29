@@ -32,12 +32,16 @@
 
 ### 2.1 配对
 
-1. Server 生成短期 pairing code；
-2. Daemon 使用 pairing code 调用配对接口；
-3. Server 返回随机、可撤销的 device credential；
-4. Daemon 将 credential 保存到本地安全存储，至少保证文件权限 `0600`；
-5. 后续 WebSocket 连接使用 device credential；
-6. Server 不返回完整 credential，日志不记录 credential。
+配对必须由一个已认证的 Agora 用户发起，pairing code 的作用是把陌生设备安全地绑定到该用户；Daemon 不能通过自报 `user_id` 或 `daemon_id` 自行声明归属。
+
+1. 已认证用户在 Server Web UI 请求添加设备；
+2. Server 生成短期 pairing code，并将 `code_hash -> user_id` 写入控制面；
+3. Daemon 使用 pairing code 调用配对接口；
+4. Server 验证 code 未过期、未消费且未撤销；
+5. Server 返回随机、可撤销的 device credential，并记录 `device_id -> user_id`；
+6. Daemon 将 credential 保存到本地安全存储，至少保证文件权限 `0600`；
+7. 后续 WebSocket 连接使用 device credential；
+8. Server 不返回完整 credential，日志不记录 credential。
 
 配对 code：
 
@@ -45,9 +49,23 @@
 - 有过期时间；
 - 服务端只保存哈希；
 - 成功配对后立即失效；
+- 绑定签发它的 `user_id`，不能跨用户使用；
 - 支持撤销设备。
 
-### 2.2 注册
+设备归属在配对时决定，WebSocket 连接时只验证 credential。Web 用户身份不通过 Daemon 协议传递。
+
+### 2.2 连接认证
+
+Daemon 建立 WebSocket 时使用 `Authorization: Bearer <device-credential>`。Server 依据 credential 哈希查找设备记录，并得到绑定的 `device_id` 与 `user_id`。
+
+连接认证成功后，Daemon 首帧 `daemon.register` 的 `payload.daemon_id` 必须等于 credential 绑定的 `device_id`。不一致时 Server 拒绝注册并关闭连接，不能允许 credential 持有人冒充其他设备。
+
+- trust-local 模式可省略 device credential，但 Server 仍只接受 loopback 连接；
+- auth 模式必须使用 per-device credential，不得退化为所有设备共享的全局 token；
+- credential 被撤销后，新的 WebSocket 连接立即失败，已有连接按实现策略断开；
+- Web 用户的 Logto principal 只存在于 Server HTTP 请求上下文，不传给 Daemon。
+
+### 2.3 注册
 
 Daemon 连接后首先发送 `daemon.register`：
 
@@ -74,7 +92,7 @@ Daemon 连接后首先发送 `daemon.register`：
 }
 ```
 
-Server 回复 `daemon.registered`，包含协议版本和 resync 要求。
+Server 回复 `daemon.registered`，包含协议版本和 resync 要求。注册成功后，Server 将该连接视为已认证的指定设备，并只允许它报告或访问属于该 `daemon_id` 的 Session。
 
 ## 3. 消息类型
 
@@ -90,7 +108,7 @@ Resync 不要求上传用户全部 Claude 会话，只允许纳管 Session。
 
 ### `session.create` / `session.created`
 
-Server 或本地 Wrapper 请求 Daemon 在指定 workspace 启动 Claude Code。Server 负责生成 Agora Session ID；Daemon 返回 Claude session ID、PID、history path 摘要和能力。
+Server 或本地 Agent Runtime 请求 Daemon 在指定 workspace 启动某个 Agent。Server 负责生成 Agora Session ID；Daemon 返回 provider 的 agent session ID、PID（如果有）、history locator 摘要和能力。
 
 workspace 路径不得写入普通 Server 日志；跨用户/跨设备请求必须校验 device scope。
 
@@ -101,7 +119,7 @@ Daemon 上报：
 - Agora Session ID；
 - state / connection；
 - PID；
-- Claude session ID；
+- Agent session ID；
 - 能力；
 - last observed 时间；
 - 错误类别和脱敏错误摘要。
@@ -207,7 +225,25 @@ Daemon 只缓存有限内容：
 
 普通高频 assistant 文本可以在 outbox 满时丢弃。Daemon 必须上报一个 gap 标记，让 Web 显示离线期间可能存在未完整同步内容。原始 JSONL 不因 outbox 丢弃而删除。
 
-## 7. 安全约束
+## 7. Web 用户授权与设备 scope
+
+Web 请求由 Server 先解析当前 principal，再执行 Session ownership 检查：
+
+```text
+principal.user_id
+  └── devices.user_id == principal.user_id
+        └── session.daemon_id == devices.device_id
+```
+
+因此：
+
+- Server 不因客户端提交 `daemon_id`、`user_id` 或 `session_id` 就视为有权；
+- `session_id -> daemon_id` 路由必须与设备归属一致；
+- 跨用户或跨设备的 history、SSE、snapshot、input、resume、stop 请求统一拒绝；
+- IM 通知链接如被兑换，也只能携带 `scope=read_observation`，并绑定单个 `session_id`；
+- 该 scope 不能调用 `session.input`、PTY attach、resume、stop、审批或设备管理。
+
+## 8. 安全约束
 
 - Server 不接受 Daemon 反向开放的公网端口；Daemon 只建立出站连接；
 - device credential 不放 URL query、普通日志或 Web 页面；
@@ -216,7 +252,7 @@ Daemon 只缓存有限内容：
 - IM webhook 仅出站通知，不能反向调用 `session.input`；
 - 不把 `raw_json`、完整 workspace、工具参数和 PTY 内容写入协议日志。
 
-## 8. 当前实现映射
+## 9. 当前实现映射
 
 现有代码仍是本地单进程原型：
 

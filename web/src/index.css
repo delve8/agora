@@ -16,8 +16,11 @@ button, input, textarea { font: inherit; }
 .app-layout { height: 100vh; min-height: 0; overflow: hidden; background: #f5f7fa; }
 .app-layout.ant-layout-has-sider { flex-direction: column; }
 .app-header { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 12px; height: auto; min-height: 56px; padding: 8px 16px; background: #fff; border-bottom: 1px solid #e8ebf0; }
+.header-primary-controls { display: flex; flex: 1 1 auto; min-width: 0; }
+.header-primary-controls .header-session-control { width: auto; }
 .header-session-control { flex: 1 1 auto; min-width: 0; max-width: 720px; }
 .header-actions { flex: 0 0 auto; }
+.header-actions > .ant-space-item { flex: 0 0 auto; }
 .app-content { display: flex; flex-direction: column; width: 100vw; flex: 1 1 auto; min-width: 0; min-height: 0; align-self: stretch; margin: 0; padding: 12px 24px; overflow: hidden; }
 .app-layout > .app-content { width: 100% !important; flex: 1 1 auto !important; }
 .error-banner { flex: 0 0 auto; margin-bottom: 12px; }
@@ -31,6 +34,8 @@ button, input, textarea { font: inherit; }
 .session-selector-sep { color: #c3c9d2; flex: 0 0 auto; }
 .workspace-grid { display: block; flex: 1 1 auto; height: 100%; min-height: 0; }
 .session-main { display: flex; flex-direction: column; gap: 12px; height: 100%; min-width: 0; min-height: 0; }
+.session-heading { flex: 0 0 auto; min-height: 28px; display: flex; align-items: center; padding-inline: 4px; }
+.session-heading-name { color: #172033; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .member-card { grid-row: span 2; align-self: start; }
 .member-card h3 { margin: 8px 0 !important; }
 .member-selected { border-color: #1677ff; }
@@ -38,7 +43,8 @@ button, input, textarea { font: inherit; }
 .member-details .ant-descriptions-item-label { color: #86909c; }
 .event-stream { flex: 1 1 auto; min-width: 0; min-height: 0; overflow: hidden; }
 .event-stream > .ant-card-body { height: 100%; min-height: 0; padding: 0; }
-.events { height: 100%; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; padding: 8px; }
+.events { position: relative; height: 100%; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior-y: contain; touch-action: pan-y; overflow-anchor: none; padding: 8px; -webkit-overflow-scrolling: touch; }
+.history-load-more { position: absolute; z-index: 1; top: 4px; left: 50%; transform: translateX(-50%); padding: 3px 8px; border-radius: 999px; background: rgba(255, 255, 255, .92); box-shadow: 0 2px 8px rgba(31, 41, 55, .08); font-size: 12px; white-space: nowrap; pointer-events: none; }
 .event-row { border-bottom: 1px solid #f0f0f0; }
 .event-row:last-child { border-bottom: 0; }
 .event-card { width: fit-content; max-width: min(88%, 860px); background: transparent; border-radius: 12px; }
@@ -67,7 +73,7 @@ button, input, textarea { font: inherit; }
 .terminal-panel .ant-card-head { min-height: 36px; padding-inline: 12px; }
 .terminal-panel .ant-card-head-title { padding-block: 6px; white-space: normal; }
 .terminal-panel .ant-card-body { padding: 0; }
-.terminal-screen { height: 168px; margin: 0; padding: 8px 12px; overflow: hidden; color: #d9dee8; background: #0d0f13; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; white-space: pre; }
+.terminal-screen { height: clamp(220px, 32vh, 400px); max-width: 100%; margin: 0; padding: 8px 12px; overflow: auto; overscroll-behavior: contain; color: #d9dee8; background: #0d0f13; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; white-space: pre; -webkit-overflow-scrolling: touch; }
 .terminal-empty { height: 120px; display: grid; place-items: center; }
 .terminal-status { display: flex; align-items: center; gap: 8px; min-height: 32px; padding: 4px 12px; border-top: 1px solid #f0f0f0; }
 .composer { display: flex; align-items: flex-end; gap: 12px; padding: 10px 12px; background: #fff; border: 1px solid #dfe4ea; border-radius: 12px; box-shadow: 0 6px 18px rgba(31, 41, 55, .1); }
@@ -76,32 +82,106 @@ button, input, textarea { font: inherit; }
 .setup-card { box-shadow: 0 12px 36px rgba(31, 41, 55, .08); }
 .setup-form { margin-top: 24px; }
 .loading-screen { min-height: 100vh; display: grid; place-items: center; color: #86909c; background: #f5f7fa; }
+.auth-signout { position: fixed; right: 12px; bottom: 10px; display: flex; align-items: center; gap: 8px; color: #86909c; font-size: 12px; background: rgba(245, 247, 250, .85); border-radius: 6px; padding: 0 4px; }
+.auth-identity { max-width: 42vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pairing-panel { margin-top: 16px; padding: 4px 0 24px; border-top: 1px solid #f0f0f0; }
+.pairing-panel .ant-divider { margin-block: 8px 12px; }
+.device-drawer .ant-drawer-body { overflow-y: auto; }
+.pair-code-row { display: flex; align-items: center; gap: 12px; }
+.pairing-loading { display: flex; align-items: center; gap: 8px; }
+.pair-command-row { display: flex; align-items: flex-start; gap: 8px; }
+.pair-command-row .pair-command { flex: 1 1 auto; min-width: 0; }
+.pair-command-row .ant-btn { flex: 0 0 auto; }
+.pair-code { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; padding: 12px; border-radius: 8px; background: #f6f8fa; font: 16px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; letter-spacing: 1px; user-select: all; }
+.pair-expiry .ant-statistic-title { margin-bottom: 2px; color: #86909c; font-size: 12px; }
+.pair-expiry .ant-statistic-content { font-size: 20px; color: #172033; font-variant-numeric: tabular-nums; }
+.pair-command { margin: 6px 0 0; padding: 10px 12px; border-radius: 6px; overflow-x: auto; background: #0d0f13; color: #d9dee8; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.agent-badge { flex: 0 0 auto; width: 24px; margin-inline-end: 0; padding-inline: 0; text-align: center; font-size: 11px; }
+.agent-badge .anticon { margin-inline-end: 0; }
+.agent-badge .agent-logo { display: block; width: 14px; height: 14px; margin: 0 auto; }
+.agent-badge-compact { width: 24px; padding-inline: 0; }
+.agent-badge-icon-only { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; color: #667085; line-height: 1; }
+.agent-badge-icon-only .agent-logo { display: block; width: 18px; height: 18px; }
+.agent-filter { flex: 0 0 58px; min-width: 58px; width: 58px; }
+.agent-filter .ant-select-selector { padding-inline: 7px 24px !important; }
+.agent-filter .ant-select-selection-item,
+.agent-filter .ant-select-selection-placeholder { display: flex; align-items: center; justify-content: center; width: 100%; padding-inline: 0 !important; }
+.agent-filter .agent-badge-icon-only { width: 22px; }
+.agent-filter-placeholder { display: inline-flex; align-items: center; justify-content: center; color: #667085; font-size: 16px; }
+.process-details-toggle { flex: 0 0 auto; }
+.session-device-badge { flex: 0 0 auto; padding: 0 6px; border: 1px solid #c9d5e6; border-radius: 999px; background: #f1f5f9; color: #5b6b80; font-size: 11px; line-height: 16px; white-space: nowrap; }
+.device-filter { min-width: 150px; }
+.device-audit { margin-top: 16px; }
+.device-audit .ant-collapse-header { padding-inline: 0 !important; color: #86909c; }
+.device-audit .ant-collapse-content-box { padding: 0 !important; }
+.device-revoked-label { color: #cf1322; font-size: 12px; }
+.device-table .ant-table-cell code { font: 12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+.device-row-revoked { opacity: .55; }
+.device-empty { margin: 24px 0; }
+.device-error { margin-bottom: 12px; }
 .mobile-menu-button { display: none; }
+.mobile-process-details-toggle { display: none; flex: 0 0 auto; }
+.mobile-menu-label { max-width: 62vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mobile-menu-content { width: 100%; }
+.mobile-menu-field { display: flex; flex-direction: column; gap: 6px; color: #667085; font-size: 12px; }
+.mobile-menu-select, .mobile-session-control { width: 100%; }
+.mobile-session-control .session-selector { flex: 1 1 auto; min-width: 0; }
+.mobile-menu-actions { display: flex; gap: 8px; padding-top: 4px; }
+.mobile-menu-actions .ant-btn { flex: 1 1 0; }
+.mobile-menu-drawer .ant-drawer-body { padding: 16px; }
+
+/* Below 1280px the header cannot reliably fit filters, session controls,
+   device actions, and the new-session action in one row. Use one compact
+   entry point instead of truncating several unrelated controls. */
+@media (max-width: 1279px) {
+  .app-header { flex-wrap: nowrap; gap: 8px; padding: 8px 12px; }
+  .header-primary-controls, .header-actions { display: none; }
+  .desktop-device-manager, .desktop-new-session { display: none; }
+  .mobile-menu-button { display: inline-flex; flex: 1 1 auto; min-width: 0; align-items: center; justify-content: flex-start; padding-inline: 10px; }
+  .mobile-menu-button .anticon { flex: 0 0 auto; }
+  .mobile-menu-button .mobile-menu-label { flex: 1 1 auto; text-align: left; }
+  .mobile-menu-button .anticon + .mobile-menu-label { margin-left: 6px; }
+  .mobile-menu-button .mobile-menu-agent { flex: 0 0 auto; margin: 0 2px 0 4px; border: 0; background: transparent; }
+  .mobile-menu-button .mobile-menu-agent .agent-logo { width: 16px; height: 16px; }
+  .mobile-process-details-toggle { display: inline-flex; }
+  .session-heading { display: none; }
+}
+
 
 @media (max-width: 900px) {
   .app-header { gap: 8px; padding: 8px 12px; }
+  .header-primary-controls { gap: 6px; }
+  .header-actions { gap: 4px; }
+  .header-actions .device-manager-trigger { width: 36px; padding-inline: 0; font-size: 0; }
+  .header-actions .device-manager-trigger .anticon { margin-inline-end: 0; font-size: 16px; }
+  .app-header .ant-btn-primary { white-space: nowrap; }
+  .session-selector-value { min-width: 0; }
+  .session-selector-workspace { max-width: 32vw; }
+  .session-selector-value > :last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .header-session-control { max-width: none; }
   .app-content { width: 100vw; padding: 10px 12px; }
   .session-selector { width: 100%; min-width: 0; }
   .workspace-grid { display: block; }
   .session-sider { display: none; }
-  .mobile-menu-button { display: inline-flex; }
   .session-main { min-width: 0; }
   .member-card, .event-stream, .terminal-panel { width: 100%; min-width: 0; }
   .member-card { grid-row: auto; }
+  .event-card { max-width: 94%; }
+  .event-markdown { overflow-wrap: anywhere; word-break: break-word; }
   .composer { width: 100%; }
   .terminal-panel { grid-column: auto; }
+  .terminal-screen { height: clamp(220px, 38vh, 360px); }
   .composer { grid-column: auto; }
 }
 
-@media (max-width: 560px) {
-  .app-header { flex-wrap: wrap; }
-  .header-session-control { flex-basis: 100%; order: 2; }
-  .header-actions { width: 100%; justify-content: flex-end; }
-  .app-header .ant-btn-primary { padding-inline: 10px; }
-  .app-header .ant-btn-primary:not(:has(.anticon)) { font-size: 0; }
-  .app-header .ant-btn-primary:not(:has(.anticon))::after { content: "New"; font-size: 14px; }
-  .composer { flex-direction: column; align-items: stretch; margin-inline: -4px; }
+@media (max-width: 700px) {
+  .app-header { padding: 6px 8px; min-height: 48px; }
+  .mobile-process-details-toggle { margin-inline: 2px; }
+  .mobile-menu-content .device-manager-trigger { width: 100%; justify-content: flex-start; }
+  .app-content { padding: 8px; }
+  .session-heading { padding-inline: 2px; }
+  .session-heading-name { max-width: calc(100vw - 48px); }
+  .composer { flex-direction: column; align-items: stretch; margin-inline: -2px; }
   .composer .ant-space, .composer .ant-btn { width: 100%; }
   .event-card { max-width: 94%; }
   .structured-event-label { align-items: flex-start; }

@@ -30,6 +30,10 @@ type Config struct {
 	Credential     string
 	CredentialPath string
 	ClaudeBinary   string
+	PiBinary       string
+	PiProvider     string
+	PiModel        string
+	PiSessionDir   string
 	HomeDir        string
 	Heartbeat      time.Duration
 	OutboxLimit    int
@@ -62,6 +66,7 @@ func New(config Config) (*Daemon, error) {
 		config.OutboxLimit = 256
 	}
 	manager := runtime.NewManager(runtime.NewMemoryStore(), adapter.NewClaudeCodeAdapter(config.ClaudeBinary), runtime.NewPTYManager(config.ClaudeBinary, config.HomeDir))
+	manager.AttachPi(runtime.NewPiManager(runtime.PiConfig{Binary: config.PiBinary, Provider: config.PiProvider, Model: config.PiModel, SessionDir: config.PiSessionDir}))
 	daemon := &Daemon{config: config, manager: manager, outbox: newOutbox(config.OutboxLimit), events: make(map[string]context.CancelFunc)}
 	manager.SetSessionExitHandler(func(value session.Session, exited runtime.PTYExit) {
 		daemon.stopEventBridge(value.ID)
@@ -189,7 +194,7 @@ func (d *Daemon) connect(ctx context.Context) error {
 
 func (d *Daemon) session(ctx context.Context) error {
 	defer d.disconnect()
-	if err := d.send(protocol.DaemonRegister, protocol.DaemonRegisterPayload{DaemonID: d.config.ID, Version: d.config.Version, Hostname: hostname(), Capabilities: map[string]bool{"can_start": true, "can_attach": true, "can_observe": true, "can_send_input": true, "can_stream": true, "can_interrupt": true, "can_resume": true, "can_approve": false, "can_read_history": true}}); err != nil {
+	if err := d.send(protocol.DaemonRegister, protocol.DaemonRegisterPayload{DaemonID: d.config.ID, Version: d.config.Version, Hostname: hostname(), Capabilities: map[string]bool{"can_start": true, "can_attach": true, "can_observe": true, "can_send_input": true, "can_stream": true, "can_interrupt": true, "can_resume": true, "can_approve": false, "can_read_history": true, "can_read_terminal": true}}); err != nil {
 		return err
 	}
 	log.Printf("agora daemon: registered as %s", d.config.ID)
@@ -284,20 +289,35 @@ func (d *Daemon) handle(frame protocol.Envelope) error {
 		if agent == "" {
 			agent = "claude"
 		}
-		if payload.ResumeID != "" {
+		if payload.DaemonID != "" && payload.DaemonID != d.config.ID {
+			// The server routes create frames to the targeted daemon's
+			// connection, but the daemon verifies the declared target anyway so
+			// a misrouted frame can never start work on the wrong device.
+			err = fmt.Errorf("session create target %s does not match this daemon %s", payload.DaemonID, d.config.ID)
+		} else if payload.ResumeID != "" {
 			identity, identityErr := session.ParseSessionID(payload.SessionID)
 			if identityErr != nil {
 				err = identityErr
 			} else if identity.DaemonID != d.config.ID || identity.Agent != agent {
 				err = fmt.Errorf("session %s is not owned by daemon %s", payload.SessionID, d.config.ID)
 			} else {
-				value = session.Session{ID: payload.SessionID, CoordinationID: payload.CoordinationID, DaemonID: identity.DaemonID, Agent: identity.Agent, AgentSessionID: identity.AgentSessionID, Workspace: payload.Workspace, DisplayName: payload.DisplayName, Role: payload.Role, State: session.StateStarting, Source: session.SourceManaged, Capabilities: session.Capabilities{CanStart: true, CanResume: true, CanReadHistory: true}}
-				value.ClaudeSessionID = strings.TrimPrefix(identity.AgentSessionID, "claude://")
-				value, err = d.manager.ResumeSession(context.Background(), value)
+				workspace := strings.TrimSpace(payload.Workspace)
+				if workspace == "" {
+					workspace = d.resolveWorkspace(payload.SessionID)
+				}
+				if workspace == "" {
+					err = fmt.Errorf("session %s workspace not found in daemon", payload.SessionID)
+				} else {
+					value = session.Session{ID: payload.SessionID, CoordinationID: payload.CoordinationID, DaemonID: identity.DaemonID, Agent: identity.Agent, AgentSessionID: identity.AgentSessionID, Workspace: workspace, HistoryPath: payload.HistoryPath, DisplayName: payload.DisplayName, Role: payload.Role, State: session.StateStarting, Source: session.SourceManaged, Capabilities: session.Capabilities{CanStart: true, CanResume: true, CanReadHistory: true}}
+					if agent == "claude" {
+						value.ClaudeSessionID = strings.TrimPrefix(identity.AgentSessionID, "claude://")
+					}
+					value, err = d.manager.ResumeSession(context.Background(), value)
+				}
 			}
 		} else {
 			provisional := "pending/" + protocol.NewID("session")
-			value, err = d.manager.CreateManagedSessionWithID(context.Background(), provisional, payload.CoordinationID, payload.Workspace, payload.DisplayName, payload.Role)
+			value, err = d.manager.CreateManagedSessionWithAgent(context.Background(), provisional, payload.CoordinationID, payload.Workspace, payload.DisplayName, payload.Role, agent)
 			if err == nil {
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				nativeID, waitErr := d.manager.WaitAgentSessionID(ctx, provisional)
@@ -315,7 +335,7 @@ func (d *Daemon) handle(frame protocol.Envelope) error {
 				}
 			}
 		}
-		created := protocol.SessionCreatedPayload{SessionID: value.ID, DaemonID: d.config.ID, Agent: value.Agent, AgentSessionID: value.AgentSessionID}
+		created := protocol.SessionCreatedPayload{SessionID: value.ID, DaemonID: d.config.ID, Agent: value.Agent, AgentSessionID: value.AgentSessionID, Workspace: value.Workspace}
 		if err != nil {
 			created.Error = err.Error()
 			return d.sendResponse(protocol.SessionCreated, created, frame.RequestID)
@@ -323,12 +343,12 @@ func (d *Daemon) handle(frame protocol.Envelope) error {
 		created.PID = value.ProcessID
 		created.ClaudeSessionID = value.ClaudeSessionID
 		created.HistoryPath = value.HistoryPath
-		created.Capabilities = map[string]bool{"can_start": true, "can_attach": true, "can_observe": true, "can_send_input": true, "can_stream": true, "can_interrupt": true, "can_resume": true, "can_approve": false, "can_read_history": true, "can_read_terminal": true}
+		created.Capabilities = capabilitiesMap(value.Capabilities)
+		d.startEventBridge(value)
 		if err := d.sendResponse(protocol.SessionCreated, created, frame.RequestID); err != nil {
 			return err
 		}
-		d.startEventBridge(value)
-		return d.send(protocol.SessionUpdate, protocol.SessionUpdatePayload{SessionID: value.ID, DaemonID: d.config.ID, Agent: value.Agent, AgentSessionID: value.AgentSessionID, ClaudeSessionID: value.ClaudeSessionID, State: value.State, Connection: value.Connection, PID: value.ProcessID, LastError: value.LastError})
+		return d.send(protocol.SessionUpdate, protocol.SessionUpdatePayload{SessionID: value.ID, DaemonID: d.config.ID, Agent: value.Agent, AgentSessionID: value.AgentSessionID, HistoryPath: value.HistoryPath, DisplayName: value.DisplayName, DisplayNameSource: value.DisplayNameSource, ClaudeSessionID: value.ClaudeSessionID, State: value.State, Connection: value.Connection, PID: value.ProcessID, LastError: value.LastError})
 	case protocol.SessionInput:
 		var payload protocol.InputPayload
 		if err := protocol.DecodePayload(frame, &payload); err != nil {
@@ -379,11 +399,32 @@ func (d *Daemon) handle(frame protocol.Envelope) error {
 				}
 			}
 		}
+		if valueErr != nil {
+			// The background catalog scan intentionally runs asynchronously so a
+			// daemon can connect quickly. A page may request history in that small
+			// window, so resolve this one session synchronously instead of exposing
+			// a transient "not found" response to the UI.
+			if discovered, found, discoverErr := d.manager.HistorySession(context.Background(), payload.SessionID, "", d.config.ID); discoverErr == nil && found {
+				value = discovered
+				valueErr = nil
+			}
+		}
 		var values []event.Event
 		if valueErr != nil {
 			valueErr = fmt.Errorf("history session %s not found", payload.SessionID)
 		} else {
-			values, valueErr = d.manager.HistoryForSession(context.Background(), value, payload.Limit)
+			values, valueErr = d.manager.HistoryForSession(context.Background(), value, 0)
+			if valueErr == nil && payload.Before != "" {
+				for index := range values {
+					if values[index].ID == payload.Before {
+						values = values[:index]
+						break
+					}
+				}
+			}
+			if valueErr == nil && payload.Limit > 0 && len(values) > payload.Limit {
+				values = values[len(values)-payload.Limit:]
+			}
 		}
 		if valueErr != nil {
 			response.Error = valueErr.Error()
@@ -394,6 +435,28 @@ func (d *Daemon) handle(frame protocol.Envelope) error {
 		}
 		log.Printf("agora daemon: history response %s events=%d error=%q", frame.RequestID, len(values), response.Error)
 		return d.sendResponse(protocol.SessionHistoryResponse, response, frame.RequestID)
+	case protocol.AttachRequest:
+		var payload protocol.AttachPayload
+		if err := protocol.DecodePayload(frame, &payload); err != nil {
+			return err
+		}
+		response := protocol.AttachPayload{SessionID: payload.SessionID}
+		if value, err := d.manager.GetSession(context.Background(), payload.SessionID); err != nil {
+			response.Error = err.Error()
+		} else {
+			var socket string
+			if value.Agent == "pi" {
+				socket, err = d.manager.AttachPiAddr(payload.SessionID)
+			} else {
+				socket, err = d.manager.AttachAddr(payload.SessionID)
+			}
+			if err != nil {
+				response.Error = err.Error()
+			} else {
+				response.Socket = socket
+			}
+		}
+		return d.sendResponse(protocol.AttachResponse, response, frame.RequestID)
 	case protocol.SnapshotRequest:
 		var payload protocol.SnapshotPayload
 		if err := protocol.DecodePayload(frame, &payload); err != nil {
@@ -411,6 +474,21 @@ func (d *Daemon) handle(frame protocol.Envelope) error {
 	default:
 		return fmt.Errorf("unsupported server message %q", frame.Type)
 	}
+}
+
+func (d *Daemon) resolveWorkspace(sessionID string) string {
+	if value, err := d.manager.GetSession(context.Background(), sessionID); err == nil && strings.TrimSpace(value.Workspace) != "" {
+		return value.Workspace
+	}
+	d.historyMu.RLock()
+	historySessions := append([]session.Session(nil), d.historySessions...)
+	d.historyMu.RUnlock()
+	for _, value := range historySessions {
+		if value.ID == sessionID {
+			return value.Workspace
+		}
+	}
+	return ""
 }
 
 func (d *Daemon) sendResync() error {
@@ -432,8 +510,11 @@ func (d *Daemon) sendResync() error {
 		}
 		payload.Sessions = append(payload.Sessions, protocol.SessionSummary{
 			SessionID: value.ID, DaemonID: d.config.ID, Agent: value.Agent,
-			AgentSessionID: value.AgentSessionID, ClaudeSessionID: value.ClaudeSessionID,
+			AgentSessionID: value.AgentSessionID, HistoryPath: value.HistoryPath, ClaudeSessionID: value.ClaudeSessionID,
+			Workspace: value.Workspace, DisplayName: value.DisplayName, DisplayNameSource: value.DisplayNameSource,
+			Role:  value.Role,
 			State: value.State, Connection: value.Connection, PID: value.ProcessID,
+			CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
 		})
 	}
 	d.historyMu.RLock()
@@ -443,7 +524,7 @@ func (d *Daemon) sendResync() error {
 		if _, exists := managedClaudeIDs[value.AgentSessionID]; exists {
 			continue
 		}
-		payload.History = append(payload.History, protocol.HistorySessionSummary{SessionID: value.ID, DaemonID: d.config.ID, Agent: value.Agent, AgentSessionID: value.AgentSessionID, ClaudeSessionID: value.ClaudeSessionID, Workspace: value.Workspace, DisplayName: value.DisplayName, DisplayNameSource: value.DisplayNameSource, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt})
+		payload.History = append(payload.History, protocol.HistorySessionSummary{SessionID: value.ID, DaemonID: d.config.ID, Agent: value.Agent, AgentSessionID: value.AgentSessionID, HistoryPath: value.HistoryPath, ClaudeSessionID: value.ClaudeSessionID, Workspace: value.Workspace, DisplayName: value.DisplayName, DisplayNameSource: value.DisplayNameSource, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt})
 	}
 	parts := splitResync(payload)
 	for index := range parts {
@@ -485,6 +566,10 @@ func splitResync(payload protocol.ResyncPayload) []protocol.ResyncPayload {
 		current = candidate
 	}
 	return append(parts, current)
+}
+
+func capabilitiesMap(value session.Capabilities) map[string]bool {
+	return map[string]bool{"can_start": value.CanStart, "can_discover": value.CanDiscover, "can_attach": value.CanAttach, "can_observe": value.CanObserve, "can_send_input": value.CanSendInput, "can_stream": value.CanStream, "can_interrupt": value.CanInterrupt, "can_resume": value.CanResume, "can_approve": value.CanApprove, "can_read_history": value.CanReadHistory, "can_read_terminal": value.CanReadTerminal}
 }
 
 func (d *Daemon) stopEventBridge(id string) {

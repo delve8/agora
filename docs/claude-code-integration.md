@@ -1,6 +1,6 @@
 # Claude Code Integration
 
-状态：`claude-wrapper` / managed PTY
+> 本文是 Claude Code 的 provider-specific 接入记录，不是 Agora 所有 Agent 的通用协议。通用接入边界见 [agent-integration.md](agent-integration.md)；Pi 的 stdio RPC/JSONL 方案见 [pi-integration.md](pi-integration.md)。Claude 的 PTY、TUI 和 `.claude` JSONL 是当前 Claude 实现的事实，不是所有 Agent 的必需条件。
 最后更新：2026-08-06
 
 ## 当前模型

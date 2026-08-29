@@ -1,5 +1,6 @@
 # Claude Code IDE Plugin Process Wrapper / stream-json Proxy Spec
 
+> 本文定义 Claude Code 插件 stream-json 的透明代理，属于 Claude-specific provider 文档。通用 Agent 接入边界见 [agent-integration.md](agent-integration.md)。Pi 首选 `--mode rpc`/`--mode json`，不应套用本文的 Claude stream-json 字段、PTY stdin 语义或 `AGORA_CLAUDE_BINARY` 配置；其方案见 [pi-integration.md](pi-integration.md)。本文中可复用的部分仅包括 bounded stdout relay、observation queue、raw JSON preservation 和退出上报。
 状态：Draft / implementation gate
 最后更新：2026-08-09
 

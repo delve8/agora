@@ -41,6 +41,76 @@ func ResolveDaemonID(override, path string) (string, error) {
 	return id, nil
 }
 
+// SaveDaemonID atomically persists an explicit daemon identity (e.g. the
+// device_id returned by pairing) so later runs resolve the same id without
+// an override. It replaces any previously stored UUID identity.
+func SaveDaemonID(path, id string) error {
+	id = strings.TrimSpace(id)
+	if err := validateDaemonID(id); err != nil {
+		return err
+	}
+	if path == "" {
+		path = defaultPath()
+	}
+	return save(path, File{DaemonID: id})
+}
+
+func DeviceCredentialPath(override string) string {
+	if value := strings.TrimSpace(override); value != "" {
+		return value
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".agora", "device.credential")
+}
+
+func LoadDeviceCredential(path string) (string, error) {
+	path = DeviceCredentialPath(path)
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	value := strings.TrimSpace(string(body))
+	if value == "" {
+		return "", fmt.Errorf("device credential file %s is empty", path)
+	}
+	return value, nil
+}
+
+func SaveDeviceCredential(path, credential string) error {
+	path = DeviceCredentialPath(path)
+	credential = strings.TrimSpace(credential)
+	if credential == "" {
+		return fmt.Errorf("device credential is empty")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("create device credential directory: %w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".device-credential-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.WriteString(credential + "\n"); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("install device credential: %w", err)
+	}
+	return nil
+}
 func defaultPath() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".agora", "config.json")
