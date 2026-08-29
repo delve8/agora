@@ -1,0 +1,33 @@
+services:
+  postgres:
+    image: ${LOGTO_POSTGRES_IMAGE:-postgres:17-alpine}
+    user: postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${LOGTO_POSTGRES_PASSWORD:-agora-logto-dev}
+      POSTGRES_DB: logto
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d logto"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - logto-postgres-data:/var/lib/postgresql/data
+
+  logto:
+    image: ${LOGTO_IMAGE:-svhd/logto:latest}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["sh", "-c", "npm run cli db seed -- --swe && npm start"]
+    environment:
+      TRUST_PROXY_HEADER: "1"
+      DB_URL: postgres://postgres:${LOGTO_POSTGRES_PASSWORD:-agora-logto-dev}@postgres:5432/logto
+      ENDPOINT: ${LOGTO_ENDPOINT:-http://127.0.0.1:3003}
+      ADMIN_ENDPOINT: ${LOGTO_ADMIN_ENDPOINT:-http://127.0.0.1:3004}
+    ports:
+      - "127.0.0.1:${LOGTO_PORT:-3003}:3001"
+      - "127.0.0.1:${LOGTO_ADMIN_PORT:-3004}:3002"
+
+volumes:
+  logto-postgres-data:

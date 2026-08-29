@@ -18,7 +18,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: agora serve | agora server | agora daemon | agora pty <args...> | agora attach <session-id> | agora wrapper [session-id] | agora claude-proxy [args...]")
+		fmt.Fprintln(os.Stderr, "usage: agora serve | agora server | agora daemon | agora pty <args...> | agora attach <session-id> | agora wrapper [session-id] | agora pi-wrapper [session-id] | agora claude-proxy [args...]")
 		os.Exit(2)
 	}
 	var err error
@@ -47,10 +47,12 @@ func main() {
 		}
 	case "wrapper":
 		err = runWrapper(os.Args[2:])
+	case "pi-wrapper":
+		err = runPiWrapper(os.Args[2:])
 	case "claude-proxy":
 		err = runClaudeProxy(os.Args[2:])
 	default:
-		fmt.Fprintln(os.Stderr, "usage: agora serve | agora pty <args...> | agora attach <session-id> | agora wrapper [session-id] | agora claude-proxy [args...]")
+		fmt.Fprintln(os.Stderr, "usage: agora serve | agora pty <args...> | agora attach <session-id> | agora wrapper [session-id] | agora pi-wrapper [session-id] | agora claude-proxy [args...]")
 		os.Exit(2)
 	}
 	if err != nil {
@@ -72,6 +74,10 @@ func serve() error {
 	agentAdapter := adapter.NewClaudeCodeAdapter(os.Getenv("AGORA_CLAUDE_BINARY"))
 	ptyManager := runtime.NewPTYManager(os.Getenv("AGORA_CLAUDE_BINARY"), os.Getenv("HOME"))
 	manager := runtime.NewManager(database, agentAdapter, ptyManager)
+	manager.AttachPi(runtime.NewPiManager(runtime.PiConfig{
+		Binary: os.Getenv("AGORA_PI_BINARY"), Provider: os.Getenv("AGORA_PI_PROVIDER"),
+		Model: os.Getenv("AGORA_PI_MODEL"), SessionDir: os.Getenv("AGORA_PI_SESSION_DIR"),
+	}))
 	if err := manager.ReconcileObservers(context.Background()); err != nil {
 		log.Printf("agora: reconcile observers: %v", err)
 	}

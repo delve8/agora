@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -159,9 +160,28 @@ func (h *daemonHub) serveHTTP(w http.ResponseWriter, r *http.Request) {
 				_ = writeEnvelope(conn, errorEnvelope("invalid_register", "daemon_id does not match credential", frame.RequestID))
 				continue
 			}
+			if h.store != nil {
+				revoked, revokeErr := h.store.IsDeviceRevoked(r.Context(), payload.DaemonID)
+				if revokeErr != nil {
+					_ = writeEnvelope(conn, errorEnvelope("register_failed", "unable to validate daemon", frame.RequestID))
+					return
+				}
+				if revoked {
+					_ = writeEnvelope(conn, errorEnvelope("invalid_register", "daemon has been revoked", frame.RequestID))
+					return
+				}
+			}
 			registered = &daemonConnection{id: payload.DaemonID, userID: device.UserID, conn: conn, send: make(chan protocol.Envelope, 128), lastSeen: time.Now().UTC()}
+
 			if h.authMode == "logto" && h.store != nil {
 				_ = h.store.TouchDevice(r.Context(), payload.DaemonID, time.Now().UTC())
+				// Backfill a friendly alias for devices paired without a name, so
+				// the web device list and session badges show the hostname instead
+				// of the raw device id. Subsequent reconnects skip this because
+				// device.Name is then non-empty.
+				if strings.TrimSpace(device.Name) == "" && strings.TrimSpace(payload.Hostname) != "" {
+					_ = h.store.UpdateDeviceName(r.Context(), payload.DaemonID, sanitizeDeviceName(payload.Hostname))
+				}
 			}
 			h.register(registered)
 			go registered.writeLoop()
@@ -201,6 +221,26 @@ func (h *daemonHub) remove(c *daemonConnection) {
 	}
 	h.mu.Unlock()
 	c.close()
+}
+
+// disconnectDaemon closes the current connection for a daemon and runs the
+// same in-memory cleanup as an ordinary websocket disconnect. It is safe to
+// call when the daemon is already offline.
+func (h *daemonHub) disconnectDaemon(daemonID string) {
+	h.mu.RLock()
+	connection := h.devices[daemonID]
+	h.mu.RUnlock()
+	if connection != nil {
+		h.remove(connection)
+	}
+}
+
+// isConnected reports whether a daemon with the given id is currently
+// connected to the hub.
+func (h *daemonHub) isConnected(id string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.devices[id] != nil
 }
 
 func (h *daemonHub) handleFrame(c *daemonConnection, frame protocol.Envelope) error {
@@ -290,12 +330,24 @@ func (h *daemonHub) handleFrame(c *daemonConnection, frame protocol.Envelope) er
 			if payload.AgentSessionID != "" {
 				existing.AgentSessionID = payload.AgentSessionID
 			}
+			if payload.HistoryPath != "" {
+				existing.HistoryPath = payload.HistoryPath
+			}
+			if payload.DisplayName != "" {
+				existing.DisplayName = payload.DisplayName
+				existing.DisplayNameSource = payload.DisplayNameSource
+			}
 			if payload.ClaudeSessionID != "" {
 				existing.ClaudeSessionID = payload.ClaudeSessionID
 			}
 			existing.State = payload.State
 			existing.Connection = payload.Connection
-			existing.PID = payload.PID
+			// The update may arrive after session.created. Preserve the PID from
+			// that response when an intermediate running update omits it; only a
+			// terminal state is allowed to clear a PID explicitly.
+			if payload.PID > 0 || payload.State == session.StateStopped || payload.State == session.StateFailed || payload.State == session.StateStale {
+				existing.PID = payload.PID
+			}
 			h.sessions[c.id][payload.SessionID] = existing
 			h.mu.Unlock()
 		}
@@ -488,6 +540,9 @@ func (h *daemonHub) effectiveSession(value session.Session) session.Session {
 	value.DaemonID = identity.DaemonID
 	value.Agent = identity.Agent
 	value.AgentSessionID = identity.AgentSessionID
+	if identity.Agent == "pi" && isOpaqueSessionName(value.DisplayName, identity.Agent) {
+		value.DisplayName = friendlySessionName(identity.Agent, value.Workspace)
+	}
 	if identity.Agent == "claude" {
 		value.ClaudeSessionID = strings.TrimPrefix(identity.AgentSessionID, "claude://")
 	}
@@ -499,22 +554,145 @@ func (h *daemonHub) effectiveSession(value session.Session) session.Session {
 		value.Capabilities = session.Capabilities{CanReadHistory: resumable, CanResume: resumable}
 		return value
 	}
-	summary, ok := h.sessions[identity.DaemonID][value.ID]
-	if ok && summary.ClaudeSessionID != "" {
+	summary, live := h.sessions[identity.DaemonID][value.ID]
+	if live && summary.ClaudeSessionID != "" {
 		value.ClaudeSessionID = summary.ClaudeSessionID
 	}
-	if ok && (summary.State == session.StateRunning || summary.State == session.StateWaiting || summary.State == session.StateStarting) && summary.PID > 0 {
+	if live && summary.AgentSessionID != "" {
+		value.AgentSessionID = summary.AgentSessionID
+	}
+	if live && summary.HistoryPath != "" {
+		value.HistoryPath = summary.HistoryPath
+	}
+	if live && strings.TrimSpace(summary.Workspace) != "" {
+		value.Workspace = summary.Workspace
+	}
+	if live && strings.TrimSpace(summary.DisplayName) != "" && !isOpaqueSessionName(summary.DisplayName, identity.Agent) {
+		value.DisplayName = summary.DisplayName
+		value.DisplayNameSource = summary.DisplayNameSource
+	}
+	if !live {
+		// The server store can contain a row created before the daemon learned
+		// its Pi history path. Enrich that row from the daemon's history catalog;
+		// otherwise getEvents would see CanReadHistory=false and return an empty
+		// transcript even though the session is visible in /api/state.
+		if history, exists := h.history[identity.DaemonID][value.ID]; exists {
+			if history.AgentSessionID != "" {
+				value.AgentSessionID = history.AgentSessionID
+			}
+			if history.HistoryPath != "" {
+				value.HistoryPath = history.HistoryPath
+			}
+			if history.Workspace != "" {
+				value.Workspace = history.Workspace
+			}
+			if history.DisplayName != "" && !isOpaqueSessionName(history.DisplayName, identity.Agent) {
+				value.DisplayName = history.DisplayName
+				value.DisplayNameSource = history.DisplayNameSource
+			}
+		}
+	}
+	if isOpaqueSessionName(value.DisplayName, identity.Agent) {
+		value.DisplayName = friendlySessionName(identity.Agent, value.Workspace)
+	}
+	if live && (summary.State == session.StateRunning || summary.State == session.StateWaiting || summary.State == session.StateStarting) && summary.PID > 0 {
 		value.State = summary.State
 		value.Connection = summary.Connection
 		value.ProcessID = summary.PID
-		value.Capabilities = session.Capabilities{CanStart: true, CanAttach: true, CanObserve: true, CanSendInput: true, CanStream: true, CanInterrupt: true, CanResume: true, CanReadHistory: true, CanReadTerminal: true}
+		value.Capabilities = liveAgentCapabilities(identity.Agent)
 		return value
 	}
 	value.State = session.StateStopped
 	value.Connection = session.ConnectionUnavailable
 	value.ProcessID = 0
-	value.Capabilities = session.Capabilities{CanReadHistory: resumable, CanResume: resumable}
+	value.Capabilities = session.Capabilities{CanReadHistory: value.HistoryPath != "" || resumable, CanResume: value.AgentSessionID != "" && value.Workspace != ""}
 	return value
+}
+
+func (h *daemonHub) liveSessions(coordinationID string) []session.Session {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	values := make([]session.Session, 0)
+	for daemonID, summaries := range h.sessions {
+		if h.devices[daemonID] == nil {
+			continue
+		}
+		for _, summary := range summaries {
+			values = append(values, liveSummarySession(summary, coordinationID))
+		}
+	}
+	return values
+}
+
+func liveSummarySession(summary protocol.SessionSummary, coordinationID string) session.Session {
+	agent := summary.Agent
+	if agent == "" {
+		agent = "claude"
+	}
+	agentSessionID := summary.AgentSessionID
+	if agentSessionID == "" && summary.ClaudeSessionID != "" {
+		agentSessionID = agent + "://" + summary.ClaudeSessionID
+	}
+	daemonID := summary.DaemonID
+	if daemonID == "" {
+		if identity, err := session.ParseSessionID(summary.SessionID); err == nil {
+			daemonID = identity.DaemonID
+		}
+	}
+	value := session.Session{
+		ID: summary.SessionID, CoordinationID: coordinationID, DaemonID: daemonID,
+		Agent: agent, AgentSessionID: agentSessionID, ClaudeSessionID: summary.ClaudeSessionID,
+		Workspace: summary.Workspace, DisplayName: summary.DisplayName, DisplayNameSource: summary.DisplayNameSource, HistoryPath: summary.HistoryPath,
+		Role: summary.Role, State: summary.State, Source: session.SourceManaged,
+		Connection: summary.Connection, ProcessID: summary.PID,
+		CreatedAt: summary.CreatedAt, UpdatedAt: summary.UpdatedAt,
+	}
+	if isOpaqueSessionName(value.DisplayName, agent) {
+		value.DisplayName = friendlySessionName(agent, value.Workspace)
+	}
+	switch value.State {
+	case session.StateRunning, session.StateWaiting, session.StateStarting:
+		if value.ProcessID > 0 {
+			value.Capabilities = liveAgentCapabilities(agent)
+		}
+	default:
+		resumable := value.Workspace != ""
+		value.Capabilities = session.Capabilities{CanReadHistory: resumable, CanResume: resumable}
+	}
+	return value
+}
+
+// upsertLiveSession records a full session in the hub's live map so a session
+// created or resumed through the server is listed immediately, without waiting
+// for the daemon to resync. Later SessionUpdate frames only adjust the state
+// fields and preserve the metadata stored here.
+func liveAgentCapabilities(agent string) session.Capabilities {
+	// Pi and Claude both run their native TUI under a daemon-owned PTY. The
+	// daemon's VT emulator can therefore serve a read-only terminal snapshot to
+	// the Web UI as well as the native attach client.
+	canAttach := agent == "claude" || agent == "claude-code" || agent == "pi"
+	canReadTerminal := canAttach
+	return session.Capabilities{CanStart: true, CanAttach: canAttach, CanObserve: true, CanSendInput: true, CanStream: true, CanInterrupt: true, CanResume: true, CanReadHistory: true, CanReadTerminal: canReadTerminal}
+}
+
+func (h *daemonHub) upsertLiveSession(value session.Session) {
+	identity, err := session.ParseSessionID(value.ID)
+	if err != nil {
+		return
+	}
+	h.mu.Lock()
+	if h.sessions[identity.DaemonID] == nil {
+		h.sessions[identity.DaemonID] = make(map[string]protocol.SessionSummary)
+	}
+	h.sessions[identity.DaemonID][value.ID] = protocol.SessionSummary{
+		SessionID: value.ID, DaemonID: identity.DaemonID, Agent: value.Agent,
+		AgentSessionID: value.AgentSessionID, ClaudeSessionID: value.ClaudeSessionID,
+		Workspace: value.Workspace, DisplayName: value.DisplayName, DisplayNameSource: value.DisplayNameSource,
+		Role: value.Role, HistoryPath: value.HistoryPath,
+		State: value.State, Connection: value.Connection, PID: value.ProcessID,
+		CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
+	}
+	h.mu.Unlock()
 }
 
 func (h *daemonHub) historySessions(coordinationID string) []session.Session {
@@ -568,7 +746,36 @@ func historySummarySession(summary protocol.HistorySessionSummary, coordinationI
 	if agentSessionID == "" && summary.ClaudeSessionID != "" {
 		agentSessionID = agent + "://" + summary.ClaudeSessionID
 	}
-	return session.Session{ID: summary.SessionID, CoordinationID: coordinationID, DaemonID: summary.DaemonID, Agent: agent, AgentSessionID: agentSessionID, ClaudeSessionID: summary.ClaudeSessionID, ExternalID: summary.ClaudeSessionID, Workspace: summary.Workspace, DisplayName: summary.DisplayName, DisplayNameSource: summary.DisplayNameSource, Role: "history", State: session.StateStopped, Source: session.SourceHistory, Connection: session.ConnectionUnavailable, Capabilities: session.Capabilities{CanReadHistory: true, CanResume: agentSessionID != "" && summary.Workspace != ""}, CreatedAt: summary.CreatedAt, UpdatedAt: summary.UpdatedAt}
+	name := summary.DisplayName
+	if isOpaqueSessionName(name, agent) {
+		name = friendlySessionName(agent, summary.Workspace)
+	}
+	return session.Session{ID: summary.SessionID, CoordinationID: coordinationID, DaemonID: summary.DaemonID, Agent: agent, AgentSessionID: agentSessionID, ClaudeSessionID: summary.ClaudeSessionID, ExternalID: summary.ClaudeSessionID, Workspace: summary.Workspace, HistoryPath: summary.HistoryPath, DisplayName: name, DisplayNameSource: summary.DisplayNameSource, Role: "history", State: session.StateStopped, Source: session.SourceHistory, Connection: session.ConnectionUnavailable, Capabilities: session.Capabilities{CanReadHistory: true, CanResume: agentSessionID != "" && summary.Workspace != ""}, CreatedAt: summary.CreatedAt, UpdatedAt: summary.UpdatedAt}
+}
+
+func isOpaqueSessionName(name, agent string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return true
+	}
+	return strings.HasPrefix(name, agent+"://") || strings.HasPrefix(name, "claude://") || strings.HasPrefix(name, "pi://")
+}
+
+func friendlySessionName(agent, workspace string) string {
+	workspace = strings.TrimSpace(workspace)
+	if workspace != "" {
+		base := filepath.Base(filepath.Clean(workspace))
+		if base != "" && base != "." && base != string(filepath.Separator) {
+			if agent == "pi" {
+				return "Pi · " + base
+			}
+			return base
+		}
+	}
+	if agent == "pi" {
+		return "Pi session"
+	}
+	return "New session"
 }
 
 func (h *daemonHub) hasRoute(sessionID string) bool {
@@ -606,6 +813,26 @@ func (h *daemonHub) requestAny(ctx context.Context, typ string, payload any, res
 	if connection == nil {
 		return protocol.Envelope{}, errors.New("no daemon is connected")
 	}
+	return h.requestConnection(ctx, connection, typ, payload, responseType)
+}
+
+// requestToDaemon sends a request frame to a specific connected daemon,
+// failing fast when that daemon is offline instead of silently choosing
+// another one.
+func (h *daemonHub) requestToDaemon(ctx context.Context, daemonID, typ string, payload any, responseType string) (protocol.Envelope, error) {
+	h.mu.RLock()
+	connection := h.devices[daemonID]
+	h.mu.RUnlock()
+	if connection == nil {
+		return protocol.Envelope{}, fmt.Errorf("daemon %s is offline", daemonID)
+	}
+	return h.requestConnection(ctx, connection, typ, payload, responseType)
+}
+
+// requestConnection is the shared send/timeout/response core for daemon
+// requests; requestAny, requestToDaemon and request all resolve a connection
+// and delegate here.
+func (h *daemonHub) requestConnection(ctx context.Context, connection *daemonConnection, typ string, payload any, responseType string) (protocol.Envelope, error) {
 	frame, err := protocol.NewEnvelope(typ, payload)
 	if err != nil {
 		return protocol.Envelope{}, err
@@ -639,8 +866,14 @@ func (h *daemonHub) requestAny(ctx context.Context, typ string, payload any, res
 	}
 }
 
-func (h *daemonHub) createSession(ctx context.Context, payload protocol.SessionCreatePayload) (protocol.SessionCreatedPayload, error) {
-	frame, err := h.requestAny(ctx, protocol.SessionCreate, payload, protocol.SessionCreated)
+func (h *daemonHub) createSession(ctx context.Context, payload protocol.SessionCreatePayload, targetDaemonID string) (protocol.SessionCreatedPayload, error) {
+	var frame protocol.Envelope
+	var err error
+	if strings.TrimSpace(targetDaemonID) != "" {
+		frame, err = h.requestToDaemon(ctx, targetDaemonID, protocol.SessionCreate, payload, protocol.SessionCreated)
+	} else {
+		frame, err = h.requestAny(ctx, protocol.SessionCreate, payload, protocol.SessionCreated)
+	}
 	if err != nil {
 		return protocol.SessionCreatedPayload{}, err
 	}
@@ -659,36 +892,7 @@ func (h *daemonHub) request(ctx context.Context, sessionID, typ string, payload 
 	if err != nil {
 		return protocol.Envelope{}, err
 	}
-	frame, err := protocol.NewEnvelope(typ, payload)
-	if err != nil {
-		return protocol.Envelope{}, err
-	}
-	frame.RequestID = protocol.NewID("req")
-	response := make(chan protocol.Envelope, 1)
-	h.mu.Lock()
-	h.pending[frame.RequestID] = response
-	h.mu.Unlock()
-	defer func() {
-		h.mu.Lock()
-		delete(h.pending, frame.RequestID)
-		h.mu.Unlock()
-	}()
-	if err := connection.write(frame); err != nil {
-		return protocol.Envelope{}, err
-	}
-	timer := time.NewTimer(h.timeout)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return protocol.Envelope{}, ctx.Err()
-	case <-timer.C:
-		return protocol.Envelope{}, fmt.Errorf("daemon request timed out")
-	case result := <-response:
-		if result.Type != responseType {
-			return protocol.Envelope{}, fmt.Errorf("unexpected daemon response %q", result.Type)
-		}
-		return result, nil
-	}
+	return h.requestConnection(ctx, connection, typ, payload, responseType)
 }
 func (h *daemonHub) resumeSession(ctx context.Context, value session.Session) (session.Session, error) {
 	identity, err := session.ParseSessionID(value.ID)
@@ -703,7 +907,7 @@ func (h *daemonHub) resumeSession(ctx context.Context, value session.Session) (s
 	}
 	frame, err := h.request(ctx, value.ID, protocol.SessionCreate, protocol.SessionCreatePayload{
 		SessionID: value.ID, CoordinationID: value.CoordinationID, Workspace: value.Workspace,
-		DisplayName: value.DisplayName, Role: value.Role, Agent: identity.Agent, ResumeID: identity.AgentSessionID,
+		DisplayName: value.DisplayName, Role: value.Role, Agent: identity.Agent, ResumeID: identity.AgentSessionID, HistoryPath: value.HistoryPath,
 	}, protocol.SessionCreated)
 	if err != nil {
 		return session.Session{}, err
@@ -722,7 +926,7 @@ func (h *daemonHub) resumeSession(ctx context.Context, value session.Session) (s
 	value.State = session.StateRunning
 	value.Connection = session.ConnectionObserved
 	value.ProcessID = result.PID
-	value.Capabilities = session.Capabilities{CanStart: true, CanAttach: true, CanObserve: true, CanSendInput: true, CanStream: true, CanInterrupt: true, CanResume: true, CanReadHistory: true, CanReadTerminal: true}
+	value.Capabilities = liveAgentCapabilities(identity.Agent)
 	return value, nil
 }
 

@@ -25,6 +25,8 @@ const (
 	SessionHistoryResponse = "session.history.response"
 	SnapshotRequest        = "snapshot.request"
 	SnapshotResponse       = "snapshot.response"
+	AttachRequest          = "attach.request"
+	AttachResponse         = "attach.response"
 	SessionInput           = "session.input"
 	SessionInputResult     = "session.input_result"
 	SessionStop            = "session.stop"
@@ -70,7 +72,7 @@ func ValidateType(typ string) error {
 	case DaemonRegister, DaemonRegistered, DaemonHeartbeat, DaemonHeartbeatAck,
 		DaemonResync, ServerResyncRequest, SessionCreate, SessionCreated,
 		SessionUpdate, EventBatch, SessionHistoryRequest, SessionHistoryResponse,
-		SnapshotRequest, SnapshotResponse, SessionInput, SessionInputResult,
+		SnapshotRequest, SnapshotResponse, AttachRequest, AttachResponse, SessionInput, SessionInputResult,
 		SessionStop, SessionStopResult, SessionExit, Ack, Error:
 		return nil
 	default:
@@ -95,11 +97,18 @@ type SessionSummary struct {
 	DaemonID       string `json:"daemon_id,omitempty"`
 	Agent          string `json:"agent,omitempty"`
 	AgentSessionID string `json:"agent_session_id,omitempty"`
+	HistoryPath    string `json:"history_path,omitempty"`
 	// Deprecated compatibility field.
-	ClaudeSessionID string `json:"claude_session_id,omitempty"`
-	State           string `json:"state"`
-	Connection      string `json:"connection,omitempty"`
-	PID             int    `json:"pid,omitempty"`
+	ClaudeSessionID   string    `json:"claude_session_id,omitempty"`
+	Workspace         string    `json:"workspace,omitempty"`
+	DisplayName       string    `json:"display_name,omitempty"`
+	DisplayNameSource string    `json:"display_name_source,omitempty"`
+	Role              string    `json:"role,omitempty"`
+	State             string    `json:"state"`
+	Connection        string    `json:"connection,omitempty"`
+	PID               int       `json:"pid,omitempty"`
+	CreatedAt         time.Time `json:"created_at,omitempty"`
+	UpdatedAt         time.Time `json:"updated_at,omitempty"`
 }
 
 type HistorySessionSummary struct {
@@ -107,6 +116,7 @@ type HistorySessionSummary struct {
 	DaemonID       string `json:"daemon_id,omitempty"`
 	Agent          string `json:"agent,omitempty"`
 	AgentSessionID string `json:"agent_session_id"`
+	HistoryPath    string `json:"history_path,omitempty"`
 	// Deprecated compatibility field.
 	ClaudeSessionID   string    `json:"claude_session_id,omitempty"`
 	Workspace         string    `json:"workspace"`
@@ -136,6 +146,11 @@ type SessionCreatePayload struct {
 	Role           string `json:"role,omitempty"`
 	Agent          string `json:"agent,omitempty"`
 	ResumeID       string `json:"resume_id,omitempty"`
+	HistoryPath    string `json:"history_path,omitempty"`
+	// DaemonID, when set, tells the receiving daemon which device the session
+	// is expected to run on. The server only sends the frame to that daemon's
+	// connection; the field lets the daemon verify the target defensively.
+	DaemonID string `json:"daemon_id,omitempty"`
 }
 
 type SessionCreatedPayload struct {
@@ -153,10 +168,13 @@ type SessionCreatedPayload struct {
 }
 
 type SessionUpdatePayload struct {
-	SessionID      string `json:"session_id"`
-	DaemonID       string `json:"daemon_id,omitempty"`
-	Agent          string `json:"agent,omitempty"`
-	AgentSessionID string `json:"agent_session_id,omitempty"`
+	SessionID         string `json:"session_id"`
+	DaemonID          string `json:"daemon_id,omitempty"`
+	Agent             string `json:"agent,omitempty"`
+	AgentSessionID    string `json:"agent_session_id,omitempty"`
+	HistoryPath       string `json:"history_path,omitempty"`
+	DisplayName       string `json:"display_name,omitempty"`
+	DisplayNameSource string `json:"display_name_source,omitempty"`
 	// Deprecated compatibility field.
 	ClaudeSessionID string `json:"claude_session_id,omitempty"`
 	State           string `json:"state"`
@@ -176,6 +194,7 @@ type HistoryRequestPayload struct {
 	SessionID string         `json:"session_id"`
 	Cursor    map[string]any `json:"cursor,omitempty"`
 	Since     string         `json:"since,omitempty"`
+	Before    string         `json:"before,omitempty"`
 	Limit     int            `json:"limit"`
 }
 
@@ -190,6 +209,12 @@ type SnapshotPayload struct {
 	SessionID string          `json:"session_id"`
 	Snapshot  json.RawMessage `json:"snapshot,omitempty"`
 	Error     string          `json:"error,omitempty"`
+}
+
+type AttachPayload struct {
+	SessionID string `json:"session_id"`
+	Socket    string `json:"socket,omitempty"`
+	Error     string `json:"error,omitempty"`
 }
 
 type InputPayload struct {

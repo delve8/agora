@@ -63,3 +63,10 @@ func TestAuthenticatorRejectsInvalidToken(t *testing.T) {
 		t.Fatal("expected invalid token error")
 	}
 }
+
+func TestAuthenticatorRequiresBearerToken(t *testing.T) {
+	_, err := NewAuthenticator(ModeLogto, testValidator{}, &testLookup{}, Principal{}).Authenticate(context.Background(), " ")
+	if err == nil || err.Error() != "authentication required" {
+		t.Fatalf("missing bearer token error = %v, want authentication required", err)
+	}
+}

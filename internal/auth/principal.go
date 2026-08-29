@@ -115,6 +115,9 @@ func (a *Authenticator) Authenticate(ctx context.Context, bearer string) (Princi
 	if a.validator == nil || a.lookup == nil {
 		return Principal{}, fmt.Errorf("authentication is not configured")
 	}
+	if strings.TrimSpace(bearer) == "" {
+		return Principal{}, fmt.Errorf("authentication required")
+	}
 	token, err := a.validator.Validate(ctx, bearer)
 	if err != nil {
 		return Principal{}, fmt.Errorf("invalid token: %w", err)

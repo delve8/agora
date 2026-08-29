@@ -13,20 +13,37 @@ import (
 
 	"github.com/delve8/agora/internal/adapter"
 	"github.com/delve8/agora/internal/coordination"
+	"github.com/delve8/agora/internal/protocol"
 	"github.com/delve8/agora/internal/runtime"
 	"github.com/delve8/agora/internal/session"
 	"github.com/delve8/agora/internal/store"
 )
 
-func TestStatePrefersLatestAITitle(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "history.jsonl")
-	content := "{\"type\":\"user\",\"uuid\":\"u1\",\"message\":{\"content\":\"first request\"}}\n" +
-		"{\"type\":\"ai-title\",\"aiTitle\":\"Old title\"}\n" +
-		"{\"type\":\"ai-title\",\"aiTitle\":\"\"}\n" +
-		"{\"type\":\"ai-title\",\"aiTitle\":\"Latest title\"}\n"
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-		t.Fatal(err)
+func seedDaemonLiveSession(srv *Server, daemonID string, summary protocol.SessionSummary) {
+	srv.daemons.mu.Lock()
+	if srv.daemons.devices[daemonID] == nil {
+		srv.daemons.devices[daemonID] = &daemonConnection{id: daemonID}
 	}
+	if srv.daemons.sessions[daemonID] == nil {
+		srv.daemons.sessions[daemonID] = make(map[string]protocol.SessionSummary)
+	}
+	srv.daemons.sessions[daemonID][summary.SessionID] = summary
+	srv.daemons.mu.Unlock()
+}
+
+func seedDaemonHistorySession(srv *Server, daemonID string, summary protocol.HistorySessionSummary) {
+	srv.daemons.mu.Lock()
+	if srv.daemons.devices[daemonID] == nil {
+		srv.daemons.devices[daemonID] = &daemonConnection{id: daemonID}
+	}
+	if srv.daemons.history[daemonID] == nil {
+		srv.daemons.history[daemonID] = make(map[string]protocol.HistorySessionSummary)
+	}
+	srv.daemons.history[daemonID][summary.SessionID] = summary
+	srv.daemons.mu.Unlock()
+}
+
+func TestStateReportsDaemonLiveSessionMetadata(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "agora.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -37,32 +54,41 @@ func TestStatePrefersLatestAITitle(t *testing.T) {
 	if err := db.CreateCoordination(context.Background(), coord); err != nil {
 		t.Fatal(err)
 	}
-	value := session.Session{ID: "sess-1", CoordinationID: coord.ID, Agent: "claude-code", Workspace: t.TempDir(), DisplayName: "New session", State: session.StateWaiting, Source: session.SourceManaged, HistoryPath: path, Capabilities: session.Capabilities{CanReadHistory: true}, CreatedAt: now, UpdatedAt: now}
-	if err := db.CreateSession(context.Background(), value); err != nil {
-		t.Fatal(err)
-	}
-	manager := runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), runtime.NewPTYManager("", ""))
-	srv := New(":0", db, manager)
+	// daemon mode: the local manager owns no PTY, so only connected daemons
+	// contribute sessions.
+	srv := New(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), nil))
+	seedDaemonLiveSession(srv, "daemon-1", protocol.SessionSummary{
+		SessionID: "daemon/daemon-1/claude://claude-1", DaemonID: "daemon-1", Agent: "claude",
+		AgentSessionID: "claude://claude-1", ClaudeSessionID: "claude-1",
+		Workspace: "/tmp/workspace", DisplayName: "Latest title", DisplayNameSource: session.DisplayNameSourceAITitle,
+		State: session.StateWaiting, Connection: session.ConnectionObserved, PID: 42,
+		CreatedAt: now, UpdatedAt: now,
+	})
 	req := httptest.NewRequest(http.MethodGet, "/api/state", nil)
 	resp := httptest.NewRecorder()
 	srv.HTTP.Handler.ServeHTTP(resp, req)
 	if resp.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", resp.Code, resp.Body.String())
 	}
-	stored, err := db.GetSession(context.Background(), value.ID)
-	if err != nil {
+	var state struct {
+		Sessions []session.Session `json:"sessions"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &state); err != nil {
 		t.Fatal(err)
 	}
-	if stored.DisplayName != "Latest title" || stored.DisplayNameSource != session.DisplayNameSourceAITitle {
-		t.Fatalf("unexpected stored name: %+v", stored)
+	if len(state.Sessions) != 1 {
+		t.Fatalf("expected 1 session, got %+v", state.Sessions)
+	}
+	got := state.Sessions[0]
+	if got.DisplayName != "Latest title" || got.DisplayNameSource != session.DisplayNameSourceAITitle || got.Workspace != "/tmp/workspace" {
+		t.Fatalf("metadata not reported: %+v", got)
+	}
+	if got.State != session.StateWaiting || got.ProcessID != 42 || !got.Capabilities.CanStream || !got.Capabilities.CanSendInput {
+		t.Fatalf("live state not reported: %+v", got)
 	}
 }
 
 func TestStatePreservesCustomDisplayName(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "history.jsonl")
-	if err := os.WriteFile(path, []byte("{\"type\":\"ai-title\",\"aiTitle\":\"Generated title\"}\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	db, err := store.Open(filepath.Join(t.TempDir(), "agora.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -73,24 +99,28 @@ func TestStatePreservesCustomDisplayName(t *testing.T) {
 	if err := db.CreateCoordination(context.Background(), coord); err != nil {
 		t.Fatal(err)
 	}
-	value := session.Session{ID: "sess-1", CoordinationID: coord.ID, Agent: "claude-code", Workspace: t.TempDir(), DisplayName: "My custom name", DisplayNameSource: session.DisplayNameSourceCustom, State: session.StateWaiting, Source: session.SourceManaged, HistoryPath: path, Capabilities: session.Capabilities{CanReadHistory: true}, CreatedAt: now, UpdatedAt: now}
-	if err := db.CreateSession(context.Background(), value); err != nil {
-		t.Fatal(err)
-	}
-	manager := runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), runtime.NewPTYManager("", ""))
-	srv := New(":0", db, manager)
+	srv := New(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), nil))
+	seedDaemonLiveSession(srv, "daemon-1", protocol.SessionSummary{
+		SessionID: "daemon/daemon-1/claude://claude-1", DaemonID: "daemon-1", Agent: "claude",
+		AgentSessionID: "claude://claude-1", ClaudeSessionID: "claude-1",
+		Workspace: "/tmp/workspace", DisplayName: "My custom name", DisplayNameSource: session.DisplayNameSourceCustom,
+		State: session.StateWaiting, Connection: session.ConnectionObserved, PID: 42,
+		CreatedAt: now, UpdatedAt: now,
+	})
 	req := httptest.NewRequest(http.MethodGet, "/api/state", nil)
 	resp := httptest.NewRecorder()
 	srv.HTTP.Handler.ServeHTTP(resp, req)
 	if resp.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", resp.Code, resp.Body.String())
 	}
-	stored, err := db.GetSession(context.Background(), value.ID)
-	if err != nil {
+	var state struct {
+		Sessions []session.Session `json:"sessions"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &state); err != nil {
 		t.Fatal(err)
 	}
-	if stored.DisplayName != value.DisplayName || stored.DisplayNameSource != session.DisplayNameSourceCustom {
-		t.Fatalf("custom name changed: %+v", stored)
+	if len(state.Sessions) != 1 || state.Sessions[0].DisplayName != "My custom name" || state.Sessions[0].DisplayNameSource != session.DisplayNameSourceCustom {
+		t.Fatalf("custom name was not preserved: %+v", state.Sessions)
 	}
 }
 
@@ -199,16 +229,7 @@ func TestStateListsEphemeralHistoryWithoutPersisting(t *testing.T) {
 	}
 }
 
-func TestStateDeduplicatesManagedClaudeHistory(t *testing.T) {
-	home := t.TempDir()
-	project := filepath.Join(home, ".claude", "projects", "-tmp-workspace")
-	if err := os.MkdirAll(project, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(project, "claude-1.jsonl")
-	if err := os.WriteFile(path, []byte("{\"type\":\"user\",\"uuid\":\"u1\",\"sessionId\":\"claude-1\",\"cwd\":\"/tmp/workspace\",\"message\":{\"content\":\"hello\"}}\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+func TestStateDeduplicatesDaemonLiveAndHistory(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "agora.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -219,11 +240,20 @@ func TestStateDeduplicatesManagedClaudeHistory(t *testing.T) {
 	if err := db.CreateCoordination(context.Background(), coord); err != nil {
 		t.Fatal(err)
 	}
-	managed := session.Session{ID: "managed-1", CoordinationID: coord.ID, ClaudeSessionID: "claude-1", Agent: "claude-code", Workspace: "/tmp/workspace", DisplayName: "Managed", DisplayNameSource: session.DisplayNameSourceCustom, State: session.StateWaiting, Source: session.SourceManaged, HistoryPath: path, CreatedAt: now, UpdatedAt: now}
-	if err := db.CreateSession(context.Background(), managed); err != nil {
-		t.Fatal(err)
-	}
-	srv := New(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), runtime.NewPTYManager("", home)))
+	srv := New(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), nil))
+	seedDaemonLiveSession(srv, "daemon-1", protocol.SessionSummary{
+		SessionID: "daemon/daemon-1/claude://claude-1", DaemonID: "daemon-1", Agent: "claude",
+		AgentSessionID: "claude://claude-1", ClaudeSessionID: "claude-1",
+		Workspace: "/tmp/workspace", DisplayName: "Managed", DisplayNameSource: session.DisplayNameSourceCustom,
+		State: session.StateWaiting, Connection: session.ConnectionObserved, PID: 42,
+		CreatedAt: now, UpdatedAt: now,
+	})
+	seedDaemonHistorySession(srv, "daemon-1", protocol.HistorySessionSummary{
+		SessionID: "daemon/daemon-1/claude://claude-1", DaemonID: "daemon-1", Agent: "claude",
+		AgentSessionID: "claude://claude-1", ClaudeSessionID: "claude-1",
+		Workspace: "/tmp/workspace", DisplayName: "History name", DisplayNameSource: session.DisplayNameSourceAITitle,
+		CreatedAt: now, UpdatedAt: now,
+	})
 	req := httptest.NewRequest(http.MethodGet, "/api/state", nil)
 	resp := httptest.NewRecorder()
 	srv.HTTP.Handler.ServeHTTP(resp, req)
@@ -233,25 +263,15 @@ func TestStateDeduplicatesManagedClaudeHistory(t *testing.T) {
 	if err := json.Unmarshal(resp.Body.Bytes(), &state); err != nil {
 		t.Fatal(err)
 	}
-	if len(state.Sessions) != 1 || state.Sessions[0].ID != managed.ID {
-		t.Fatalf("managed history was duplicated: %+v", state.Sessions)
+	if len(state.Sessions) != 1 || state.Sessions[0].ID != "daemon/daemon-1/claude://claude-1" {
+		t.Fatalf("live and history were duplicated: %+v", state.Sessions)
+	}
+	if state.Sessions[0].DisplayName != "Managed" {
+		t.Fatalf("live metadata was clobbered by history: %+v", state.Sessions[0])
 	}
 }
 
-func TestStateReturnsStoppedManagedSessionAsResumable(t *testing.T) {
-	home := t.TempDir()
-	workspace := filepath.Join(home, "workspace")
-	project := filepath.Join(home, ".claude", "projects", "-workspace")
-	if err := os.MkdirAll(project, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(workspace, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(project, "claude-1.jsonl")
-	if err := os.WriteFile(path, []byte("{\"type\":\"user\",\"uuid\":\"u1\",\"sessionId\":\"claude-1\",\"cwd\":\""+workspace+"\",\"message\":{\"content\":\"hello\"}}\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+func TestStateReturnsStoppedDaemonSessionAsResumable(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "agora.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -262,11 +282,14 @@ func TestStateReturnsStoppedManagedSessionAsResumable(t *testing.T) {
 	if err := db.CreateCoordination(context.Background(), coord); err != nil {
 		t.Fatal(err)
 	}
-	managed := session.Session{ID: "managed-1", CoordinationID: coord.ID, ClaudeSessionID: "claude-1", Agent: "claude-code", Workspace: workspace, DisplayName: "Custom", DisplayNameSource: session.DisplayNameSourceCustom, State: session.StateRunning, Source: session.SourceManaged, ProcessID: 999999, HistoryPath: path, Capabilities: session.Capabilities{CanSendInput: true, CanStream: true, CanReadTerminal: true}, CreatedAt: now, UpdatedAt: now}
-	if err := db.CreateSession(context.Background(), managed); err != nil {
-		t.Fatal(err)
-	}
-	srv := New(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), runtime.NewPTYManager("", home)))
+	srv := New(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), nil))
+	seedDaemonLiveSession(srv, "daemon-1", protocol.SessionSummary{
+		SessionID: "daemon/daemon-1/claude://claude-1", DaemonID: "daemon-1", Agent: "claude",
+		AgentSessionID: "claude://claude-1", ClaudeSessionID: "claude-1",
+		Workspace: "/tmp/workspace", DisplayName: "Custom", DisplayNameSource: session.DisplayNameSourceCustom,
+		State: session.StateStopped, Connection: session.ConnectionUnavailable, PID: 0,
+		CreatedAt: now, UpdatedAt: now,
+	})
 	req := httptest.NewRequest(http.MethodGet, "/api/state", nil)
 	resp := httptest.NewRecorder()
 	srv.HTTP.Handler.ServeHTTP(resp, req)
@@ -276,16 +299,16 @@ func TestStateReturnsStoppedManagedSessionAsResumable(t *testing.T) {
 	if err := json.Unmarshal(resp.Body.Bytes(), &state); err != nil {
 		t.Fatal(err)
 	}
-	if len(state.Sessions) != 1 || state.Sessions[0].ID != managed.ID || state.Sessions[0].DisplayName != "Custom" {
-		t.Fatalf("unexpected stopped managed session: %+v", state.Sessions)
+	if len(state.Sessions) != 1 {
+		t.Fatalf("unexpected sessions: %+v", state.Sessions)
 	}
 	value := state.Sessions[0]
-	if value.State != session.StateStopped || value.ProcessID != 0 || !value.Capabilities.CanResume || value.Capabilities.CanStream || value.Capabilities.CanSendInput || value.Capabilities.CanReadTerminal {
-		t.Fatalf("stale managed session has live capabilities: %+v", value)
+	if value.State != session.StateStopped || value.ProcessID != 0 || !value.Capabilities.CanResume || value.Capabilities.CanStream || value.Capabilities.CanSendInput {
+		t.Fatalf("stale daemon session has live capabilities: %+v", value)
 	}
 }
 
-func TestStateReturnsExitedExternalSessionAsResumable(t *testing.T) {
+func TestStateReturnsExitedProxySessionAsResumable(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "agora.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -297,11 +320,9 @@ func TestStateReturnsExitedExternalSessionAsResumable(t *testing.T) {
 		t.Fatal(err)
 	}
 	workspace := t.TempDir()
-	value := session.Session{ID: "external-1", CoordinationID: coord.ID, ClaudeSessionID: "claude-1", Agent: "claude-code", Workspace: workspace, DisplayName: "External", State: session.StateRunning, Source: session.SourceExternal, ProcessID: 999999, Capabilities: session.Capabilities{CanObserve: true, CanStream: true}, CreatedAt: now, UpdatedAt: now}
-	if err := db.CreateSession(context.Background(), value); err != nil {
-		t.Fatal(err)
-	}
-	srv := New(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), runtime.NewPTYManager("", t.TempDir())))
+	value := session.Session{ID: "proxy-1", CoordinationID: coord.ID, ClaudeSessionID: "claude-1", Agent: "claude-code", Workspace: workspace, DisplayName: "Proxy", State: session.StateRunning, Source: session.SourceProxy, ProcessID: 999999, Capabilities: session.Capabilities{CanObserve: true, CanStream: true}, CreatedAt: now, UpdatedAt: now}
+	srv := New(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), nil))
+	srv.setProxySession(value)
 	req := httptest.NewRequest(http.MethodGet, "/api/state", nil)
 	resp := httptest.NewRecorder()
 	srv.HTTP.Handler.ServeHTTP(resp, req)
@@ -316,7 +337,7 @@ func TestStateReturnsExitedExternalSessionAsResumable(t *testing.T) {
 	}
 	got := state.Sessions[0]
 	if got.State != session.StateStopped || got.ProcessID != 0 || got.Capabilities.CanStream || !got.Capabilities.CanResume {
-		t.Fatalf("exited external session still appears live: %+v", got)
+		t.Fatalf("exited proxy session still appears live: %+v", got)
 	}
 }
 

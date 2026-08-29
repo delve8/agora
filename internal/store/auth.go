@@ -152,6 +152,35 @@ func (s *Store) RevokeDevice(ctx context.Context, deviceID string, at time.Time)
 	return err
 }
 
+// UpdateDeviceName sets the user-facing alias for a device. Names are display
+// labels only (never used as the daemon identity), so they are not validated
+// here beyond being stored.
+func (s *Store) UpdateDeviceName(ctx context.Context, deviceID, name string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE devices SET name=? WHERE device_id=?`, name, deviceID)
+	return err
+}
+
+// IsDeviceRevoked reports whether a known device has been revoked. Unknown
+// device IDs return false so trust-local mode can still accept unpaired daemon
+// identities, which have no device row to revoke.
+func (s *Store) IsDeviceRevoked(ctx context.Context, deviceID string) (bool, error) {
+	var revoked string
+	err := s.db.QueryRowContext(ctx, `SELECT revoked_at FROM devices WHERE device_id=?`, deviceID).Scan(&revoked)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return strings.TrimSpace(revoked) != "", err
+}
+
+func (s *Store) UserHasDevice(ctx context.Context, userID, daemonID string) (bool, error) {
+	var exists int
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM devices WHERE user_id=? AND device_id=?`, userID, daemonID).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil && exists == 1, err
+}
+
 func (s *Store) UserOwnsDaemon(ctx context.Context, userID, daemonID string) (bool, error) {
 	var exists int
 	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM devices WHERE user_id=? AND device_id=? AND (revoked_at IS NULL OR revoked_at='')`, userID, daemonID).Scan(&exists)

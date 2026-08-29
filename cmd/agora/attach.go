@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,7 +44,11 @@ func createWrapperSession() (string, error) {
 		base = "New session"
 	}
 	apiBase := agoraAPIBase()
-	stateResp, err := http.Get(apiBase + "/api/state")
+	stateRequest, err := agoraRequest(http.MethodGet, apiBase+"/api/state", nil)
+	if err != nil {
+		return "", fmt.Errorf("create Agora state request: %w", err)
+	}
+	stateResp, err := http.DefaultClient.Do(stateRequest)
 	if err != nil {
 		return "", fmt.Errorf("connect to Agora: %w", err)
 	}
@@ -67,7 +72,12 @@ func createWrapperSession() (string, error) {
 		"display_name": base,
 		"role":         "terminal",
 	})
-	resp, err := http.Post(apiBase+"/api/coordinations/"+state.Coordination.ID+"/sessions", "application/json", strings.NewReader(string(body)))
+	request, err := agoraRequest(http.MethodPost, apiBase+"/api/coordinations/"+url.PathEscape(state.Coordination.ID)+"/sessions", strings.NewReader(string(body)))
+	if err != nil {
+		return "", fmt.Errorf("create Agora session request: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(request)
 	if err != nil {
 		return "", fmt.Errorf("create Agora session: %w", err)
 	}
@@ -131,7 +141,11 @@ func runAttach(id string) error {
 }
 
 func attachSocket(sessionID string) (string, error) {
-	resp, err := http.Get(agoraAPIBase() + "/api/sessions/" + sessionID + "/attach")
+	request, err := agoraRequest(http.MethodGet, agoraAPIBase()+"/api/sessions/"+url.PathEscape(sessionID)+"/attach", nil)
+	if err != nil {
+		return "", fmt.Errorf("create attach request: %w", err)
+	}
+	resp, err := http.DefaultClient.Do(request)
 	if err != nil {
 		return "", fmt.Errorf("query Agora for attach address: %w", err)
 	}
@@ -149,4 +163,27 @@ func attachSocket(sessionID string) (string, error) {
 		return "", fmt.Errorf("session %s has no attach socket (is it running?)", sessionID)
 	}
 	return body.Socket, nil
+}
+
+// agoraRequest adds the optional CLI bearer token. Local mode does not need
+// it; Logto deployments can use AGORA_ACCESS_TOKEN (or AGORA_TOKEN) when a
+// terminal wrapper needs to call the protected API.
+func agoraRequest(method, endpoint string, body io.Reader) (*http.Request, error) {
+	request, err := http.NewRequest(method, endpoint, body)
+	if err != nil {
+		return nil, err
+	}
+	if token := strings.TrimSpace(firstNonEmptyEnv("AGORA_ACCESS_TOKEN", "AGORA_TOKEN")); token != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
+	return request, nil
+}
+
+func firstNonEmptyEnv(names ...string) string {
+	for _, name := range names {
+		if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+			return value
+		}
+	}
+	return ""
 }

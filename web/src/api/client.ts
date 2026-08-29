@@ -1,9 +1,17 @@
-import type { Coordination, Event, Message, PTYSnapshot, Session } from "../types";
+import type { Coordination, Device, Event, Message, PTYSnapshot, Session } from "../types";
 
 let accessToken: (() => Promise<string | undefined>) | undefined;
-export function setAccessTokenProvider(provider: (() => Promise<string | undefined>) | undefined) { accessToken = provider; }
+let invalidateAccessToken: (() => Promise<void>) | undefined;
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+export function setAccessTokenProvider(
+  provider: (() => Promise<string | undefined>) | undefined,
+  invalidate?: (() => Promise<void>) | undefined,
+) {
+  accessToken = provider;
+  invalidateAccessToken = invalidate;
+}
+
+async function request<T>(path: string, init?: RequestInit, retry = false): Promise<T> {
   const token = accessToken ? await accessToken() : undefined;
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
@@ -13,6 +21,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let body: T & { error?: string };
   try { body = JSON.parse(text) as T & { error?: string }; }
   catch { throw new Error(response.ok ? "Server returned invalid JSON" : `request failed: ${response.status}`); }
+  // A stale Logto access token can survive a refresh in the browser SDK. API
+  // requests are safe to retry once because authentication is checked before
+  // the handler is entered. The invalidation callback obtains a fresh token
+  // for the configured Agora resource before the retry.
+  if (response.status === 401 && !retry && invalidateAccessToken) {
+    await invalidateAccessToken();
+    return request<T>(path, init, true);
+  }
   if (!response.ok) throw new Error(body.error || `request failed: ${response.status}`);
   return body as T;
 }
@@ -22,8 +38,20 @@ export type PrincipalResponse = { principal: { user_id: string; display_name?: s
 
 export function loadMe() { return request<PrincipalResponse>("/api/me"); }
 export function loadState() { return request<StateResponse>("/api/state"); }
-export function createSession(coordinationId: string, input: { workspace: string; display_name: string; role: string }) { return request<Session>(`/api/coordinations/${coordinationId}/sessions`, { method: "POST", body: JSON.stringify(input) }); }
-export function loadEvents(sessionId: string) { return request<Event[]>(`/api/sessions/${encodeURIComponent(sessionId)}/events`); }
+export type PairCodeResponse = { code: string; expires_at: string };
+export function createPairCode() { return request<PairCodeResponse>("/api/devices/pair-codes", { method: "POST" }); }
+export function listDevices() { return request<Device[]>("/api/devices"); }
+export function renameDevice(deviceId: string, name: string) { return request<{ renamed: boolean }>(`/api/devices/${encodeURIComponent(deviceId)}/name`, { method: "POST", body: JSON.stringify({ name }) }); }
+export function revokeDevice(deviceId: string) { return request<{ revoked: boolean }>(`/api/devices/${encodeURIComponent(deviceId)}/revoke`, { method: "POST" }); }
+export type CreateSessionInput = { workspace: string; display_name: string; role: string; agent: string; daemon_id?: string };
+export function createSession(coordinationId: string, input: CreateSessionInput) { return request<Session>(`/api/coordinations/${coordinationId}/sessions`, { method: "POST", body: JSON.stringify(input) }); }
+export function loadEvents(sessionId: string, options?: { limit?: number; before?: string }) {
+  const query = new URLSearchParams();
+  if (options?.limit) query.set("limit", String(options.limit));
+  if (options?.before) query.set("before", options.before);
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  return request<Event[]>(`/api/sessions/${encodeURIComponent(sessionId)}/events${suffix}`);
+}
 export function resumeSession(sessionId: string) { return request<Session>(`/api/sessions/${encodeURIComponent(sessionId)}/resume`, { method: "POST" }); }
 export function stopSession(sessionId: string) { return request<{ accepted: boolean }>(`/api/sessions/${encodeURIComponent(sessionId)}/stop`, { method: "POST" }); }
 export function loadPTYSnapshot(sessionId: string, signal?: AbortSignal) { return request<PTYSnapshot>(`/api/sessions/${encodeURIComponent(sessionId)}/pty/snapshot`, { signal }); }

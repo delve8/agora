@@ -82,6 +82,18 @@ To attach to an existing managed session:
 ./agora attach sess-<session-id>
 ```
 
+Pi uses the same native terminal attach path, but has its own wrapper so a
+Pi session is started as an interactive TUI rather than RPC:
+
+```bash
+./agora pi-wrapper
+./agora pi-wrapper daemon/<daemon-id>/pi://<pi-session-id>
+```
+
+For a Logto-protected Server, set `AGORA_ACCESS_TOKEN` (or `AGORA_TOKEN`) for
+CLI API requests. The Pi process itself runs on the Daemon machine under a
+real PTY with `pi --session <history-file>` when resuming an existing session.
+
 ### 4. Use Web and terminal together
 
 - Type normally in the wrapper terminal to use native Claude Code.

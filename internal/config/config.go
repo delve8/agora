@@ -41,6 +41,20 @@ func ResolveDaemonID(override, path string) (string, error) {
 	return id, nil
 }
 
+// SaveDaemonID atomically persists an explicit daemon identity (e.g. the
+// device_id returned by pairing) so later runs resolve the same id without
+// an override. It replaces any previously stored UUID identity.
+func SaveDaemonID(path, id string) error {
+	id = strings.TrimSpace(id)
+	if err := validateDaemonID(id); err != nil {
+		return err
+	}
+	if path == "" {
+		path = defaultPath()
+	}
+	return save(path, File{DaemonID: id})
+}
+
 func DeviceCredentialPath(override string) string {
 	if value := strings.TrimSpace(override); value != "" {
 		return value

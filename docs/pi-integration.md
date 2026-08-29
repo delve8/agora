@@ -1,8 +1,8 @@
 # Pi Integration
 
-> 状态：Design / 实测基线
+> 状态：已实现 PTY/TUI 托管（Web snapshot + native attach）
 >
-> 本文记录本机 Pi coding agent 的接口探测结果和 Agora 对接方案。它描述的是 provider-specific 适配，不代表当前代码已经支持 Pi。
+> 本文记录本机 Pi coding agent 的接口探测结果和 Agora 对接方案。Pi 的 Web/RPC 设计已经替换为 Agora Daemon 真实 PTY 托管；JSONL history 仍是 Web 消息的权威来源。
 >
 > 实测版本：Pi `0.84.2`，npm 包 `@earendil-works/pi-coding-agent`。Pi 版本升级后必须重新检查 CLI help、RPC 文档和事件 fixture；不要把某一版本的事件字段当成永久稳定 API。
 
@@ -12,10 +12,11 @@ Pi 是 Agora 首个非 Claude Agent 的推荐接入对象。它不应被套进 C
 
 ```text
 Pi managed process
-  ├── control:   --mode rpc（双向 stdin/stdout JSONL）
-  ├── live obs:  --mode json 或 RPC 异步 events
-  ├── history:   本地追加式 session JSONL
-  └── terminal:  默认无 PTY/TUI attach
+  ├── control/input: Agora-owned PTY（普通 Pi TUI）
+  ├── live screen: VT emulator -> Web /pty/snapshot
+  ├── native attach: Unix socket -> agora attach / pi-wrapper
+  ├── history: 本地追加式 session JSONL -> Web/SSE
+  └── lifecycle: Pi TUI 与 RPC 模式互斥
 ```
 
 Pi 和 Agora 现有设计的匹配点：
@@ -33,8 +34,13 @@ Pi 和 Agora 现有设计的匹配点：
 Agora 启动 Pi 时必须显式指定 provider 和 model，不依赖用户当前默认值：
 
 ```text
-pi --provider anthropic --model <provider-model> --mode rpc ...
+pi --provider anthropic --model <provider-model> ...
 ```
+
+Agora uses the normal interactive Pi TUI under a real PTY. A new managed
+session uses `--session-id <uuid>`; a resumed session uses the exact history
+file path with `--session <history-file>`. Agora does not use `--mode rpc` for
+managed Pi sessions.
 
 非交互观察或一次性运行可以使用：
 
@@ -319,7 +325,7 @@ Agora 的 `Session.State` 应由 runtime 状态机综合这些信号，不能在
 | `CanResume` | true | `--resume`/`--session-id`/session locator |
 | `CanApprove` | false | `--approve` 是启动级信任，不是结构化审批 |
 | `CanReadHistory` | true | 追加式 JSONL |
-| `CanReadTerminal` | false | 不启动 PTY，不提供屏幕 snapshot |
+| `CanReadTerminal` | true（运行中） | Pi PTY 的 VT emulator 提供只读屏幕 snapshot；停止会话不可读取 |
 
 能力必须随着 Pi 版本、启动模式和配置重新计算。例如 `--no-session` 会关闭 history/resume；若只连接 `--mode json` 而不保留进程控制，则 `CanSendInput`/`CanInterrupt` 不应宣称为 true。
 

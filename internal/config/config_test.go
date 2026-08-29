@@ -62,3 +62,54 @@ func TestResolveDaemonIDRejectsInvalidConfig(t *testing.T) {
 		t.Fatal("expected invalid override error")
 	}
 }
+
+func TestSaveDaemonIDPersistsIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := SaveDaemonID(path, "device-abc123"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ResolveDaemonID("", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "device-abc123" {
+		t.Fatalf("resolved id = %q, want device-abc123", got)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("config permissions = %o, want 600", info.Mode().Perm())
+	}
+}
+
+func TestSaveDaemonIDReplacesUUID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	stored, err := ResolveDaemonID("", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveDaemonID(path, "device-xyz"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ResolveDaemonID("", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == stored {
+		t.Fatalf("SaveDaemonID did not replace the stored UUID %q", stored)
+	}
+	if got != "device-xyz" {
+		t.Fatalf("resolved id = %q, want device-xyz", got)
+	}
+}
+
+func TestSaveDaemonIDRejectsInvalid(t *testing.T) {
+	if err := SaveDaemonID(filepath.Join(t.TempDir(), "config.json"), "bad/id"); err == nil {
+		t.Fatal("expected invalid id error")
+	}
+	if err := SaveDaemonID(filepath.Join(t.TempDir(), "config.json"), ""); err == nil {
+		t.Fatal("expected empty id error")
+	}
+}

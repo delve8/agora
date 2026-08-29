@@ -1,7 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import { createSession, loadEvents, loadState, resumeSession, sendMessage, stopSession, subscribe } from "../api/client";
+import type { CreateSessionInput } from "../api/client";
 import type { Coordination, Event, Session } from "../types";
 import { derivedSessionName } from "../sessionName";
+
+const INITIAL_EVENT_COUNT = 60;
+const OLDER_EVENT_PAGE_SIZE = 50;
 
 function linkedSessionFromLocation() {
   if (typeof window === "undefined") return "";
@@ -14,6 +18,8 @@ export function useCoordination() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState("");
   const [events, setEvents] = useState<Event[]>([]);
+  const [hasOlderEvents, setHasOlderEvents] = useState(false);
+  const [loadingOlderEvents, setLoadingOlderEvents] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
@@ -52,18 +58,43 @@ export function useCoordination() {
     const selected = sessions.find((session) => session.id === selectedSessionId);
     if (!selected) { setEvents([]); return; }
     setEvents([]);
+    setHasOlderEvents(false);
+    setLoadingOlderEvents(false);
     let cancelled = false;
-    if (canReadHistory) {
-      void loadEvents(selectedSessionId).then((value) => {
+    let firstLoad = true;
+    let historyLoaded = false;
+    const loadCurrentEvents = (showError: boolean) => {
+      if (!canReadHistory) return;
+      void loadEvents(selectedSessionId, { limit: INITIAL_EVENT_COUNT }).then((value) => {
         if (cancelled) return;
         setEvents((current) => {
-          const byId = new Map(value.map((item) => [item.id, item]));
-          for (const item of current) byId.set(item.id, item);
+          const byId = new Map(current.map((item) => [item.id, item]));
+          for (const item of value) byId.set(item.id, item);
           return [...byId.values()].sort((a, b) => a.created_at.localeCompare(b.created_at));
         });
+        if (firstLoad) {
+          setHasOlderEvents(value.length >= INITIAL_EVENT_COUNT);
+          firstLoad = false;
+          historyLoaded = true;
+        }
         applyDerivedName(selectedSessionId, value);
-      }).catch((value) => { if (!cancelled) setError(value instanceof Error ? value.message : "Unable to load events"); });
-    }
+        if (showError) setError("");
+      }).catch((value) => {
+        if (showError && !cancelled) setError(value instanceof Error ? value.message : "Unable to load events");
+      });
+    };
+    loadCurrentEvents(true);
+    // The Pi RPC stream is best-effort, while its JSONL history is the
+    // authoritative transcript. Poll Pi history so messages written by an
+    // external Pi process (or emitted during an observer startup race) appear
+    // without requiring a manual session switch or page refresh.
+    // Retry the first history request for every provider. During a server or
+    // daemon restart the session list may become available before the session
+    // route/history authorization does; a transient 403/502 must not leave the
+    // conversation permanently empty after the error disappears.
+    const historyTimer = canReadHistory ? window.setInterval(() => {
+      if (!historyLoaded || selected.agent === "pi") loadCurrentEvents(false);
+    }, 2000) : undefined;
     const unsubscribe = canStream ? subscribe(selectedSessionId, (value) => {
       setEvents((current) => {
         if (current.some((item) => item.id === value.id)) return current;
@@ -72,10 +103,30 @@ export function useCoordination() {
         return next;
       });
     }, () => { if (!cancelled) setError("Event stream disconnected; retrying on refresh"); }) : () => {};
-    return () => { cancelled = true; unsubscribe(); };
+    return () => { cancelled = true; if (historyTimer !== undefined) window.clearInterval(historyTimer); unsubscribe(); };
   }, [selectedSessionId, canReadHistory, canStream, applyDerivedName]);
 
-  const addSession = useCallback(async (input: { workspace: string; display_name: string; role: string }) => {
+  const loadOlderEvents = useCallback(async () => {
+    if (!selectedSessionId || !canReadHistory || !hasOlderEvents || loadingOlderEvents || events.length === 0) return;
+    const oldest = events[0];
+    setLoadingOlderEvents(true);
+    try {
+      const value = await loadEvents(selectedSessionId, { limit: OLDER_EVENT_PAGE_SIZE, before: oldest.id });
+      setEvents((current) => {
+        const byId = new Map(value.map((item) => [item.id, item]));
+        for (const item of current) byId.set(item.id, item);
+        return [...byId.values()].sort((a, b) => a.created_at.localeCompare(b.created_at));
+      });
+      setHasOlderEvents(value.length >= OLDER_EVENT_PAGE_SIZE);
+      applyDerivedName(selectedSessionId, value);
+    } catch (value) {
+      setError(value instanceof Error ? value.message : "Unable to load older events");
+    } finally {
+      setLoadingOlderEvents(false);
+    }
+  }, [applyDerivedName, canReadHistory, events, hasOlderEvents, loadingOlderEvents, selectedSessionId]);
+
+  const addSession = useCallback(async (input: CreateSessionInput) => {
     if (!coordination) throw new Error("coordination is not ready");
     try {
       const session = await createSession(coordination.id, input);
@@ -118,5 +169,5 @@ export function useCoordination() {
 
   const send = useCallback(async (sessionId: string, content: string) => sendMessage(sessionId, content), []);
 
-  return { coordination, sessions, currentSession, selectedSessionId, setSelectedSessionId, events, loading, error, setError, addSession, resume, stop, send, refresh };
+  return { coordination, sessions, currentSession, selectedSessionId, setSelectedSessionId, events, hasOlderEvents, loadingOlderEvents, loadOlderEvents, loading, error, setError, addSession, resume, stop, send, refresh };
 }

@@ -1,5 +1,6 @@
-import { Card, Descriptions, Empty, Tag, Typography } from "antd";
+import { Card, Descriptions, Empty, Space, Tag, Typography } from "antd";
 import type { Session } from "../types";
+import { AgentBadge } from "./AgentBadge";
 
 const { Text, Title } = Typography;
 
@@ -8,7 +9,7 @@ export function MemberPanel({ session, selected, onSelect }: { session?: Session
   return <Card className={`member-card ${selected ? "member-selected" : ""}`} onClick={onSelect} hoverable>
     <Text type="secondary">MANAGED MEMBER</Text>
     <Title level={3}>{session.display_name}</Title>
-    <Tag color={session.state === "running" ? "success" : session.state === "failed" ? "error" : "default"}>{session.connection || session.state}</Tag>
+    <Space size={6} wrap><AgentBadge agent={session.agent} /><Tag color={session.state === "running" ? "success" : session.state === "failed" ? "error" : "default"}>{session.connection || session.state}</Tag></Space>
     <Descriptions className="member-details" column={1} size="small" colon={false}>
       <Descriptions.Item label="Agent">{session.agent}</Descriptions.Item>
       <Descriptions.Item label="Role">{session.role || "unassigned"}</Descriptions.Item>

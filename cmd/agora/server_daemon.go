@@ -13,7 +13,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/delve8/agora/internal/adapter"
 	"github.com/delve8/agora/internal/config"
 	"github.com/delve8/agora/internal/daemon"
 	"github.com/delve8/agora/internal/runtime"
@@ -27,7 +26,10 @@ func runServer() error {
 		return err
 	}
 	defer database.Close()
-	manager := runtime.NewManager(database, adapter.NewClaudeCodeAdapter(os.Getenv("AGORA_CLAUDE_BINARY")), nil)
+	// The remote server does not own Agent processes. Claude and Pi run in
+	// connected daemons, so keep the manager nil-capable here and let the
+	// daemon hub route history, input, resume, and live events to the owner.
+	manager := (*runtime.Manager)(nil)
 	addr := firstEnv("AGORA_SERVER_ADDR", "AGORA_ADDR")
 	if addr == "" {
 		addr = "127.0.0.1:8080"
@@ -40,38 +42,34 @@ func runServer() error {
 		return err
 	}
 	srv := server.NewWithWebDirAndAuth(addr, database, manager, os.Getenv("AGORA_WEB_DIR"), authConfig)
-	return runHTTPServer(srv, manager.Close)
+	// The split server deliberately has no local runtime manager. Keep the
+	// shutdown callback nil-safe; a SIGTERM must not turn into a panic while
+	// the server is already shutting down.
+	cleanup := func() {}
+	if manager != nil {
+		cleanup = manager.Close
+	}
+	return runHTTPServer(srv, cleanup)
 }
 
 func runDaemon(pairCode string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	daemonID, err := config.ResolveDaemonID(os.Getenv("AGORA_DAEMON_ID"), os.Getenv("AGORA_CONFIG_PATH"))
+	daemonID, credential, err := resolveDaemonIdentity(pairCode, os.Getenv("AGORA_CONFIG_PATH"), os.Getenv("AGORA_DEVICE_CREDENTIAL_PATH"))
 	if err != nil {
 		return err
-	}
-	credential := strings.TrimSpace(os.Getenv("AGORA_DEVICE_CREDENTIAL"))
-	credentialPath := os.Getenv("AGORA_DEVICE_CREDENTIAL_PATH")
-	if credential == "" {
-		credential, _ = config.LoadDeviceCredential(credentialPath)
-	}
-	if strings.TrimSpace(pairCode) != "" {
-		var err error
-		credential, err = pairDevice(firstEnv("AGORA_SERVER_URL", "http://127.0.0.1:8080"), pairCode, os.Getenv("AGORA_DEVICE_NAME"))
-		if err != nil {
-			return err
-		}
-		if err := config.SaveDeviceCredential(credentialPath, credential); err != nil {
-			return err
-		}
 	}
 	d, err := daemon.New(daemon.Config{
 		ID:             daemonID,
 		Version:        firstEnv("AGORA_VERSION", "dev"),
 		ServerURL:      daemonWSURL(firstEnv("AGORA_SERVER_URL", "http://127.0.0.1:8080")),
 		Credential:     credential,
-		CredentialPath: credentialPath,
+		CredentialPath: os.Getenv("AGORA_DEVICE_CREDENTIAL_PATH"),
 		ClaudeBinary:   os.Getenv("AGORA_CLAUDE_BINARY"),
+		PiBinary:       firstEnv("AGORA_PI_BINARY", "PI_BINARY"),
+		PiProvider:     firstEnv("AGORA_PI_PROVIDER", "PI_PROVIDER"),
+		PiModel:        firstEnv("AGORA_PI_MODEL", "PI_MODEL"),
+		PiSessionDir:   firstEnv("AGORA_PI_SESSION_DIR", "PI_SESSION_DIR"),
 		HomeDir:        os.Getenv("HOME"),
 	})
 	if err != nil {
@@ -81,36 +79,84 @@ func runDaemon(pairCode string) error {
 	return d.Run(ctx)
 }
 
-func pairDevice(serverURL, code, name string) (string, error) {
+// resolveDaemonIdentity decides the daemon's identity and credential.
+//
+// A pairing code binds the daemon to the device the server creates: the
+// returned device_id becomes the daemon id (persisted to the config file so
+// later runs without --pair reuse it) and the returned credential
+// authenticates it. That keeps daemon.register's daemon_id equal to the
+// credential-owned device_id, which the server enforces in logto mode.
+func resolveDaemonIdentity(pairCode, configPath, credentialPath string) (string, string, error) {
+	if strings.TrimSpace(pairCode) != "" {
+		if override := strings.TrimSpace(os.Getenv("AGORA_DAEMON_ID")); override != "" {
+			return "", "", fmt.Errorf("AGORA_DAEMON_ID cannot be combined with --pair: pairing binds the daemon to a server-issued device_id")
+		}
+		// Default the device alias to the hostname so paired devices are
+		// distinguishable in the web device list without requiring the user to
+		// set AGORA_DEVICE_NAME.
+		deviceName := strings.TrimSpace(os.Getenv("AGORA_DEVICE_NAME"))
+		if deviceName == "" {
+			if hostname, hostErr := os.Hostname(); hostErr == nil {
+				deviceName = strings.TrimSpace(hostname)
+			}
+		}
+		deviceID, credential, err := pairDevice(firstEnv("AGORA_SERVER_URL", "http://127.0.0.1:8080"), pairCode, deviceName)
+		if err != nil {
+			return "", "", err
+		}
+		if err := config.SaveDeviceCredential(credentialPath, credential); err != nil {
+			return "", "", err
+		}
+		if err := config.SaveDaemonID(configPath, deviceID); err != nil {
+			return "", "", err
+		}
+		return deviceID, credential, nil
+	}
+	daemonID, err := config.ResolveDaemonID(os.Getenv("AGORA_DAEMON_ID"), configPath)
+	if err != nil {
+		return "", "", err
+	}
+	credential := strings.TrimSpace(os.Getenv("AGORA_DEVICE_CREDENTIAL"))
+	if credential == "" {
+		credential, _ = config.LoadDeviceCredential(credentialPath)
+	}
+	return daemonID, credential, nil
+}
+
+func pairDevice(serverURL, code, name string) (deviceID, credential string, err error) {
 	endpoint := strings.TrimRight(serverURL, "/") + "/api/daemon/pair"
 	body := strings.NewReader(fmt.Sprintf(`{"code":%q,"name":%q}`, code, name))
 	request, err := http.NewRequest(http.MethodPost, endpoint, body)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	request.Header.Set("Content-Type", "application/json")
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer response.Body.Close()
 	var result struct {
+		DeviceID   string `json:"device_id"`
 		Credential string `json:"credential"`
 		Error      string `json:"error"`
 	}
 	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
-		return "", err
+		return "", "", err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		if result.Error != "" {
-			return "", errors.New(result.Error)
+			return "", "", errors.New(result.Error)
 		}
-		return "", fmt.Errorf("pairing failed with status %s", response.Status)
+		return "", "", fmt.Errorf("pairing failed with status %s", response.Status)
 	}
 	if result.Credential == "" {
-		return "", errors.New("pairing response did not include credential")
+		return "", "", errors.New("pairing response did not include credential")
 	}
-	return result.Credential, nil
+	if result.DeviceID == "" {
+		return "", "", errors.New("pairing response did not include device_id")
+	}
+	return result.DeviceID, result.Credential, nil
 }
 func runHTTPServer(srv *server.Server, cleanup func()) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
