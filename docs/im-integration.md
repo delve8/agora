@@ -1,8 +1,8 @@
 # Agora IM 集成规范
 
-> 状态：Draft / notification-entry design
+> 状态：Implemented / outbound webhook notifications
 >
-> 本文定义 IM 在 Agora 中的第一阶段定位和边界。它描述产品行为与安全约束，不代表已经实现了任何具体 IM SDK、Webhook、认证服务或远程访问网关。
+> 本文定义 IM 在 Agora 中的第一阶段定位和边界。当前已实现 Server 侧出站 Webhook、用户级多目标配置和高价值 Session 状态通知；具体 IM 的长连接、入站消息和双向控制仍不在范围内。
 
 ## 1. 目标与核心决策
 
@@ -35,7 +35,7 @@ Agora Web          = 完整历史、事件流、PTY screen snapshot 和普通 Se
 - capability link 不能调用输入、resume、stop、attach、设备管理或审批接口；
 - 通知失败、重复和暂时不可达时，不破坏 Session、历史事件或 Web UI。
 
-第一阶段可以先实现 generic webhook，再接入一个真实 IM provider。provider-specific 的卡片、按钮和富文本格式属于 adapter 层，不应进入核心 Session 模型。
+当前实现支持 generic webhook、飞书、钉钉和企业微信的简单文本 Webhook。provider-specific 的卡片、按钮和富文本格式属于 adapter 层，不进入核心 Session 模型。
 
 ### 2.2 非目标
 
@@ -94,17 +94,15 @@ Session: weather-fetcher
 
 ### 3.3 失败、退出和恢复
 
-建议首期关注以下状态转换：
+任务通知只关注以下结果：
 
 ```text
-running → attention_required
-running → failed
-running → stopped/exited
-attention_required → running/resumed
-running → completed（如果 Adapter 能可靠识别）
+Agent task → completed
+Agent task → failed
+native PTY → approval_required
 ```
 
-只在状态转换或聚合窗口结束时通知。不要因为同一个状态被轮询多次而重复发送。
+`running`、`starting`、普通 `waiting`、恢复、手动停止和普通错误事件都不发送通知。只在 Agent 明确产生任务结果或终端进入已识别的用户介入提示时通知。
 
 ## 4. 通知模型
 
@@ -144,18 +142,16 @@ type Notifier interface {
 
 ### 4.1 Attention 类型
 
-可先使用有限且可扩展的枚举：
+当前使用有限且可扩展的枚举：
 
 ```text
 none
-approval_observed
+approval_required
 failed
-stopped
 completed
-resumed
 ```
 
-`approval_observed` 仅表示 PTY 画面符合已验证的展示模式，不等同于拥有可执行的 approval API。它不改变 Session 的 `Capabilities.CanApprove`，该字段仍必须为 `false`，直到另行完成审批识别、授权和控制设计。
+Webhook 是任务结果和用户介入通知，不是运维状态告警。`running`、`starting`、普通 `waiting`、手动停止、恢复和普通错误事件不会触发通知。`approval_required` 仅表示 PTY 画面符合已验证的展示模式，不等同于拥有可执行的 approval API；它不改变 Session 的 `Capabilities.CanApprove`。
 
 ### 4.2 通知策略
 
@@ -163,15 +159,15 @@ resumed
 
 | 类别 | 示例 | 首期行为 |
 |---|---|---|
-| 高优先级 | permission/HIL 观察、失败、进程退出 | 发送一条状态变化通知 |
-| 中优先级 | 恢复、完成、Session 启动 | 可配置发送 |
-| 低优先级 | 普通 assistant 文本、单个工具调用/结果 | 默认不发送 |
+| 高优先级 | 需要用户介入、任务失败 | 发送一条任务通知 |
+| 中优先级 | 任务完成 | 发送一条任务通知 |
+| 低优先级 | 普通 assistant 文本、单个工具调用/结果、启动/恢复/停止 | 不发送 |
 | 高频数据 | PTY screen、raw bytes、token、轮询结果 | 永不逐条发送 |
 
 同一个 Session 在短窗口内发生多条低层事件时，应优先合并成一条摘要。通知策略应至少具备：
 
-- 状态转换去重；
-- 稳定事件 ID 或 `(session, attention, transition)` 去重键；
+- 任务结果事件使用稳定事件 ID 去重；
+- 相同用户介入提示在短窗口内去重；
 - HIL 识别的连续快照确认或 debounce；
 - provider 暂时失败时的有限重试或明确记录；
 - 不因通知失败而重试 Session 输入或重复执行 Agent 操作。
@@ -342,8 +338,8 @@ Provider adapter 不负责：
 
 ### 通知与入口
 
-- Session 发生配置的高价值状态转换时，IM 收到一条简短通知；
-- 同一个状态不会因轮询或重复 JSONL event 产生消息风暴；
+- Agent 任务产生明确的完成/失败结果，或 PTY 进入已识别的用户介入提示时，IM 收到一条简短通知；
+- 同一个任务结果不会因轮询、历史回放或重复 JSONL event 产生消息风暴；
 - 通知包含可识别的 Session 和可用的 Web deep link；
 - 点击链接后能打开指定 Session 的现有 Web 观察页面；
 - Web 页面仍显示 history/event stream 和当前 PTY snapshot；
@@ -363,11 +359,25 @@ Provider adapter 不负责：
 ### 降级行为
 
 - 没有可用 Web 地址时，通知应明确标记“需要本机打开 Agora”或不发送不可用链接；
-- PTY 无法观察时，不得伪造 `approval_observed`；
+- PTY 无法观察时，不得伪造 `approval_required`；
 - provider 不可用时，Session 和 Web 观察仍然可用；一期只保留内存中的投递失败结果，不形成持久化通知审计历史；
 - Session 删除、停止或过期后，旧链接不能访问其他 Session。
 
-## 10. 后续演进
+## 10. 当前使用方式
+
+在 Web UI Header 打开“设备”管理面板，在“IM Webhook”区域可以添加多个通知地址。每个地址可以选择 `Generic`、飞书、钉钉或企业微信，配置后可单独启用、禁用、测试或删除。
+
+Server 将 Webhook 按当前用户保存。Agent 任务产生明确的完成/失败结果，或 PTY 进入已识别的用户介入提示时，Server 会发送简短任务通知；启动、恢复、停止、普通 error event、assistant 文本、tool 事件、PTY snapshot 和轮询不会逐条发送。通知投递失败不会影响 Agent 会话。
+
+Server 如果配置了 `AGORA_PUBLIC_URL`，通知会附带对应 Session 的 Web 链接：
+
+```bash
+AGORA_PUBLIC_URL=https://agora.example.com
+```
+
+未配置公开地址时，通知不附带不可用的 localhost 链接。Webhook URL 在列表 API 中会隐藏 query、fragment 和认证信息。
+
+## 11. 后续演进
 
 只有在出站通知的真实使用证明有需求后，才考虑：
 

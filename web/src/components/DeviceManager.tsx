@@ -1,7 +1,7 @@
 import { useCallback, useRef, useState } from "react";
-import { Alert, Badge, Button, Collapse, Divider, Drawer, Empty, Popconfirm, Space, Spin, Statistic, Table, Tooltip, Typography } from "antd";
+import { Alert, Badge, Button, Collapse, Divider, Drawer, Empty, Input, Popconfirm, Select, Space, Spin, Statistic, Switch, Table, Tooltip, Typography } from "antd";
 import { CheckOutlined, CopyOutlined, DesktopOutlined, PlusOutlined, ReloadOutlined } from "@ant-design/icons";
-import { createPairCode, renameDevice, revokeDevice } from "../api/client";
+import { createPairCode, createWebhook, deleteWebhook, listWebhooks, renameDevice, revokeDevice, testWebhook, updateWebhook, type WebhookTarget } from "../api/client";
 import type { Device } from "../types";
 
 const { Paragraph, Text } = Typography;
@@ -41,6 +41,12 @@ export function DeviceManager({ devices, refresh, onRevoked, onOpen }: DeviceMan
   const [pairingBusy, setPairingBusy] = useState(false);
   const [pairingError, setPairingError] = useState("");
   const [pairingOpen, setPairingOpen] = useState(false);
+  const [webhooks, setWebhooks] = useState<WebhookTarget[]>([]);
+  const [webhookURL, setWebhookURL] = useState("");
+  const [webhookLabel, setWebhookLabel] = useState("");
+  const [webhookProvider, setWebhookProvider] = useState("generic");
+  const [webhookBusy, setWebhookBusy] = useState(false);
+  const [webhookError, setWebhookError] = useState("");
   const pairingRequest = useRef(0);
   const activeDevices = devices.filter((device) => !device.revoked_at);
   const revokedDevices = devices.filter((device) => device.revoked_at);
@@ -107,6 +113,20 @@ export function DeviceManager({ devices, refresh, onRevoked, onOpen }: DeviceMan
     setCode(null);
     setExpiresAt(null);
     setCopied(false);
+  };
+
+  const loadWebhooks = async () => {
+    try { setWebhooks(await listWebhooks()); } catch (cause) { setWebhookError(cause instanceof Error ? cause.message : "加载 Webhook 失败"); }
+  };
+
+  const addWebhook = async () => {
+    if (!webhookURL.trim()) return;
+    setWebhookBusy(true); setWebhookError("");
+    try {
+      const value = await createWebhook({ provider: webhookProvider, label: webhookLabel.trim(), url: webhookURL.trim() });
+      setWebhooks((current) => [...current, value]); setWebhookURL(""); setWebhookLabel("");
+    } catch (cause) { setWebhookError(cause instanceof Error ? cause.message : "添加 Webhook 失败"); }
+    finally { setWebhookBusy(false); }
   };
 
   const openPairing = () => {
@@ -226,7 +246,7 @@ export function DeviceManager({ devices, refresh, onRevoked, onOpen }: DeviceMan
   const activeColumns = columns;
 
   return <>
-    <Button className="device-manager-trigger" icon={<DesktopOutlined />} htmlType="button" onClick={() => { onOpen?.(); setOpen(true); }}>设备</Button>
+    <Button className="device-manager-trigger" icon={<DesktopOutlined />} htmlType="button" onClick={() => { onOpen?.(); setOpen(true); void loadWebhooks(); }}>设备</Button>
     <Drawer
       title="设备 / Devices"
       className="device-drawer"
@@ -249,6 +269,24 @@ export function DeviceManager({ devices, refresh, onRevoked, onOpen }: DeviceMan
           size="small"
         />
       )}
+      <Divider>IM Webhook</Divider>
+      <Space direction="vertical" size={10} style={{ width: "100%" }}>
+        <Typography.Text type="secondary">配置多个 Webhook 后，Agent 任务完成、失败或需要用户介入时，会向启用的地址发送通知。</Typography.Text>
+        {webhookError && <Alert type="error" showIcon closable message={webhookError} onClose={() => setWebhookError("")} />}
+        {webhooks.map((webhook) => <Space key={webhook.id} className="webhook-row" wrap>
+          <Switch checked={webhook.enabled} onChange={(enabled) => void updateWebhook(webhook.id, enabled).then((value) => setWebhooks((current) => current.map((item) => item.id === value.id ? value : item)))} />
+          <Text strong>{webhook.label || webhook.provider}</Text>
+          <Tooltip title={webhook.url}><code>{webhook.url.length > 42 ? webhook.url.slice(0, 42) + "…" : webhook.url}</code></Tooltip>
+          <Button size="small" onClick={() => void testWebhook(webhook.id)}>测试</Button>
+          <Popconfirm title="删除此 Webhook？" onConfirm={() => void deleteWebhook(webhook.id).then(() => setWebhooks((current) => current.filter((item) => item.id !== webhook.id)))}><Button size="small" danger>删除</Button></Popconfirm>
+        </Space>)}
+        <Space.Compact block>
+          <Select value={webhookProvider} onChange={setWebhookProvider} options={[{ value: "generic", label: "Generic" }, { value: "feishu", label: "飞书" }, { value: "dingtalk", label: "钉钉" }, { value: "wecom", label: "企业微信" }]} />
+          <Input value={webhookLabel} onChange={(event) => setWebhookLabel(event.target.value)} placeholder="名称（可选）" />
+          <Input value={webhookURL} onChange={(event) => setWebhookURL(event.target.value)} onPressEnter={() => void addWebhook()} placeholder="Webhook URL" />
+          <Button type="primary" loading={webhookBusy} disabled={!webhookURL.trim()} onClick={() => void addWebhook()}>添加</Button>
+        </Space.Compact>
+      </Space>
       {revokedDevices.length > 0 && <Collapse
         className="device-audit"
         ghost

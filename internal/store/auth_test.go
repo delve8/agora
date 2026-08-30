@@ -52,6 +52,40 @@ func TestPairCodeAndDeviceOwnership(t *testing.T) {
 	}
 }
 
+func TestWebhookTargets(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "agora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	user, err := db.GetOrCreateLocalUser(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := db.CreateWebhookTarget(ctx, WebhookTarget{ID: "hook-1", UserID: user.UserID, Provider: "feishu", Label: "ops", URL: "https://example.test/hook", Enabled: true, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	values, err := db.ListWebhookTargets(ctx, user.UserID)
+	if err != nil || len(values) != 1 || values[0].Provider != "feishu" || values[0].URL == "" {
+		t.Fatalf("webhooks = %+v, %v", values, err)
+	}
+	if err := db.SetWebhookTargetEnabled(ctx, user.UserID, "hook-1", false); err != nil {
+		t.Fatal(err)
+	}
+	value, err := db.GetWebhookTarget(ctx, user.UserID, "hook-1")
+	if err != nil || value.Enabled {
+		t.Fatalf("updated webhook = %+v, %v", value, err)
+	}
+	if err := db.DeleteWebhookTarget(ctx, user.UserID, "hook-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.GetWebhookTarget(ctx, user.UserID, "hook-1"); err == nil {
+		t.Fatal("expected deleted webhook")
+	}
+}
+
 func TestUpdateDeviceName(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "agora.db"))
 	if err != nil {

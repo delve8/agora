@@ -26,6 +26,7 @@ import (
 	"github.com/delve8/agora/internal/coordination"
 	"github.com/delve8/agora/internal/event"
 	"github.com/delve8/agora/internal/message"
+	"github.com/delve8/agora/internal/notification"
 	"github.com/delve8/agora/internal/protocol"
 	"github.com/delve8/agora/internal/runtime"
 	"github.com/delve8/agora/internal/session"
@@ -41,8 +42,10 @@ type Server struct {
 
 	// proxySessions holds proxy-registered sessions in memory so the session
 	// list never has to read them back from the store.
-	proxyMu       sync.Mutex
-	proxySessions map[string]session.Session
+	proxyMu        sync.Mutex
+	proxySessions  map[string]session.Session
+	notifyMu       sync.Mutex
+	notifyPolicies map[string]*notification.Policy
 }
 
 func New(addr string, db *store.Store, manager *runtime.Manager) *Server {
@@ -70,7 +73,21 @@ func NewWithWebDirAndAuth(addr string, db *store.Store, manager *runtime.Manager
 			local = principal
 		}
 	}
-	s := &Server{store: db, manager: manager, daemons: newDaemonHub(db, authConfig.Mode), auth: auth.NewAuthenticatorWithProvisioning(authConfig.Mode, validator, db, local, authConfig.Provisioning), proxySessions: make(map[string]session.Session)}
+	s := &Server{store: db, manager: manager, daemons: newDaemonHub(db, authConfig.Mode), auth: auth.NewAuthenticatorWithProvisioning(authConfig.Mode, validator, db, local, authConfig.Provisioning), proxySessions: make(map[string]session.Session), notifyPolicies: make(map[string]*notification.Policy)}
+	s.daemons.onEvents = s.notifyObservedEvents
+	s.daemons.onSessionAttention = s.notifySessionAttention
+	s.daemons.onSessionExit = func(id string, code int, lastError string, _ bool) {
+		s.notifyTaskResult(id, false, lastError, "")
+	}
+	if manager != nil {
+		manager.SetEventHandler(func(item event.Event) { s.notifyObservedEvents(item.SessionID, []event.Event{item}) })
+		manager.SetAttentionHandler(s.notifySessionAttention)
+		manager.SetSessionExitHandler(func(value session.Session, exited runtime.PTYExit) {
+			if exited.ExitCode != 0 && !exited.Intentional {
+				s.notifyTaskResult(value.ID, false, value.LastError, "")
+			}
+		})
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /api/daemon/ws", s.daemons.serveHTTP)
@@ -80,6 +97,11 @@ func NewWithWebDirAndAuth(addr string, db *store.Store, manager *runtime.Manager
 	mux.HandleFunc("GET /api/devices", s.listDevices)
 	mux.HandleFunc("POST /api/devices/{id}/revoke", s.revokeDevice)
 	mux.HandleFunc("POST /api/devices/{id}/name", s.renameDevice)
+	mux.HandleFunc("GET /api/webhooks", s.listWebhooks)
+	mux.HandleFunc("POST /api/webhooks", s.createWebhook)
+	mux.HandleFunc("PATCH /api/webhooks/{id}", s.updateWebhook)
+	mux.HandleFunc("DELETE /api/webhooks/{id}", s.deleteWebhook)
+	mux.HandleFunc("POST /api/webhooks/{id}/test", s.testWebhook)
 	mux.HandleFunc("GET /api/state", s.state)
 	mux.HandleFunc("POST /api/coordinations", s.createCoordination)
 	mux.HandleFunc("GET /api/coordinations/{id}", s.getCoordination)
@@ -235,6 +257,137 @@ func (s *Server) resolveSession(ctx context.Context, id string) (session.Session
 }
 
 var errForbidden = errors.New("forbidden")
+
+func (s *Server) notifySessionAttention(sessionID, attention string) {
+	if attention != string(notification.AttentionApprovalRequired) {
+		return
+	}
+	value, err := s.resolveNotificationSession(context.Background(), sessionID)
+	if err != nil {
+		return
+	}
+	value.State = session.StateWaiting
+	s.dispatchNotification(value, notification.AttentionApprovalRequired, "Agora · 需要用户介入", "Agent 正在原生终端等待你的确认，请打开终端处理后继续任务。", "")
+}
+
+func (s *Server) notifyTaskResult(sessionID string, success bool, summary, eventID string) {
+	value, err := s.resolveNotificationSession(context.Background(), sessionID)
+	if err != nil {
+		return
+	}
+	attention := notification.AttentionCompleted
+	title := "Agora · Agent 任务已完成"
+	if !success {
+		attention = notification.AttentionFailed
+		title = "Agora · Agent 任务失败"
+		value.State = session.StateFailed
+	} else {
+		value.State = "completed"
+	}
+	if strings.TrimSpace(summary) == "" {
+		summary = "任务结果已产生，请打开 Agora 查看详情。"
+	}
+	s.dispatchNotification(value, attention, title, summary, eventID)
+}
+
+func (s *Server) notifyObservedEvents(sessionID string, values []event.Event) {
+	if s.store == nil || len(values) == 0 {
+		return
+	}
+	for _, item := range values {
+		if !isTaskResultEvent(item) {
+			continue
+		}
+		summary := item.Summary
+		if summary == "" {
+			summary = item.Content
+		}
+		s.notifyTaskResult(sessionID, !item.IsError, summary, item.ID)
+	}
+}
+
+func isTaskResultEvent(item event.Event) bool {
+	if item.Kind != event.KindResult && item.Kind != event.KindError {
+		return false
+	}
+	// Proxy integrations may provide an already-normalized result without the
+	// provider's raw record. A KindResult is sufficient in that case.
+	if strings.TrimSpace(item.RawJSON) == "" {
+		return item.Kind == event.KindResult
+	}
+	// Inspect the provider record rather than only the normalized Kind. Pi's
+	// history begins with a `session` metadata record, which is not a task end.
+	var raw struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal([]byte(item.RawJSON), &raw) != nil {
+		return false
+	}
+	switch raw.Type {
+	case "result", "agent_end", "agent_settled", "turn_end":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) resolveNotificationSession(ctx context.Context, id string) (session.Session, error) {
+	value, err := s.store.GetSession(ctx, id)
+	if err != nil {
+		return session.Session{}, err
+	}
+	if value.Source == session.SourceManaged && s.manager == nil {
+		value = s.daemons.effectiveSession(value)
+	}
+	return value, nil
+}
+
+func (s *Server) dispatchNotification(value session.Session, attention notification.Attention, title, summary, eventID string) {
+	if s.store == nil {
+		return
+	}
+	owner := "local"
+	if value.DaemonID != "" {
+		if userID, err := s.store.DeviceOwner(context.Background(), value.DaemonID); err == nil {
+			owner = userID
+		}
+	}
+	targets, err := s.store.ListWebhookTargets(context.Background(), owner)
+	if err != nil || len(targets) == 0 {
+		return
+	}
+	converted := make([]notification.Target, 0, len(targets))
+	for _, target := range targets {
+		converted = append(converted, notification.Target{ID: target.ID, Provider: notification.Provider(target.Provider), Label: target.Label, URL: target.URL, Enabled: target.Enabled})
+	}
+	s.notifyMu.Lock()
+	policy := s.notifyPolicies[owner]
+	if policy == nil {
+		policy = notification.NewPolicy(30 * time.Second)
+		s.notifyPolicies[owner] = policy
+	}
+	allowed := policy.Allow(notification.SessionNotification{ID: eventID, SessionID: value.ID, State: value.State, Attention: attention})
+	s.notifyMu.Unlock()
+	if !allowed {
+		return
+	}
+	notifier := &notification.WebhookNotifier{Targets: converted, Client: &http.Client{Timeout: 10 * time.Second}}
+	notificationID := eventID
+	if notificationID == "" {
+		notificationID = newID("notification")
+	}
+	go func() {
+		_ = notifier.NotifySessionEvent(context.Background(), notification.SessionNotification{ID: notificationID, CoordinationID: value.CoordinationID, SessionID: value.ID, SessionName: value.DisplayName, State: value.State, Attention: attention, Title: title, Summary: summary, OpenURL: s.sessionOpenURL(value.ID), CreatedAt: time.Now().UTC()})
+	}()
+}
+
+func (s *Server) sessionOpenURL(id string) string {
+	base := strings.TrimRight(strings.TrimSpace(os.Getenv("AGORA_PUBLIC_URL")), "/")
+	if base == "" {
+		return ""
+	}
+	return base + "/?session=" + url.QueryEscape(id)
+}
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -413,6 +566,177 @@ func (s *Server) listDevices(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, devices)
+}
+
+type webhookDTO struct {
+	ID       string `json:"id"`
+	Provider string `json:"provider"`
+	Label    string `json:"label"`
+	URL      string `json:"url"`
+	Enabled  bool   `json:"enabled"`
+}
+
+func webhookResponse(value store.WebhookTarget) webhookDTO {
+	return webhookDTO{ID: value.ID, Provider: value.Provider, Label: value.Label, URL: maskWebhookURL(value.URL), Enabled: value.Enabled}
+}
+
+func maskWebhookURL(raw string) string {
+	value, err := url.Parse(raw)
+	if err != nil {
+		return "configured"
+	}
+	if value.User != nil {
+		value.User = url.User("***")
+	}
+	if value.RawQuery != "" {
+		value.RawQuery = "***"
+	}
+	if value.Fragment != "" {
+		value.Fragment = "***"
+	}
+	return value.String()
+}
+
+func validateWebhookURL(raw string) (string, error) {
+	value, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || value.Scheme != "http" && value.Scheme != "https" || value.Host == "" {
+		return "", errors.New("webhook URL must be an http or https URL")
+	}
+	return value.String(), nil
+}
+
+func webhookProvider(value string) notification.Provider {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return notification.ProviderGeneric
+	}
+	return notification.Provider(value)
+}
+
+func (s *Server) listWebhooks(w http.ResponseWriter, r *http.Request) {
+	principal, err := auth.RequirePrincipal(r.Context())
+	if err != nil {
+		writeErrorStatus(w, http.StatusUnauthorized, err)
+		return
+	}
+	values, err := s.store.ListWebhookTargets(r.Context(), principal.UserID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	result := make([]webhookDTO, 0, len(values))
+	for _, value := range values {
+		result = append(result, webhookResponse(value))
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) createWebhook(w http.ResponseWriter, r *http.Request) {
+	principal, err := auth.RequirePrincipal(r.Context())
+	if err != nil {
+		writeErrorStatus(w, http.StatusUnauthorized, err)
+		return
+	}
+	var input struct {
+		Provider string `json:"provider"`
+		Label    string `json:"label"`
+		URL      string `json:"url"`
+	}
+	if err := decodeJSON(r, &input); err != nil {
+		writeErrorStatus(w, http.StatusBadRequest, err)
+		return
+	}
+	u, err := validateWebhookURL(input.URL)
+	if err != nil {
+		writeErrorStatus(w, http.StatusBadRequest, err)
+		return
+	}
+	provider := webhookProvider(input.Provider)
+	if _, _, err := notification.Payload(provider, notification.SessionNotification{Title: "test"}); err != nil {
+		writeErrorStatus(w, http.StatusBadRequest, err)
+		return
+	}
+	now := time.Now().UTC()
+	value := store.WebhookTarget{ID: newID("webhook"), UserID: principal.UserID, Provider: string(provider), Label: sanitizeDeviceName(input.Label), URL: u, Enabled: true, CreatedAt: now, UpdatedAt: now}
+	if err := s.store.CreateWebhookTarget(r.Context(), value); err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, webhookResponse(value))
+}
+
+func (s *Server) updateWebhook(w http.ResponseWriter, r *http.Request) {
+	principal, err := auth.RequirePrincipal(r.Context())
+	if err != nil {
+		writeErrorStatus(w, http.StatusUnauthorized, err)
+		return
+	}
+	id := r.PathValue("id")
+	var input struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if err := decodeJSON(r, &input); err != nil {
+		writeErrorStatus(w, http.StatusBadRequest, err)
+		return
+	}
+	if input.Enabled == nil {
+		writeErrorStatus(w, http.StatusBadRequest, errors.New("enabled is required"))
+		return
+	}
+	if err := s.store.SetWebhookTargetEnabled(r.Context(), principal.UserID, id, *input.Enabled); errors.Is(err, sql.ErrNoRows) {
+		writeErrorStatus(w, http.StatusNotFound, err)
+		return
+	} else if err != nil {
+		writeError(w, err)
+		return
+	}
+	value, err := s.store.GetWebhookTarget(r.Context(), principal.UserID, id)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, webhookResponse(value))
+}
+
+func (s *Server) deleteWebhook(w http.ResponseWriter, r *http.Request) {
+	principal, err := auth.RequirePrincipal(r.Context())
+	if err != nil {
+		writeErrorStatus(w, http.StatusUnauthorized, err)
+		return
+	}
+	err = s.store.DeleteWebhookTarget(r.Context(), principal.UserID, r.PathValue("id"))
+	if errors.Is(err, sql.ErrNoRows) {
+		writeErrorStatus(w, http.StatusNotFound, err)
+		return
+	}
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"deleted": true})
+}
+
+func (s *Server) testWebhook(w http.ResponseWriter, r *http.Request) {
+	principal, err := auth.RequirePrincipal(r.Context())
+	if err != nil {
+		writeErrorStatus(w, http.StatusUnauthorized, err)
+		return
+	}
+	value, err := s.store.GetWebhookTarget(r.Context(), principal.UserID, r.PathValue("id"))
+	if errors.Is(err, sql.ErrNoRows) {
+		writeErrorStatus(w, http.StatusNotFound, err)
+		return
+	} else if err != nil {
+		writeError(w, err)
+		return
+	}
+	notifier := &notification.WebhookNotifier{Client: &http.Client{Timeout: 10 * time.Second}, Targets: []notification.Target{{ID: value.ID, Provider: notification.Provider(value.Provider), Label: value.Label, URL: value.URL, Enabled: true}}}
+	err = notifier.NotifySessionEvent(r.Context(), notification.SessionNotification{ID: newID("notification"), SessionName: "Webhook test", State: "test", Attention: notification.AttentionCompleted, Title: "Agora Webhook 测试", Summary: "Webhook 配置正常。", CreatedAt: time.Now().UTC()})
+	if err != nil {
+		writeErrorStatus(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"sent": true})
 }
 
 func (s *Server) renameDevice(w http.ResponseWriter, r *http.Request) {
@@ -1349,6 +1673,9 @@ func (s *Server) reportProxyExit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setProxySession(value)
+	if input.State == session.StateFailed {
+		s.notifyTaskResult(value.ID, false, value.LastError, "")
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "exit_code": input.ExitCode, "signal": input.Signal, "dropped_events": input.DroppedEvents})
 }
 

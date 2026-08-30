@@ -32,14 +32,16 @@ type Manager struct {
 	history   *adapter.HistoryCatalog
 	piHistory *adapter.PiHistoryCatalog
 
-	mu            sync.Mutex
-	active        map[string]bool
-	generation    map[string]uint64
-	observers     map[string]context.CancelFunc
-	piObservers   map[string]context.CancelFunc
-	subs          map[string]map[chan event.Event]struct{}
-	sessionOnExit func(session.Session, PTYExit)
-	closed        bool
+	mu               sync.Mutex
+	active           map[string]bool
+	generation       map[string]uint64
+	observers        map[string]context.CancelFunc
+	piObservers      map[string]context.CancelFunc
+	subs             map[string]map[chan event.Event]struct{}
+	sessionOnExit    func(session.Session, PTYExit)
+	eventHandler     func(event.Event)
+	attentionHandler func(string, string)
+	closed           bool
 }
 
 func NewManager(db StateStore, agentAdapter *adapter.ClaudeCodeAdapter, ptyManager *PTYManager) *Manager {
@@ -50,6 +52,14 @@ func NewManager(db StateStore, agentAdapter *adapter.ClaudeCodeAdapter, ptyManag
 	manager := &Manager{store: db, adapter: agentAdapter, pty: ptyManager, homeDir: homeDir, history: adapter.NewHistoryCatalog(homeDir), piHistory: adapter.NewPiHistoryCatalog(homeDir, ""), active: make(map[string]bool), generation: make(map[string]uint64), observers: make(map[string]context.CancelFunc), piObservers: make(map[string]context.CancelFunc), subs: make(map[string]map[chan event.Event]struct{})}
 	if ptyManager != nil {
 		ptyManager.SetExitHandler(manager.handlePTYExit)
+		ptyManager.SetAttentionHandler(func(id, attention string) {
+			manager.mu.Lock()
+			handler := manager.attentionHandler
+			manager.mu.Unlock()
+			if handler != nil {
+				handler(id, attention)
+			}
+		})
 	}
 	return manager
 }
@@ -878,6 +888,18 @@ func (m *Manager) SetSessionExitHandler(handler func(session.Session, PTYExit)) 
 	m.mu.Unlock()
 }
 
+func (m *Manager) SetEventHandler(handler func(event.Event)) {
+	m.mu.Lock()
+	m.eventHandler = handler
+	m.mu.Unlock()
+}
+
+func (m *Manager) SetAttentionHandler(handler func(string, string)) {
+	m.mu.Lock()
+	m.attentionHandler = handler
+	m.mu.Unlock()
+}
+
 func (m *Manager) handlePTYExit(exited PTYExit) {
 	m.clearActive(exited.AgoraID)
 	m.StopObserver(exited.AgoraID)
@@ -933,7 +955,7 @@ func (m *Manager) handlePiExit(exited PiExit) {
 	handler := m.sessionOnExit
 	m.mu.Unlock()
 	if handler != nil {
-		handler(value, PTYExit{AgoraID: exited.AgoraID, ExitCode: exited.ExitCode, Err: exited.Err})
+		handler(value, PTYExit{AgoraID: exited.AgoraID, ExitCode: exited.ExitCode, Err: exited.Err, Intentional: exited.Intentional})
 	}
 }
 
@@ -1368,12 +1390,16 @@ func (m *Manager) advanceObservation(id string) { m.mu.Lock(); m.generation[id]+
 
 func (m *Manager) publish(coordinationID string, value event.Event) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	for ch := range m.subs[coordinationID] {
 		select {
 		case ch <- value:
 		default:
 		}
+	}
+	handler := m.eventHandler
+	m.mu.Unlock()
+	if handler != nil {
+		handler(value)
 	}
 }
 

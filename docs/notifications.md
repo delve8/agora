@@ -67,30 +67,30 @@ type Target struct {
 
 ## 3. Attention 与发送策略
 
+Webhook 是任务通知，不是运维告警。Server 不因为 Session 启动、恢复、停止、进入普通 waiting、轮询或普通 error event 发送通知。只有 Agent 明确给出任务结果，或终端进入已识别的用户介入提示时才发送。
+
 首期支持：
 
 - `none`：不发送；
-- `failed`：Session 失败；
-- `stopped`：进程停止或退出；
-- `completed`：Adapter 能可靠识别完成；
-- `resumed`：Session 从断线/等待恢复。
+- `failed`：Agent 任务明确失败或异常退出；
+- `completed`：Adapter 能可靠识别任务完成；
+- `approval_required`：已识别的原生终端用户介入提示。
 
 推荐默认行为：
 
 | attention | 默认行为 |
 |---|---|
 | failed | 发送 |
-| stopped | 发送 |
-| resumed | 发送 |
-| completed | 可配置，默认发送 |
+| completed | 发送 |
+| approval_required | 发送 |
 | none | 不发送 |
 
 普通 assistant 文本、单个 tool call/tool result、PTY snapshot、轮询和 token 不逐条发送。
 
 ## 4. 去重、debounce 与失败
 
-- 去重 key：`session_id + attention + state`；
-- 短窗口内相同 key 只发送一次；
+- 任务结果使用 `session_id + attention + event_id` 去重；
+- 用户介入提示按 Session 和短时间窗口去重；
 - duplicate Event 不重新触发通知；
 - provider 失败不影响 Agent、Daemon JSONL、Web SSE 或 Web input；
 - 多个 target 独立投递，一个失败不能阻断其他 target；
@@ -108,7 +108,7 @@ type Target struct {
 {
   "msg_type": "text",
   "content": {
-    "text": "Agora · Session failed\nClaude stopped\n打开 Agora：https://..."
+    "text": "Agora · Agent 任务完成\n任务结果已产生\n打开 Agora：https://..."
   }
 }
 ```
@@ -121,7 +121,7 @@ type Target struct {
 {
   "msgtype": "text",
   "text": {
-    "content": "Agora · Session failed\nClaude stopped\n打开 Agora：https://..."
+    "content": "Agora · Agent 任务完成\n任务结果已产生\n打开 Agora：https://..."
   }
 }
 ```
@@ -134,7 +134,7 @@ type Target struct {
 {
   "msgtype": "text",
   "text": {
-    "content": "Agora · Session failed\nClaude stopped\n打开 Agora：https://..."
+    "content": "Agora · Agent 任务完成\n任务结果已产生\n打开 Agora：https://..."
   }
 }
 ```
@@ -143,11 +143,11 @@ type Target struct {
 
 ```json
 {
-  "text": "Agora · Session failed\nClaude stopped\n打开 Agora：https://...",
+  "text": "Agora · Agent 任务完成\n任务结果已产生\n打开 Agora：https://...",
   "notification": {
     "session_id": "sess-1",
     "state": "failed",
-    "attention": "failed"
+    "attention": "completed"
   }
 }
 ```

@@ -63,17 +63,19 @@ type PiProcess struct {
 }
 
 type PiManager struct {
-	config    PiConfig
-	mu        sync.Mutex
-	processes map[string]*PiProcess
-	onExit    func(PiExit)
+	config           PiConfig
+	mu               sync.Mutex
+	processes        map[string]*PiProcess
+	intentionalStops map[string]bool
+	onExit           func(PiExit)
 }
 
 type PiExit struct {
-	AgoraID  string
-	NativeID string
-	ExitCode int
-	Err      error
+	AgoraID     string
+	NativeID    string
+	ExitCode    int
+	Err         error
+	Intentional bool
 }
 
 // PiManager runs Pi's normal interactive TUI under an Agora-owned PTY. Pi's
@@ -101,7 +103,7 @@ func NewPiManager(config PiConfig) *PiManager {
 	if config.SessionDir == "" {
 		config.SessionDir = firstEnvValue("AGORA_PI_SESSION_DIR", "PI_SESSION_DIR")
 	}
-	return &PiManager{config: config, processes: make(map[string]*PiProcess)}
+	return &PiManager{config: config, processes: make(map[string]*PiProcess), intentionalStops: make(map[string]bool)}
 }
 
 func firstEnvValue(names ...string) string {
@@ -190,6 +192,8 @@ func (m *PiManager) start(id, workspace, nativeID, historyPath string) (*PiProce
 		}
 		m.mu.Lock()
 		delete(m.processes, id)
+		intentional := m.intentionalStops[id]
+		delete(m.intentionalStops, id)
 		m.mu.Unlock()
 		process.mu.Lock()
 		process.closed = true
@@ -200,7 +204,7 @@ func (m *PiManager) start(id, workspace, nativeID, historyPath string) (*PiProce
 		close(events)
 		log.Printf("agora: Pi session %s process exited pid=%d code=%d err=%v", id, cmd.Process.Pid, code, waitErr)
 		if onExit != nil {
-			onExit(PiExit{AgoraID: id, NativeID: process.nativeID(), ExitCode: code, Err: waitErr})
+			onExit(PiExit{AgoraID: id, NativeID: process.nativeID(), ExitCode: code, Err: waitErr, Intentional: intentional})
 		}
 	}()
 	return process, nil
@@ -319,11 +323,20 @@ func (m *PiManager) Interrupt(ctx context.Context, id string) error { return m.S
 func (m *PiManager) Stop(id string) error {
 	m.mu.Lock()
 	p := m.processes[id]
+	if p != nil {
+		m.intentionalStops[id] = true
+	}
 	m.mu.Unlock()
 	if p == nil || p.Process == nil {
 		return fmt.Errorf("Pi session %s is not running", id)
 	}
-	return p.Process.Signal(syscall.SIGTERM)
+	if err := p.Process.Signal(syscall.SIGTERM); err != nil {
+		m.mu.Lock()
+		delete(m.intentionalStops, id)
+		m.mu.Unlock()
+		return err
+	}
+	return nil
 }
 func (m *PiManager) AttachAddr(id string) (string, error) {
 	m.mu.Lock()
@@ -422,6 +435,9 @@ func (m *PiManager) serveAttach(p *PiProcess) {
 			if n > 0 {
 				p.recordOutput(buf[:n])
 				if p.observation != nil {
+					// Pi currently has no provider-independent approval protocol;
+					// retain the terminal screen for observation without inferring
+					// user intervention from arbitrary TUI text.
 					p.observation.record(buf[:n])
 				}
 				broadcast(buf[:n])

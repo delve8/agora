@@ -181,6 +181,7 @@ type SessionUpdatePayload struct {
 	Connection      string `json:"connection,omitempty"`
 	PID             int    `json:"pid,omitempty"`
 	LastError       string `json:"last_error,omitempty"`
+	Attention       string `json:"attention,omitempty"`
 }
 
 type EventBatchPayload struct {
@@ -245,6 +246,7 @@ type ExitPayload struct {
 	Signal        string `json:"signal,omitempty"`
 	LastError     string `json:"last_error,omitempty"`
 	DroppedEvents int    `json:"dropped_events,omitempty"`
+	Intentional   bool   `json:"intentional,omitempty"`
 }
 
 type AckPayload struct {

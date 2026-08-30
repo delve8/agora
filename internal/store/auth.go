@@ -29,6 +29,17 @@ type PairCode struct {
 	ConsumedAt *time.Time
 }
 
+type WebhookTarget struct {
+	ID        string
+	UserID    string
+	Provider  string
+	Label     string
+	URL       string
+	Enabled   bool
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
 func HashSecret(value string) string {
 	digest := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(digest[:])
@@ -172,6 +183,12 @@ func (s *Store) IsDeviceRevoked(ctx context.Context, deviceID string) (bool, err
 	return strings.TrimSpace(revoked) != "", err
 }
 
+func (s *Store) DeviceOwner(ctx context.Context, daemonID string) (string, error) {
+	var userID string
+	err := s.db.QueryRowContext(ctx, `SELECT user_id FROM devices WHERE device_id=? AND (revoked_at IS NULL OR revoked_at='')`, daemonID).Scan(&userID)
+	return userID, err
+}
+
 func (s *Store) UserHasDevice(ctx context.Context, userID, daemonID string) (bool, error) {
 	var exists int
 	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM devices WHERE user_id=? AND device_id=?`, userID, daemonID).Scan(&exists)
@@ -188,6 +205,96 @@ func (s *Store) UserOwnsDaemon(ctx context.Context, userID, daemonID string) (bo
 		return false, nil
 	}
 	return err == nil && exists == 1, err
+}
+
+func (s *Store) CreateWebhookTarget(ctx context.Context, target WebhookTarget) error {
+	if strings.TrimSpace(target.ID) == "" || strings.TrimSpace(target.UserID) == "" || strings.TrimSpace(target.URL) == "" {
+		return errors.New("webhook target id, user id and URL are required")
+	}
+	if target.CreatedAt.IsZero() {
+		target.CreatedAt = time.Now().UTC()
+	}
+	if target.UpdatedAt.IsZero() {
+		target.UpdatedAt = target.CreatedAt
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO webhook_targets(id,user_id,provider,label,url,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`, target.ID, target.UserID, target.Provider, target.Label, target.URL, boolInt(target.Enabled), target.CreatedAt.UTC().Format(timeFormat), target.UpdatedAt.UTC().Format(timeFormat))
+	return err
+}
+
+func (s *Store) GetWebhookTarget(ctx context.Context, userID, id string) (WebhookTarget, error) {
+	var target WebhookTarget
+	var enabled int
+	var created, updated string
+	err := s.db.QueryRowContext(ctx, `SELECT id,user_id,provider,label,url,enabled,created_at,updated_at FROM webhook_targets WHERE id=? AND user_id=?`, id, userID).Scan(&target.ID, &target.UserID, &target.Provider, &target.Label, &target.URL, &enabled, &created, &updated)
+	if err != nil {
+		return target, err
+	}
+	target.Enabled = enabled != 0
+	target.CreatedAt, err = parseTime(created)
+	if err != nil {
+		return target, err
+	}
+	target.UpdatedAt, err = parseTime(updated)
+	return target, err
+}
+
+func (s *Store) ListWebhookTargets(ctx context.Context, userID string) ([]WebhookTarget, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id,user_id,provider,label,url,enabled,created_at,updated_at FROM webhook_targets WHERE user_id=? ORDER BY created_at`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	values := make([]WebhookTarget, 0)
+	for rows.Next() {
+		var target WebhookTarget
+		var enabled int
+		var created, updated string
+		if err := rows.Scan(&target.ID, &target.UserID, &target.Provider, &target.Label, &target.URL, &enabled, &created, &updated); err != nil {
+			return nil, err
+		}
+		target.Enabled = enabled != 0
+		target.CreatedAt, err = parseTime(created)
+		if err != nil {
+			return nil, err
+		}
+		target.UpdatedAt, err = parseTime(updated)
+		if err != nil {
+			return nil, err
+		}
+		values = append(values, target)
+	}
+	return values, rows.Err()
+}
+
+func (s *Store) DeleteWebhookTarget(ctx context.Context, userID, id string) error {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM webhook_targets WHERE id=? AND user_id=?`, id, userID)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err == nil && count == 0 {
+		return sql.ErrNoRows
+	}
+	return err
+}
+
+func (s *Store) SetWebhookTargetEnabled(ctx context.Context, userID, id string, enabled bool) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE webhook_targets SET enabled=?,updated_at=? WHERE id=? AND user_id=?`, boolInt(enabled), time.Now().UTC().Format(timeFormat), id, userID)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err == nil && count == 0 {
+		return sql.ErrNoRows
+	}
+	return err
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func (s *Store) ListDevices(ctx context.Context, userID string) ([]Device, error) {

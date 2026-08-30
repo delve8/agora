@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -41,6 +42,55 @@ func seedDaemonHistorySession(srv *Server, daemonID string, summary protocol.His
 	}
 	srv.daemons.history[daemonID][summary.SessionID] = summary
 	srv.daemons.mu.Unlock()
+}
+
+func TestWebhookConfigurationSupportsMultipleTargets(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "agora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	srv := New(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), nil))
+	for _, body := range []string{`{"provider":"generic","label":"one","url":"https://example.test/one?secret=abc"}`, `{"provider":"feishu","label":"two","url":"https://example.test/two"}`} {
+		resp := httptest.NewRecorder()
+		srv.HTTP.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/api/webhooks", bytes.NewBufferString(body)))
+		if resp.Code != http.StatusCreated {
+			t.Fatalf("create webhook returned %d: %s", resp.Code, resp.Body.String())
+		}
+	}
+	resp := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/api/webhooks", nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("list webhooks returned %d: %s", resp.Code, resp.Body.String())
+	}
+	var values []struct {
+		ID, URL string
+		Enabled bool
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &values); err != nil {
+		t.Fatal(err)
+	}
+	if len(values) != 2 || !values[0].Enabled || strings.Contains(values[0].URL, "secret=abc") {
+		t.Fatalf("webhook list = %+v", values)
+	}
+	// Toggle and delete through the authenticated API using the first target ID.
+	var listed []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	update := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPatch, "/api/webhooks/"+listed[0].ID, bytes.NewBufferString(`{"enabled":false}`))
+	srv.HTTP.Handler.ServeHTTP(update, req)
+	if update.Code != http.StatusOK {
+		t.Fatalf("disable webhook returned %d: %s", update.Code, update.Body.String())
+	}
+	remove := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(remove, httptest.NewRequest(http.MethodDelete, "/api/webhooks/"+listed[0].ID, nil))
+	if remove.Code != http.StatusOK {
+		t.Fatalf("delete webhook returned %d: %s", remove.Code, remove.Body.String())
+	}
 }
 
 func TestStateReportsDaemonLiveSessionMetadata(t *testing.T) {

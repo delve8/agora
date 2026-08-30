@@ -31,21 +31,24 @@ const (
 )
 
 type daemonHub struct {
-	mu          sync.RWMutex
-	store       *store.Store
-	authMode    string
-	devices     map[string]*daemonConnection
-	routes      map[string]string
-	sessions    map[string]map[string]protocol.SessionSummary
-	history     map[string]map[string]protocol.HistorySessionSummary
-	seen        map[string]time.Time
-	seenOrder   []string
-	subs        map[string]map[chan event.Event]struct{}
-	resyncParts map[string]resyncAccumulator
-	pending     map[string]chan protocol.Envelope
-	timeout     time.Duration
-	token       string
-	upgrader    websocket.Upgrader
+	mu                 sync.RWMutex
+	store              *store.Store
+	authMode           string
+	devices            map[string]*daemonConnection
+	routes             map[string]string
+	sessions           map[string]map[string]protocol.SessionSummary
+	history            map[string]map[string]protocol.HistorySessionSummary
+	seen               map[string]time.Time
+	seenOrder          []string
+	subs               map[string]map[chan event.Event]struct{}
+	resyncParts        map[string]resyncAccumulator
+	pending            map[string]chan protocol.Envelope
+	timeout            time.Duration
+	token              string
+	onEvents           func(string, []event.Event)
+	onSessionAttention func(string, string)
+	onSessionExit      func(string, int, string, bool)
+	upgrader           websocket.Upgrader
 }
 
 type resyncAccumulator struct {
@@ -340,8 +343,12 @@ func (h *daemonHub) handleFrame(c *daemonConnection, frame protocol.Envelope) er
 			if payload.ClaudeSessionID != "" {
 				existing.ClaudeSessionID = payload.ClaudeSessionID
 			}
-			existing.State = payload.State
-			existing.Connection = payload.Connection
+			if payload.State != "" {
+				existing.State = payload.State
+			}
+			if payload.Connection != "" {
+				existing.Connection = payload.Connection
+			}
 			// The update may arrive after session.created. Preserve the PID from
 			// that response when an intermediate running update omits it; only a
 			// terminal state is allowed to clear a PID explicitly.
@@ -350,6 +357,9 @@ func (h *daemonHub) handleFrame(c *daemonConnection, frame protocol.Envelope) er
 			}
 			h.sessions[c.id][payload.SessionID] = existing
 			h.mu.Unlock()
+			if payload.Attention != "" && h.onSessionAttention != nil {
+				h.onSessionAttention(payload.SessionID, payload.Attention)
+			}
 		}
 		return nil
 	case protocol.EventBatch:
@@ -389,6 +399,9 @@ func (h *daemonHub) handleFrame(c *daemonConnection, frame protocol.Envelope) er
 			current.PID = 0
 			h.sessions[c.id][payload.SessionID] = current
 			h.mu.Unlock()
+			if h.onSessionExit != nil && payload.ExitCode != 0 && !payload.Intentional {
+				h.onSessionExit(payload.SessionID, payload.ExitCode, payload.LastError, payload.Intentional)
+			}
 		}
 		return nil
 	default:
@@ -470,7 +483,10 @@ func (h *daemonHub) handleEventBatch(c *daemonConnection, frame protocol.Envelop
 	if duplicate {
 		return nil
 	}
-	h.Publish(payload.SessionID, payload.Events)
+	fresh := h.Publish(payload.SessionID, payload.Events)
+	if fresh > 0 && h.onEvents != nil {
+		h.onEvents(payload.SessionID, payload.Events)
+	}
 	return nil
 }
 

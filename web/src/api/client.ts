@@ -43,6 +43,12 @@ export function createPairCode() { return request<PairCodeResponse>("/api/device
 export function listDevices() { return request<Device[]>("/api/devices"); }
 export function renameDevice(deviceId: string, name: string) { return request<{ renamed: boolean }>(`/api/devices/${encodeURIComponent(deviceId)}/name`, { method: "POST", body: JSON.stringify({ name }) }); }
 export function revokeDevice(deviceId: string) { return request<{ revoked: boolean }>(`/api/devices/${encodeURIComponent(deviceId)}/revoke`, { method: "POST" }); }
+export type WebhookTarget = { id: string; provider: string; label: string; url: string; enabled: boolean };
+export function listWebhooks() { return request<WebhookTarget[]>("/api/webhooks"); }
+export function createWebhook(input: { provider: string; label: string; url: string }) { return request<WebhookTarget>("/api/webhooks", { method: "POST", body: JSON.stringify(input) }); }
+export function updateWebhook(id: string, enabled: boolean) { return request<WebhookTarget>(`/api/webhooks/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify({ enabled }) }); }
+export function deleteWebhook(id: string) { return request<{ deleted: boolean }>(`/api/webhooks/${encodeURIComponent(id)}`, { method: "DELETE" }); }
+export function testWebhook(id: string) { return request<{ sent: boolean }>(`/api/webhooks/${encodeURIComponent(id)}/test`, { method: "POST" }); }
 export type CreateSessionInput = { workspace: string; display_name: string; role: string; agent: string; daemon_id?: string };
 export function createSession(coordinationId: string, input: CreateSessionInput) { return request<Session>(`/api/coordinations/${coordinationId}/sessions`, { method: "POST", body: JSON.stringify(input) }); }
 export function loadEvents(sessionId: string, options?: { limit?: number; before?: string }) {

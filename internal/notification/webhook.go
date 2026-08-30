@@ -16,14 +16,22 @@ type WebhookNotifier struct {
 }
 
 func (n *WebhookNotifier) NotifySessionEvent(ctx context.Context, value SessionNotification) error {
+	var failures []string
 	for _, target := range n.Targets {
 		if !target.Enabled || strings.TrimSpace(target.URL) == "" {
 			continue
 		}
 		if delivery := n.NotifyTarget(ctx, target, value); !delivery.Delivered {
 			// One provider failure must not prevent other configured targets from receiving the notice.
-			continue
+			label := target.Label
+			if label == "" {
+				label = target.ID
+			}
+			failures = append(failures, fmt.Sprintf("%s: %s", label, delivery.Error))
 		}
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("webhook delivery failed: %s", strings.Join(failures, "; "))
 	}
 	return nil
 }
@@ -41,13 +49,13 @@ func (n *WebhookNotifier) NotifyTarget(ctx context.Context, target Target, value
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.URL, bytes.NewReader(body))
 	if err != nil {
-		delivery.Error = err.Error()
+		delivery.Error = "invalid webhook request"
 		return delivery
 	}
 	req.Header.Set("Content-Type", contentType)
 	resp, err := client.Do(req)
 	if err != nil {
-		delivery.Error = err.Error()
+		delivery.Error = "webhook request failed"
 		return delivery
 	}
 	defer resp.Body.Close()

@@ -65,6 +65,8 @@ CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, display_name TEXT NOT NUL
 CREATE TABLE IF NOT EXISTS user_identities (user_id TEXT NOT NULL, provider TEXT NOT NULL, subject TEXT NOT NULL, PRIMARY KEY (provider, subject), FOREIGN KEY (user_id) REFERENCES users(id));
 CREATE TABLE IF NOT EXISTS devices (device_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, credential_hash TEXT NOT NULL UNIQUE, name TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, last_seen_at TEXT NOT NULL DEFAULT '', revoked_at TEXT NOT NULL DEFAULT '', FOREIGN KEY (user_id) REFERENCES users(id));
 CREATE TABLE IF NOT EXISTS pair_codes (code_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at TEXT NOT NULL, consumed_at TEXT NOT NULL DEFAULT '', FOREIGN KEY (user_id) REFERENCES users(id));
+CREATE TABLE IF NOT EXISTS webhook_targets (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, provider TEXT NOT NULL DEFAULT 'generic', label TEXT NOT NULL DEFAULT '', url TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY (user_id) REFERENCES users(id));
+CREATE INDEX IF NOT EXISTS webhook_targets_user_id ON webhook_targets(user_id);
 CREATE INDEX IF NOT EXISTS devices_user_id ON devices(user_id);
 CREATE INDEX IF NOT EXISTS pair_codes_user_id ON pair_codes(user_id);
 CREATE INDEX IF NOT EXISTS messages_coord_created ON messages(coordination_id, created_at);
@@ -85,6 +87,8 @@ CREATE INDEX IF NOT EXISTS messages_coord_created ON messages(coordination_id, c
 		`ALTER TABLE sessions ADD COLUMN display_name_source TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sessions ADD COLUMN daemon_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sessions ADD COLUMN agent_session_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE webhook_targets ADD COLUMN provider TEXT NOT NULL DEFAULT 'generic'`,
+		`ALTER TABLE webhook_targets ADD COLUMN label TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, alterErr := s.db.ExecContext(ctx, statement); alterErr != nil && !strings.Contains(strings.ToLower(alterErr.Error()), "duplicate column") {
 			return alterErr

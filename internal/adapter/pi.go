@@ -222,8 +222,20 @@ func piEventFromRawSingle(sessionID, id, typ string, raw map[string]any, data []
 		if value, ok := raw["isError"].(bool); ok {
 			isError = value
 		}
-	case "agent_end", "turn_end", "agent_settled", "session":
+	case "agent_end", "turn_end", "agent_settled":
 		kind, semantic = event.KindResult, "status"
+		if failed, ok := raw["isError"].(bool); ok {
+			isError = failed
+		}
+		if failed, ok := raw["is_error"].(bool); ok {
+			isError = isError || failed
+		}
+		if failure := firstString(raw, "error", "errorMessage"); failure != "" {
+			content = firstNonEmpty(content, failure)
+			isError = true
+		}
+	case "session":
+		kind, semantic = event.KindSystem, "metadata"
 	case "error", "session_error":
 		kind, semantic, isError = event.KindError, "error", true
 	case "compaction", "compaction_start", "compaction_end", "queue_update", "model_change", "thinking_level_change", "session_info":

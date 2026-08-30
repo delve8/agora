@@ -70,7 +70,22 @@ func New(config Config) (*Daemon, error) {
 	daemon := &Daemon{config: config, manager: manager, outbox: newOutbox(config.OutboxLimit), events: make(map[string]context.CancelFunc)}
 	manager.SetSessionExitHandler(func(value session.Session, exited runtime.PTYExit) {
 		daemon.stopEventBridge(value.ID)
-		_ = daemon.send(protocol.SessionExit, protocol.ExitPayload{SessionID: value.ID, State: value.State, ExitCode: exited.ExitCode, LastError: value.LastError})
+		_ = daemon.send(protocol.SessionExit, protocol.ExitPayload{SessionID: value.ID, State: value.State, ExitCode: exited.ExitCode, LastError: value.LastError, Intentional: exited.Intentional})
+	})
+	manager.SetEventHandler(func(item event.Event) {
+		if item.Kind != event.KindResult && !(item.Kind == event.KindError && item.IsError) {
+			return
+		}
+		payload := protocol.EventBatchPayload{SessionID: item.SessionID}
+		body, err := json.Marshal([]event.Event{item})
+		if err != nil {
+			return
+		}
+		payload.Events = body
+		_ = daemon.send(protocol.EventBatch, payload)
+	})
+	manager.SetAttentionHandler(func(id, attention string) {
+		_ = daemon.send(protocol.SessionUpdate, protocol.SessionUpdatePayload{SessionID: id, Attention: attention})
 	})
 	return daemon, nil
 }

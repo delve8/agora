@@ -17,11 +17,10 @@ const (
 type Attention string
 
 const (
-	AttentionNone      Attention = "none"
-	AttentionFailed    Attention = "failed"
-	AttentionStopped   Attention = "stopped"
-	AttentionCompleted Attention = "completed"
-	AttentionResumed   Attention = "resumed"
+	AttentionNone             Attention = "none"
+	AttentionFailed           Attention = "failed"
+	AttentionCompleted        Attention = "completed"
+	AttentionApprovalRequired Attention = "approval_required"
 )
 
 type Target struct {

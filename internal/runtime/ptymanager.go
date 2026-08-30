@@ -30,9 +30,11 @@ type PTYManager struct {
 	homeDir   string
 	socketDir string
 
-	mu       sync.Mutex
-	sessions map[string]*PTYSession // keyed by Agora session id
-	onExit   func(PTYExit)
+	mu               sync.Mutex
+	sessions         map[string]*PTYSession // keyed by Agora session id
+	intentionalStops map[string]bool
+	onExit           func(PTYExit)
+	onAttention      func(string, string)
 }
 
 type PTYExit struct {
@@ -40,6 +42,7 @@ type PTYExit struct {
 	ClaudeSession string
 	ExitCode      int
 	Err           error
+	Intentional   bool
 }
 
 type PTYSession struct {
@@ -61,6 +64,7 @@ type ptyObservation struct {
 	frames   []rawFrame
 	capacity int
 	sequence uint64
+	approval bool
 }
 
 type rawFrame struct {
@@ -75,6 +79,11 @@ const (
 	defaultRawFrameLimit = 32
 )
 
+func looksLikeApprovalPrompt(snapshot terminal.Snapshot) bool {
+	text := strings.ToLower(strings.Join(snapshot.Lines, "\n"))
+	return strings.Contains(text, "do you want to allow claude") || (strings.Contains(text, "claude wants to") && strings.Contains(text, "1."))
+}
+
 func newPTYObservation() *ptyObservation {
 	return &ptyObservation{
 		emulator: terminal.NewVT10x(defaultPTYCols, defaultPTYRows),
@@ -82,7 +91,7 @@ func newPTYObservation() *ptyObservation {
 	}
 }
 
-func (o *ptyObservation) record(data []byte) {
+func (o *ptyObservation) record(data []byte) bool {
 	copyData := append([]byte(nil), data...)
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -93,6 +102,10 @@ func (o *ptyObservation) record(data []byte) {
 	if len(o.frames) > o.capacity {
 		o.frames = o.frames[len(o.frames)-o.capacity:]
 	}
+	approval := looksLikeApprovalPrompt(o.emulator.Snapshot())
+	changed := approval && !o.approval
+	o.approval = approval
+	return changed
 }
 
 func (o *ptyObservation) snapshot() terminal.Snapshot {
@@ -111,16 +124,23 @@ func NewPTYManager(binary, homeDir string) *PTYManager {
 		homeDir, _ = os.UserHomeDir()
 	}
 	return &PTYManager{
-		binary:    binary,
-		homeDir:   homeDir,
-		socketDir: filepath.Join(os.TempDir(), "agora-pty"),
-		sessions:  make(map[string]*PTYSession),
+		binary:           binary,
+		homeDir:          homeDir,
+		socketDir:        filepath.Join(os.TempDir(), "agora-pty"),
+		sessions:         make(map[string]*PTYSession),
+		intentionalStops: make(map[string]bool),
 	}
 }
 
 func (m *PTYManager) SetExitHandler(handler func(PTYExit)) {
 	m.mu.Lock()
 	m.onExit = handler
+	m.mu.Unlock()
+}
+
+func (m *PTYManager) SetAttentionHandler(handler func(string, string)) {
+	m.mu.Lock()
+	m.onAttention = handler
 	m.mu.Unlock()
 }
 
@@ -214,13 +234,15 @@ func (m *PTYManager) Launch(agoraID, workspace, claudeSession string) (*PTYSessi
 		}
 		m.mu.Lock()
 		delete(m.sessions, agoraID)
+		intentional := m.intentionalStops[agoraID]
+		delete(m.intentionalStops, agoraID)
 		handler := m.onExit
 		claudeSession := session.ClaudeSession
 		m.mu.Unlock()
 		_ = listener.Close()
 		_ = file.Close()
 		if handler != nil {
-			handler(PTYExit{AgoraID: agoraID, ClaudeSession: claudeSession, ExitCode: exitCode, Err: waitErr})
+			handler(PTYExit{AgoraID: agoraID, ClaudeSession: claudeSession, ExitCode: exitCode, Err: waitErr, Intentional: intentional})
 		}
 		log.Printf("agora: managed session %s process exited", agoraID)
 	}()
@@ -246,11 +268,17 @@ func (m *PTYManager) Input(agoraID, content string) error {
 func (m *PTYManager) Stop(agoraID string) error {
 	m.mu.Lock()
 	session := m.sessions[agoraID]
+	if session != nil {
+		m.intentionalStops[agoraID] = true
+	}
 	m.mu.Unlock()
 	if session == nil || session.Process == nil {
 		return fmt.Errorf("managed session %s is not running", agoraID)
 	}
 	if err := session.Process.Signal(syscall.SIGTERM); err != nil {
+		m.mu.Lock()
+		delete(m.intentionalStops, agoraID)
+		m.mu.Unlock()
 		return fmt.Errorf("stop managed session %s: %w", agoraID, err)
 	}
 	return nil
@@ -382,8 +410,13 @@ func (m *PTYManager) serveAttach(session *PTYSession) {
 			n, err := master.Read(buf)
 			if n > 0 {
 				data := append([]byte(nil), buf[:n]...)
-				if session.observation != nil {
-					session.observation.record(data)
+				if session.observation != nil && session.observation.record(data) {
+					m.mu.Lock()
+					handler := m.onAttention
+					m.mu.Unlock()
+					if handler != nil {
+						handler(session.AgoraID, "approval_required")
+					}
 				}
 				broadcast(data)
 			}
