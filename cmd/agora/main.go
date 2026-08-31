@@ -18,7 +18,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: agora serve | agora server | agora daemon | agora pty <args...> | agora attach <session-id> | agora wrapper [session-id] | agora pi-wrapper [session-id] | agora claude-proxy [args...]")
+		fmt.Fprintln(os.Stderr, "usage: agora serve | agora server | agora daemon | agora pty <args...> | agora attach <session-id> | agora wrap <pi|claude> [session-id|prompt...] | agora wrapper [session-id] | agora pi-wrapper [session-id] | agora claude-proxy [args...]")
 		os.Exit(2)
 	}
 	var err error
@@ -45,14 +45,29 @@ func main() {
 		} else {
 			err = runAttach(os.Args[2])
 		}
+	case "wrap":
+		if len(os.Args) < 3 {
+			err = fmt.Errorf("wrap requires an agent: pi or claude")
+		} else {
+			switch os.Args[2] {
+			case "pi":
+				err = runPiWrapper(os.Args[3:])
+			case "claude", "claude-code":
+				err = runWrapper(os.Args[3:])
+			default:
+				err = fmt.Errorf("unsupported wrapper agent %q: expected pi or claude", os.Args[2])
+			}
+		}
 	case "wrapper":
+		// Backward-compatible alias for `agora wrap claude`.
 		err = runWrapper(os.Args[2:])
 	case "pi-wrapper":
+		// Backward-compatible alias for `agora wrap pi`.
 		err = runPiWrapper(os.Args[2:])
 	case "claude-proxy":
 		err = runClaudeProxy(os.Args[2:])
 	default:
-		fmt.Fprintln(os.Stderr, "usage: agora serve | agora pty <args...> | agora attach <session-id> | agora wrapper [session-id] | agora pi-wrapper [session-id] | agora claude-proxy [args...]")
+		fmt.Fprintln(os.Stderr, "usage: agora serve | agora pty <args...> | agora attach <session-id> | agora wrap <pi|claude> [session-id|prompt...] | agora wrapper [session-id] | agora pi-wrapper [session-id] | agora claude-proxy [args...]")
 		os.Exit(2)
 	}
 	if err != nil {

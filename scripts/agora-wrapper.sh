@@ -56,9 +56,9 @@ fi
 
 case "$agent" in
   pi)
-    exec "$agora_bin" pi-wrapper "$@"
+    exec "$agora_bin" wrap pi "$@"
     ;;
   claude|claude-code)
-    exec "$agora_bin" wrapper "$@"
+    exec "$agora_bin" wrap claude "$@"
     ;;
 esac

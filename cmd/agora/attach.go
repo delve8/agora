@@ -21,8 +21,8 @@ import (
 // this process only renders and forwards the terminal bytes.
 func runWrapper(args []string) error {
 	sessionID := ""
-	if len(args) > 0 && strings.HasPrefix(args[0], "sess-") {
-		sessionID = args[0]
+	if len(args) > 0 && looksLikeAgoraSessionID(args[0]) {
+		sessionID = strings.TrimSpace(args[0])
 	}
 	if sessionID == "" {
 		created, err := createWrapperSession()
