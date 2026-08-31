@@ -64,6 +64,7 @@ type PiProcess struct {
 
 type PiManager struct {
 	config           PiConfig
+	binaryErr        error
 	mu               sync.Mutex
 	processes        map[string]*PiProcess
 	intentionalStops map[string]bool
@@ -84,12 +85,19 @@ type PiExit struct {
 func NewPiManager(config PiConfig) *PiManager {
 	// Keep direct/local construction consistent with the daemon command. The
 	// explicit PiConfig value wins, then the conventional environment names,
-	// and finally the safe built-in defaults.
+	// and finally the safe built-in defaults. If `pi` resolves to the generic
+	// PATH wrapper, skip it and select the real Pi executable later in PATH.
 	if config.Binary == "" {
 		config.Binary = firstEnvValue("AGORA_PI_BINARY", "PI_BINARY")
 	}
-	if config.Binary == "" {
-		config.Binary = defaultPiBinary
+	var binaryErr error
+	if resolved, err := resolveAgentBinary(config.Binary, defaultPiBinary); err == nil {
+		config.Binary = resolved
+	} else {
+		binaryErr = err
+		if config.Binary == "" {
+			config.Binary = defaultPiBinary
+		}
 	}
 	if config.Provider == "" {
 		config.Provider = firstEnvValue("AGORA_PI_PROVIDER", "PI_PROVIDER")
@@ -103,7 +111,7 @@ func NewPiManager(config PiConfig) *PiManager {
 	if config.SessionDir == "" {
 		config.SessionDir = firstEnvValue("AGORA_PI_SESSION_DIR", "PI_SESSION_DIR")
 	}
-	return &PiManager{config: config, processes: make(map[string]*PiProcess), intentionalStops: make(map[string]bool)}
+	return &PiManager{config: config, binaryErr: binaryErr, processes: make(map[string]*PiProcess), intentionalStops: make(map[string]bool)}
 }
 
 func firstEnvValue(names ...string) string {
@@ -131,6 +139,9 @@ func (m *PiManager) Start(id, workspace, nativeID string) (*PiProcess, error) {
 }
 
 func (m *PiManager) start(id, workspace, nativeID, historyPath string) (*PiProcess, error) {
+	if m.binaryErr != nil {
+		return nil, m.binaryErr
+	}
 	m.mu.Lock()
 	if existing := m.processes[id]; existing != nil {
 		m.mu.Unlock()

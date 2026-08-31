@@ -106,9 +106,11 @@ The generic CLI entry point is `agora wrap pi` or `agora wrap claude`; the
 old `agora pi-wrapper` and `agora wrapper` commands remain compatibility
 aliases. The wrapper infers `pi` or `claude` from its symlink name, or accepts
 `AGORA_WRAPPER_AGENT=pi|claude`. Set `AGORA_BIN` if the `agora` binary is not
-on `PATH`. The Daemon must use the real Pi executable in
-`AGORA_PI_BINARY`—not the wrapper symlink—or it would recursively invoke the
-wrapper, for example:
+on `PATH`. The Daemon automatically skips the Agora wrapper when `pi` or `claude` is a
+bare command name in `PATH`, and resolves the next real executable. An
+explicit `AGORA_PI_BINARY` or `AGORA_CLAUDE_BINARY` should still point to the
+real executable; configuring the wrapper path explicitly is rejected to avoid
+recursion. For example:
 
 ```bash
 make start AGORA_PI_BINARY="$HOME/.nvm/versions/node/v24.13.0/bin/pi"

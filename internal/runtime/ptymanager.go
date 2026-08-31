@@ -27,6 +27,7 @@ import (
 // by Input() when a message arrives from the web UI or IM.
 type PTYManager struct {
 	binary    string
+	binaryErr error
 	homeDir   string
 	socketDir string
 
@@ -117,14 +118,23 @@ func (o *ptyObservation) snapshot() terminal.Snapshot {
 }
 
 func NewPTYManager(binary, homeDir string) *PTYManager {
-	if binary == "" {
-		binary = "claude"
+	var binaryErr error
+	if resolved, err := resolveAgentBinary(binary, "claude"); err == nil {
+		binary = resolved
+	} else {
+		binaryErr = err
+		if strings.TrimSpace(binary) == "" {
+			// Preserve the historical constructor contract; Launch reports the
+			// useful exec error if the real binary is not installed.
+			binary = "claude"
+		}
 	}
 	if homeDir == "" {
 		homeDir, _ = os.UserHomeDir()
 	}
 	return &PTYManager{
 		binary:           binary,
+		binaryErr:        binaryErr,
 		homeDir:          homeDir,
 		socketDir:        filepath.Join(os.TempDir(), "agora-pty"),
 		sessions:         make(map[string]*PTYSession),
@@ -155,6 +165,9 @@ func (m *PTYManager) IsRunning(agoraID string) bool {
 // otherwise it starts fresh. The Claude session id is read from the metadata
 // file (~/.claude/sessions/<pid>.json), which is written while the process runs.
 func (m *PTYManager) Launch(agoraID, workspace, claudeSession string) (*PTYSession, error) {
+	if m.binaryErr != nil {
+		return nil, m.binaryErr
+	}
 	m.mu.Lock()
 	if existing := m.sessions[agoraID]; existing != nil {
 		m.mu.Unlock()
