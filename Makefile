@@ -18,6 +18,7 @@ AGORA_PI_BINARY ?= $(if $(PI_BINARY),$(PI_BINARY),pi)
 AGORA_PI_PROVIDER ?= $(if $(PI_PROVIDER),$(PI_PROVIDER),anthropic)
 AGORA_PI_MODEL ?= $(PI_MODEL)
 AGORA_PI_SESSION_DIR ?= $(PI_SESSION_DIR)
+AGORA_WRAPPER_DIR ?= $(HOME)/.local/bin
 
 # Logto dev stack (Podman). `make server` uses these by default; set
 # AGORA_AUTH_MODE=local to skip Logto, or set AGORA_LOGTO_ISSUER/
@@ -44,7 +45,7 @@ LOGTO_POSTGRES_PASSWORD ?= agora-logto-dev
 
 .PHONY: all build build-go build-web web-install test e2e vet fmt clean \
         local server server-local daemon web start \
-        logto-up logto-bootstrap logto-down logto-purge logto-status
+        logto-up logto-bootstrap logto-down logto-purge logto-status install-wrapper
 
 all: build
 
@@ -141,6 +142,16 @@ logto-purge:
 
 logto-status:
 	$(PODMAN) compose -f "$(LOGTO_COMPOSE_FILE)" --project-name "$(LOGTO_PROJECT)" ps
+
+install-wrapper: build-go
+	@mkdir -p "$(AGORA_WRAPPER_DIR)"
+	@agora_path="$(AGORA_BIN)"; case "$$agora_path" in /*) ;; *) agora_path="$(CURDIR)/$$agora_path" ;; esac; \
+		ln -sf "$$agora_path" "$(AGORA_WRAPPER_DIR)/agora"
+	@ln -sf "$(CURDIR)/scripts/agora-wrapper.sh" "$(AGORA_WRAPPER_DIR)/pi"
+	@ln -sf "$(CURDIR)/scripts/agora-wrapper.sh" "$(AGORA_WRAPPER_DIR)/claude"
+	@echo "installed Agora wrappers: $(AGORA_WRAPPER_DIR)/pi and $(AGORA_WRAPPER_DIR)/claude"
+	@echo "Agora CLI linked at $(AGORA_WRAPPER_DIR)/agora"
+	@echo "ensure $(AGORA_WRAPPER_DIR) is before the real agent binaries and AGORA_PI_BINARY points to the real pi binary"
 
 clean:
 	rm -rf "$(BIN_DIR)" "$(WEB_DIR)/dist"

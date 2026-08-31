@@ -90,6 +90,31 @@ Pi session is started as an interactive TUI rather than RPC:
 ./agora pi-wrapper daemon/<daemon-id>/pi://<pi-session-id>
 ```
 
+To keep using the normal `pi` command while routing interactive sessions
+through the local Daemon, install the generic wrapper under the agent name:
+
+```bash
+make install-wrapper
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+The wrapper infers `pi` or `claude` from its symlink name, or accepts
+`AGORA_WRAPPER_AGENT=pi|claude`. Set `AGORA_BIN` if the `agora` binary is not
+on `PATH`. The Daemon must use the real Pi executable in
+`AGORA_PI_BINARY`—not the wrapper symlink—or it would recursively invoke the
+wrapper, for example:
+
+```bash
+make start AGORA_PI_BINARY="$HOME/.nvm/versions/node/v24.13.0/bin/pi"
+```
+
+The wrapper creates a new Session in the current directory and then attaches
+to the PTY created by the Daemon; an existing Agora Session ID is attached
+directly. Positional arguments after a new Pi invocation are sent as initial
+prompts. This wrapper intentionally exposes the managed interactive-session
+surface, not every Pi administrative option such as `pi auth`, `pi install`,
+or `pi --help`; use the real Pi binary for those commands.
+
 For a Logto-protected Server, set `AGORA_ACCESS_TOKEN` (or `AGORA_TOKEN`) for
 CLI API requests. The Pi process itself runs on the Daemon machine under a
 real PTY with `pi --session <history-file>` when resuming an existing session.

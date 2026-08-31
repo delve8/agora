@@ -98,7 +98,7 @@ func createWrapperSession() (string, error) {
 }
 
 func agoraAPIBase() string {
-	base := os.Getenv("AGORA_ADDR")
+	base := firstNonEmptyEnv("AGORA_ADDR", "AGORA_SERVER_URL")
 	if base == "" {
 		return "http://127.0.0.1:8080"
 	}
