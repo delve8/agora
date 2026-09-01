@@ -129,6 +129,45 @@ Agora Daemon
 
 Agora 的 resume API 以 canonical Session ID 为准；Daemon 解析 `pi://`，再将 native ID/path 交给 Pi driver。不能把 `--continue` 的“最近”行为作为远程恢复的唯一依据。
 
+### 3.4 TUI 内部 `/resume` 与运行时 rebind
+
+`--session-id <id>` 能准确建立 Pi 进程**启动时**的初始绑定，但不能单独保证 TUI 运行期间不会通过 `/resume` 或未来的 session picker 切换上下文。Agora 必须把这类切换视为 provider context rebind，而不是普通 user message。
+
+Pi adapter 的目标流程是：
+
+```text
+pi://A + A.jsonl
+      │
+      │ 检测到已提交的 /resume
+      ▼
+resume_pending
+      │
+      │ 记录时间和各 session history 的 cursor/size 基线
+      │ 观察后续用户输入
+      ▼
+扫描 Pi history 增量
+      │
+      │ 在时间窗口内找到另一个 workspace 相同的 pi://B，
+      │ 且 B 的新增 user message 与后续输入匹配
+      ▼
+原子 rebind 到 pi://B + B.jsonl
+```
+
+具体要求：
+
+- PTY 输入方向优先识别用户**提交**的 `/resume`，不能仅搜索 TUI 输出中的字符串；原始字节仍必须原样发送给 Pi；
+- 识别 `/resume` 后不立即更新 `AgentSessionID` 或 `HistoryPath`，先保存旧绑定和所有候选文件的 byte offset/record ID/size，进入 `resume_pending`；
+- 后续消息优先从 PTY 输入捕获，并与 `/resume` 之后各 JSONL 的新增 user record 匹配。匹配必须使用增量 cursor，不能因为旧 transcript 中存在同样文字就切换；
+- 使用 workspace、native session ID、输入提交时间、history record timestamp 和本地文件写入时间作为联合约束。重复内容只有在时间窗口和新增记录条件同时满足时才算候选；
+- 若只有一个明确候选，停止旧 observer，以目标文件末尾初始化新 cursor，更新 `AgentSessionID=pi://B`、`HistoryPath` 和运行 metadata，再启动新 observer；目标文件已有历史不能作为新 live event 重放；
+- canonical Agora ID 包含 native ID 时必须原子 rekey/更新 route，不能只修改 history path；
+- 没有后续输入、候选不唯一、history 延迟写入或无法确认时保持 pending/需人工确认，不猜测。Pi 如果能从 RPC `get_state` 或 context event 得到当前 native ID，应优先使用结构化状态确认，并用 history 匹配做校验；
+- rebind 后的扫描必须幂等，依靠 cursor 和稳定 external ID 去重。
+
+Pi adapter 的测试至少覆盖：`--session-id` 初始绑定、`/resume` 触发、不同 session 在时间窗口外的相同消息、history 延迟 flush、目标文件旧记录不重放、无后续消息、多个候选、rebind 后输入和 observer 重启恢复。
+
+该流程不是 Pi 独有的产品语义。Claude、OpenCode、Codex 或其他支持交互式 context switch 的 provider 也必须提供等价的 trigger、候选确认和原子 rebind；没有可靠状态或 history 证据的 provider 不得伪造 native identity。
+
 ## 4. History 接入
 
 ### 4.1 文件事实源

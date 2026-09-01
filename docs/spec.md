@@ -803,6 +803,14 @@ Agora 不自建密码、社交登录或多 provider 登录页面。显式认证�
 
 IM 通知使用 Agora 自己签发的短期 opaque notification capability link，而不是把 Logto access token、完整 Web session 或通用 API bearer token 放进消息。link 只绑定一个 Session 和 `scope=read_observation`，兑换后建立受限的 HttpOnly、Secure、SameSite cookie，并清理 URL 中的 token。它只允许读取目标 Session 的 metadata、history、SSE observation 和只读 PTY snapshot，禁止输入、resume、stop、attach 写入、审批、设备管理和通知配置。由于 provider 可能预取链接，短 TTL、scope 限制和撤销优先于“首次 GET 即永久消费”；token 泄露的后果明确限定为 TTL 内观察单个 Session，因此通知 target 必须视为可信接收边界。
 
+### ADR-017：交互式 Context Switch 必须通过证据确认并原子 rebind
+
+Managed Agent 的启动参数（例如 `pi --session-id <id>` 或 Claude 的 `--resume <id>`）只保证启动时的 native Session identity。若 provider 的 TUI、RPC 或 API 允许在同一进程内执行 `/resume`、session picker、`continue`、`switch` 或等价操作，Agent Runtime 必须检测 context-switch trigger，并进入 `resume_pending`，不能在看到命令时立即修改 Session 绑定。
+
+Runtime 应保存旧 native ID、history locator、observer cursor 和触发时间，然后使用 provider 后续提交的用户消息与各 history locator 的新增记录进行确认。匹配至少结合 native ID、workspace、增量 cursor、消息内容和有限时间窗口；文件 mtime、TUI 输出和标题只作为辅助证据。重复文本只有在目标 history 于触发后新增且时间约束满足时才构成候选。候选唯一且达到 provider 定义的置信度后，Runtime 必须原子更新 native ID、history locator、observer cursor、Session metadata 及 canonical route/rekey，再启动目标 observer；目标 history 中已有的旧记录不得重放为 live event。
+
+如果没有后续消息、history 尚未 flush、候选不唯一或证据不足，保持 pending/需人工确认，不猜测、不伪造 identity。能提供当前 context native ID 的结构化 RPC/HTTP/ACP provider 应优先使用该状态并以 history 交叉校验。Claude、Pi、OpenCode、Codex 及未来其他支持 context switch 的 provider 都必须实现等价的 trigger、确认和原子 rebind；无法可靠识别当前 context 的 provider 必须显式限制该能力或不自动 rebind。
+
 ## 13. 未决问题
 
 这些问题暂不阻塞 MVP：

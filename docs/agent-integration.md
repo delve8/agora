@@ -159,6 +159,71 @@ type Cursor struct {
 
 Claude 使用项目目录下的 `<session-id>.jsonl`；Pi 使用项目 key 目录下的 session JSONL；OpenCode 使用 SQLite database/session/message/part 查询或 provider export。通用 runtime 只保存 locator 和 cursor，不假定 `.claude`、文件名或 JSON 字段。
 
+### 2.6 运行时 Session rebind：处理 TUI/上下文切换
+
+一个 managed Agent 进程可能允许用户在原生交互界面中切换上下文，例如在 TUI 中执行 `/resume`，或使用 provider 自己的 session picker、`continue`、`switch`、`new context` 命令。启动时通过 `--session-id`、`--resume` 或等价参数建立的绑定，只能证明**启动时**的 Session identity；不能自动证明整个进程生命周期内 TUI 始终使用同一个 native Session。
+
+因此每个支持交互式上下文切换的 provider 都必须实现类似的运行时 rebind 机制。目标约束是：
+
+```text
+一个 Agora managed Session
+  ↔ 当前 Agent context 的一个 native Session
+  ↔ 当前 context 对应的 history locator
+```
+
+这不是 Server 的 provider-specific 协议，而是 Daemon/Agent Runtime 内部的状态机。Server 只接收 rebind 后的规范化 Session metadata 和事件。
+
+#### 触发、确认与提交
+
+rebind 分为三个阶段，不能在发现切换命令时立即改写绑定：
+
+```text
+bound(A)
+  └─ context-switch trigger（例如 /resume）
+       ↓
+resume_pending(A)
+       └─ 捕获后续用户输入 + 扫描 history 增量
+            ↓
+rebind_candidate(B)
+       └─ 证据满足 provider 策略后原子提交
+            ↓
+bound(B)
+```
+
+1. **触发**：由 provider-specific 的输入拦截器、结构化 live event、RPC/API state change 或原生 metadata 变化发现疑似 context switch。对 PTY 只能把用户提交的 `/resume`（而不是正在编辑的半行）作为触发信号；对 RPC/HTTP/ACP 优先使用结构化命令或 state event。触发信号不得改变发往 Agent 的原始输入。
+2. **pending**：保存旧 native ID、旧 locator、触发时间，以及所有可搜索 history locator 的基线 cursor（至少包括 byte offset/record ID/size）。此时继续使用旧绑定，但不把任何候选 Session 当成已确认事实。
+3. **候选匹配**：捕获切换完成后的第一条或后续用户消息，并读取各候选 history 在基线之后的新增记录。候选应同时满足：
+   - native Session ID 与旧 ID 不同；
+   - workspace/project 与当前运行上下文一致；
+   - history 在触发后出现新增记录，而不是只在旧 transcript 中找到相同文本；
+   - 新增 user message 与捕获输入在 provider parser 定义的规范化规则下精确匹配；
+   - record timestamp、写入观察时间和输入提交时间处于 provider 配置的有限窗口内；
+   - 候选唯一，或最高候选相对第二候选有明确安全间隔。
+4. **提交**：确认后停止旧 observer，以目标 history 的当前末尾建立新 cursor，更新 `AgentSessionID`、provider-native ID、history locator、workspace/name 等运行 metadata，再启动新 observer。目标 history 的旧内容由 history API 正常读取，但不得在 rebind 时作为新的 live event 重放。canonical ID 包含 native ID 时，必须通过 runtime 的原子 rekey/route update 保持 Agora ID 与 native ID 一致；不能只更新 `HistoryPath`。
+
+默认不依赖单一证据。history 内容是主要确认依据，文件 mtime/size 只是辅助排序，TUI 屏幕文本只作为辅助信号。PTY 输入方向优先于从 ANSI/VT 输出中反向提取消息；输入、prompt 和 tool 内容只在内存中短暂保留用于匹配，不进入普通日志或 Server 持久化。
+
+#### 不确定与失败处理
+
+- 只发现 `/resume` 而没有后续可匹配的消息时，保持 `resume_pending`，不自动切换；可设置有界超时，超时后回到 `bound(A)` 并记录 observation warning。
+- 候选为零、候选不唯一、workspace 不一致或时间窗口不满足时，不 rebind；应上报可解释的 `session_rebind_pending`/`session_rebind_ambiguous` 状态，而不是猜测。
+- 候选确认后如果目标 history 无法读取，保留旧绑定并报告错误；不得先删除旧 locator。
+- rebind 必须幂等。重复扫描同一追加记录不能重复发布事件，也不能重复 rekey；cursor 和 stable external ID 仍是去重事实。
+- provider 如果能直接提供“当前 context native ID”的结构化状态，应优先使用该状态确认，消息/history 推断只作为 fallback 或交叉校验。
+
+#### Provider 接入要求
+
+| Provider 能力 | 实现要求 |
+|---|---|
+| 启动时可指定 native ID | 使用明确的 `--session-id`、`--resume` 或等价参数建立初始绑定，并保存 locator/cursor 基线 |
+| 支持 TUI 内部切换 | 提供输入/屏幕触发检测，并用后续输入与 history 增量确认；不能只依赖 `/resume` 字符串 |
+| 支持结构化 RPC/HTTP/ACP | 优先消费 context/session state change event；保留同样的 pending、确认和原子提交语义 |
+| 可读取追加式 history | 按 locator/cursor 扫描切换后的新增记录，使用 provider parser 生成统一 `event.Event` |
+| 不能可靠识别当前 context | 不声明自动 rebind；进入 pending/需人工确认或限制该 TUI 命令，不能伪造 identity |
+| 无可切换 context | 明确声明 provider contract 不支持 rebind，并保证单个 process 的 identity 不会悄悄变化 |
+
+新增 provider 的验收必须至少覆盖：检测 context-switch trigger、相同内容的时间窗口排除、无后续输入、多个候选、history 延迟写入、目标 history 初始旧记录不重放、rebind 后继续发送输入和 observer 重启去重。
+
 ## 3. 接入模式
 
 ### 3.1 Managed process
