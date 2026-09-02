@@ -36,6 +36,7 @@ type PTYManager struct {
 	intentionalStops map[string]bool
 	onExit           func(PTYExit)
 	onAttention      func(string, string)
+	inputHandler     func(string, string)
 }
 
 type PTYExit struct {
@@ -56,7 +57,9 @@ type PTYSession struct {
 	SocketPath    string
 	StartedAt     time.Time
 
-	observation *ptyObservation
+	observation  *ptyObservation
+	inputHandler func(string, string)
+	mu           sync.Mutex
 }
 
 type ptyObservation struct {
@@ -154,6 +157,14 @@ func (m *PTYManager) SetAttentionHandler(handler func(string, string)) {
 	m.mu.Unlock()
 }
 
+// SetInputHandler observes submitted terminal lines without changing the bytes
+// sent to Claude. It is used for provider context-switch detection.
+func (m *PTYManager) SetInputHandler(handler func(string, string)) {
+	m.mu.Lock()
+	m.inputHandler = handler
+	m.mu.Unlock()
+}
+
 func (m *PTYManager) IsRunning(agoraID string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -162,9 +173,35 @@ func (m *PTYManager) IsRunning(agoraID string) bool {
 
 // Launch starts a Claude Code process for the given Agora session under a PTY.
 // If claudeSession is non-empty it resumes that conversation (--resume);
-// otherwise it starts fresh. The Claude session id is read from the metadata
-// file (~/.claude/sessions/<pid>.json), which is written while the process runs.
+// otherwise it starts fresh and lets Claude choose its native session id.
+func (m *PTYManager) Command(claudeSession string) []string {
+	args := []string{m.binary}
+	if claudeSession != "" {
+		args = append(args, "--resume", claudeSession)
+	}
+	return args
+}
+
+func (m *PTYManager) FreshCommand(claudeSession string) []string {
+	return []string{m.binary, "--session-id", claudeSession}
+}
+
 func (m *PTYManager) Launch(agoraID, workspace, claudeSession string) (*PTYSession, error) {
+	return m.launch(agoraID, workspace, claudeSession, false)
+}
+
+// LaunchWithSessionID starts a fresh Claude conversation with a caller-selected
+// native id. This is used by split Daemon creation so the Server can receive a
+// canonical session identity immediately instead of waiting for Claude's
+// metadata file (which may not be written until after project trust is handled).
+func (m *PTYManager) LaunchWithSessionID(agoraID, workspace, sessionID string) (*PTYSession, error) {
+	if sessionID == "" {
+		return nil, fmt.Errorf("Claude session id is required")
+	}
+	return m.launch(agoraID, workspace, sessionID, true)
+}
+
+func (m *PTYManager) launch(agoraID, workspace, claudeSession string, freshSessionID bool) (*PTYSession, error) {
 	if m.binaryErr != nil {
 		return nil, m.binaryErr
 	}
@@ -176,7 +213,9 @@ func (m *PTYManager) Launch(agoraID, workspace, claudeSession string) (*PTYSessi
 	m.mu.Unlock()
 
 	args := []string{m.binary}
-	if claudeSession != "" {
+	if freshSessionID {
+		args = append(args, "--session-id", claudeSession)
+	} else if claudeSession != "" {
 		args = append(args, "--resume", claudeSession)
 	}
 	cmd := exec.Command(args[0], args[1:]...)
@@ -198,6 +237,9 @@ func (m *PTYManager) Launch(agoraID, workspace, claudeSession string) (*PTYSessi
 		return nil, fmt.Errorf("listen %s: %w", socketPath, err)
 	}
 
+	m.mu.Lock()
+	inputHandler := m.inputHandler
+	m.mu.Unlock()
 	session := &PTYSession{
 		AgoraID:       agoraID,
 		Workspace:     workspace,
@@ -208,6 +250,7 @@ func (m *PTYManager) Launch(agoraID, workspace, claudeSession string) (*PTYSessi
 		StartedAt:     time.Now().UTC(),
 		ClaudeSession: claudeSession,
 		observation:   newPTYObservation(),
+		inputHandler:  inputHandler,
 	}
 	go m.serveAttach(session)
 
@@ -246,18 +289,21 @@ func (m *PTYManager) Launch(agoraID, workspace, claudeSession string) (*PTYSessi
 			exitCode = cmd.ProcessState.ExitCode()
 		}
 		m.mu.Lock()
-		delete(m.sessions, agoraID)
-		intentional := m.intentionalStops[agoraID]
-		delete(m.intentionalStops, agoraID)
-		handler := m.onExit
+		session.mu.Lock()
+		currentID := session.AgoraID
 		claudeSession := session.ClaudeSession
+		session.mu.Unlock()
+		delete(m.sessions, currentID)
+		intentional := m.intentionalStops[currentID]
+		delete(m.intentionalStops, currentID)
+		handler := m.onExit
 		m.mu.Unlock()
 		_ = listener.Close()
 		_ = file.Close()
 		if handler != nil {
-			handler(PTYExit{AgoraID: agoraID, ClaudeSession: claudeSession, ExitCode: exitCode, Err: waitErr, Intentional: intentional})
+			handler(PTYExit{AgoraID: currentID, ClaudeSession: claudeSession, ExitCode: exitCode, Err: waitErr, Intentional: intentional})
 		}
-		log.Printf("agora: managed session %s process exited", agoraID)
+		log.Printf("agora: managed session %s process exited", currentID)
 	}()
 
 	return session, nil
@@ -275,6 +321,9 @@ func (m *PTYManager) Input(agoraID, content string) error {
 		return fmt.Errorf("managed session %s is not running", agoraID)
 	}
 	_, err := io.WriteString(session.Master, content+"\r")
+	if err == nil && session.inputHandler != nil && strings.TrimSpace(content) != "" {
+		session.inputHandler(session.AgoraID, content)
+	}
 	return err
 }
 
@@ -340,7 +389,13 @@ func (m *PTYManager) WaitClaudeSessionID(ctx context.Context, agoraID string) (s
 	}
 }
 func (m *PTYManager) Rekey(oldID, newID string) error {
-	if oldID == "" || newID == "" || oldID == newID {
+	return m.Rebind(oldID, newID, "")
+}
+
+// Rebind changes the logical Agora key and optionally the provider-native
+// identity while keeping the same running PTY process.
+func (m *PTYManager) Rebind(oldID, newID, nativeID string) error {
+	if oldID == "" || newID == "" {
 		return fmt.Errorf("invalid PTY session rekey")
 	}
 	m.mu.Lock()
@@ -349,12 +404,17 @@ func (m *PTYManager) Rekey(oldID, newID string) error {
 	if value == nil {
 		return fmt.Errorf("managed session %s is not running", oldID)
 	}
-	if m.sessions[newID] != nil {
-		return fmt.Errorf("managed session %s already exists", newID)
+	if oldID != newID {
+		if m.sessions[newID] != nil {
+			return fmt.Errorf("managed session %s already exists", newID)
+		}
+		delete(m.sessions, oldID)
 	}
 	value.AgoraID = newID
+	if nativeID != "" {
+		value.ClaudeSession = nativeID
+	}
 	m.sessions[newID] = value
-	delete(m.sessions, oldID)
 	return nil
 }
 
@@ -459,8 +519,8 @@ func (m *PTYManager) serveAttach(session *PTYSession) {
 					}
 				}
 			}()
-			// Client keyboard -> master.
-			_, _ = io.Copy(master, c.conn)
+			// Client keyboard -> master, while observing submitted lines.
+			copyTerminalInput(master, c.conn, func() string { m.mu.Lock(); defer m.mu.Unlock(); return session.AgoraID }, session.inputHandler)
 		}(c)
 	}
 }

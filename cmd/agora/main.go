@@ -18,7 +18,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: agora serve | agora server | agora daemon | agora pty <args...> | agora attach <session-id> | agora wrap <pi|claude> [session-id|prompt...] | agora wrapper [session-id] | agora pi-wrapper [session-id] | agora claude-proxy [args...]")
+		fmt.Fprintln(os.Stderr, "usage: agora serve | agora server | agora daemon | agora session-host --config <path> | agora pty <args...> | agora attach <session-id> | agora wrap <pi|claude> [session-id|prompt...] | agora wrapper [session-id] | agora pi-wrapper [session-id] | agora claude-proxy [args...]")
 		os.Exit(2)
 	}
 	var err error
@@ -27,6 +27,8 @@ func main() {
 		err = serve()
 	case "server":
 		err = runServer()
+	case "session-host":
+		err = runSessionHost(os.Args[2:])
 	case "daemon":
 		pairCode := ""
 		if len(os.Args) == 4 && os.Args[2] == "--pair" {
@@ -67,7 +69,7 @@ func main() {
 	case "claude-proxy":
 		err = runClaudeProxy(os.Args[2:])
 	default:
-		fmt.Fprintln(os.Stderr, "usage: agora serve | agora pty <args...> | agora attach <session-id> | agora wrap <pi|claude> [session-id|prompt...] | agora wrapper [session-id] | agora pi-wrapper [session-id] | agora claude-proxy [args...]")
+		fmt.Fprintln(os.Stderr, "usage: agora serve | agora server | agora daemon | agora session-host --config <path> | agora pty <args...> | agora attach <session-id> | agora wrap <pi|claude> [session-id|prompt...] | agora wrapper [session-id] | agora pi-wrapper [session-id] | agora claude-proxy [args...]")
 		os.Exit(2)
 	}
 	if err != nil {

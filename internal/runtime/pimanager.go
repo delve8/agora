@@ -1,7 +1,9 @@
 package runtime
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -51,15 +53,16 @@ type PiProcess struct {
 	Process    *os.Process
 	SocketPath string
 
-	observation *ptyObservation
-	master      *os.File
-	listener    net.Listener
-	cmd         *exec.Cmd
-	mu          sync.Mutex
-	closed      bool
-	done        chan struct{}
-	replayMu    sync.Mutex
-	replay      [][]byte
+	observation  *ptyObservation
+	master       *os.File
+	listener     net.Listener
+	cmd          *exec.Cmd
+	mu           sync.Mutex
+	closed       bool
+	done         chan struct{}
+	inputHandler func(string, string)
+	replayMu     sync.Mutex
+	replay       [][]byte
 }
 
 type PiManager struct {
@@ -69,6 +72,7 @@ type PiManager struct {
 	processes        map[string]*PiProcess
 	intentionalStops map[string]bool
 	onExit           func(PiExit)
+	inputHandler     func(string, string)
 }
 
 type PiExit struct {
@@ -128,17 +132,123 @@ func (m *PiManager) SetExitHandler(handler func(PiExit)) {
 	m.onExit = handler
 	m.mu.Unlock()
 }
+
+// SetInputHandler observes submitted terminal lines without changing the bytes
+// sent to Pi. It is used by the runtime to detect provider context commands.
+func (m *PiManager) SetInputHandler(handler func(string, string)) {
+	m.mu.Lock()
+	m.inputHandler = handler
+	m.mu.Unlock()
+}
 func (m *PiManager) SessionDir() string { return m.config.SessionDir }
+
+// Command returns the exact provider command used for a managed Pi session.
+// Session Host uses it so the Agent process is created outside the Daemon.
+func (m *PiManager) Command(nativeID, historyPath string, agentArgs []string) []string {
+	args := []string{m.config.Binary}
+	if len(agentArgs) > 0 {
+		return append(args, agentArgs...)
+	}
+	if m.config.Provider != "" {
+		args = append(args, "--provider", m.config.Provider)
+	}
+	if m.config.Model != "" {
+		args = append(args, "--model", m.config.Model)
+	}
+	if m.config.SessionDir != "" {
+		args = append(args, "--session-dir", m.config.SessionDir)
+	}
+	if historyPath != "" {
+		args = append(args, "--session", historyPath)
+	} else if nativeID != "" {
+		args = append(args, "--session-id", nativeID)
+	}
+	return args
+}
 func (m *PiManager) IsRunning(id string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.processes[id] != nil
 }
 func (m *PiManager) Start(id, workspace, nativeID string) (*PiProcess, error) {
-	return m.start(id, workspace, nativeID, "")
+	return m.StartWithArgs(id, workspace, nativeID, nil)
 }
 
-func (m *PiManager) start(id, workspace, nativeID, historyPath string) (*PiProcess, error) {
+func (m *PiManager) StartWithArgs(id, workspace, nativeID string, agentArgs []string) (*PiProcess, error) {
+	// The argument slice is owned by Pi and is passed through unchanged. We may
+	// inspect an explicit session selector only for Agora's local bookkeeping;
+	// it is never removed, reordered, or rewritten in the child argv.
+	if nativeID == "" {
+		nativeID = m.nativeIDFromArgs(agentArgs)
+	}
+	return m.start(id, workspace, nativeID, "", agentArgs)
+}
+
+func (m *PiManager) nativeIDFromArgs(args []string) string {
+	candidate := ""
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		if arg == "--session" || arg == "--session-id" {
+			if index+1 < len(args) {
+				candidate = strings.TrimSpace(args[index+1])
+			}
+			index++
+			continue
+		}
+		for _, flag := range []string{"--session=", "--session-id="} {
+			if strings.HasPrefix(arg, flag) {
+				candidate = strings.TrimSpace(strings.TrimPrefix(arg, flag))
+			}
+		}
+	}
+	if candidate == "" {
+		return ""
+	}
+	if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+		if nativeID := piSessionIDFromFile(candidate); nativeID != "" {
+			return nativeID
+		}
+	}
+	if strings.ContainsAny(candidate, `/\\`) {
+		return ""
+	}
+	root := m.config.SessionDir
+	if root == "" {
+		home, _ := os.UserHomeDir()
+		root = filepath.Join(home, ".pi", "agent", "sessions")
+	}
+	if values, err := adapter.NewPiHistoryCatalog("", root).List(context.Background()); err == nil {
+		for _, value := range values {
+			if value.SessionID == candidate || (len(candidate) >= 8 && strings.HasPrefix(value.SessionID, candidate)) {
+				return value.SessionID
+			}
+		}
+	}
+	// Keep the supplied value as a best-effort identity. Pi itself remains the
+	// authority for whether this selector is valid.
+	return candidate
+}
+
+func piSessionIDFromFile(path string) string {
+	file, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+	var raw map[string]any
+	scanner := bufio.NewScanner(file)
+	if !scanner.Scan() || json.Unmarshal(scanner.Bytes(), &raw) != nil {
+		return ""
+	}
+	for _, key := range []string{"id", "sessionId", "session_id"} {
+		if value, ok := raw[key].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func (m *PiManager) start(id, workspace, nativeID, historyPath string, agentArgs []string) (*PiProcess, error) {
 	if m.binaryErr != nil {
 		return nil, m.binaryErr
 	}
@@ -149,22 +259,8 @@ func (m *PiManager) start(id, workspace, nativeID, historyPath string) (*PiProce
 	}
 	m.mu.Unlock()
 
-	args := []string{m.config.Binary, "--provider", m.config.Provider}
-	if m.config.Model != "" {
-		args = append(args, "--model", m.config.Model)
-	}
-	if m.config.SessionDir != "" {
-		args = append(args, "--session-dir", m.config.SessionDir)
-	}
-	if historyPath != "" {
-		// Resume with the concrete JSONL path. --resume opens Pi's interactive
-		// session picker and is not suitable for a managed process.
-		args = append(args, "--session", historyPath)
-	} else if nativeID != "" {
-		// A fresh session can use a stable native id immediately, avoiding a
-		// race between the visible TUI and history catalog discovery.
-		args = append(args, "--session-id", nativeID)
-	}
+	args := m.Command(nativeID, historyPath, agentArgs)
+	// Command preserves caller-owned arguments and provider defaults exactly.
 	log.Printf("agora: starting Pi session %s in %s: %s", id, workspace, strings.Join(args, " "))
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Dir = workspace
@@ -186,7 +282,10 @@ func (m *PiManager) start(id, workspace, nativeID, historyPath string) (*PiProce
 		_ = cmd.Process.Kill()
 		return nil, fmt.Errorf("listen Pi attach socket: %w", err)
 	}
-	process := &PiProcess{AgoraID: id, PID: cmd.Process.Pid, NativeID: nativeID, Workspace: workspace, Process: cmd.Process, SocketPath: listener.Addr().String(), observation: newPTYObservation(), master: master, listener: listener, cmd: cmd, done: make(chan struct{})}
+	m.mu.Lock()
+	inputHandler := m.inputHandler
+	m.mu.Unlock()
+	process := &PiProcess{AgoraID: id, PID: cmd.Process.Pid, NativeID: nativeID, Workspace: workspace, Process: cmd.Process, SocketPath: listener.Addr().String(), observation: newPTYObservation(), master: master, listener: listener, cmd: cmd, done: make(chan struct{}), inputHandler: inputHandler}
 	events := make(chan PiEvent, piEventBuffer)
 	process.Events = events
 	m.mu.Lock()
@@ -202,20 +301,21 @@ func (m *PiManager) start(id, workspace, nativeID, historyPath string) (*PiProce
 			code = cmd.ProcessState.ExitCode()
 		}
 		m.mu.Lock()
-		delete(m.processes, id)
-		intentional := m.intentionalStops[id]
-		delete(m.intentionalStops, id)
-		m.mu.Unlock()
 		process.mu.Lock()
+		currentID := process.AgoraID
 		process.closed = true
 		process.mu.Unlock()
+		delete(m.processes, currentID)
+		intentional := m.intentionalStops[currentID]
+		delete(m.intentionalStops, currentID)
+		m.mu.Unlock()
 		close(process.done)
 		_ = listener.Close()
 		_ = master.Close()
 		close(events)
-		log.Printf("agora: Pi session %s process exited pid=%d code=%d err=%v", id, cmd.Process.Pid, code, waitErr)
+		log.Printf("agora: Pi session %s process exited pid=%d code=%d err=%v", currentID, cmd.Process.Pid, code, waitErr)
 		if onExit != nil {
-			onExit(PiExit{AgoraID: id, NativeID: process.nativeID(), ExitCode: code, Err: waitErr, Intentional: intentional})
+			onExit(PiExit{AgoraID: currentID, NativeID: process.nativeID(), ExitCode: code, Err: waitErr, Intentional: intentional})
 		}
 	}()
 	return process, nil
@@ -266,18 +366,29 @@ func (m *PiManager) discoverNativeID(process *PiProcess, historyPath string) {
 }
 
 func (m *PiManager) Rekey(oldID, newID string) error {
+	return m.Rebind(oldID, newID, "")
+}
+
+// Rebind changes both the Agora process key and, when supplied, the native Pi
+// context identity discovered after an in-process /resume.
+func (m *PiManager) Rebind(oldID, newID, nativeID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	process := m.processes[oldID]
 	if process == nil {
 		return fmt.Errorf("Pi session %s is not running", oldID)
 	}
-	if _, ok := m.processes[newID]; ok {
-		return fmt.Errorf("Pi session %s already exists", newID)
+	if oldID != newID {
+		if _, ok := m.processes[newID]; ok {
+			return fmt.Errorf("Pi session %s already exists", newID)
+		}
+		delete(m.processes, oldID)
 	}
-	delete(m.processes, oldID)
 	process.mu.Lock()
 	process.AgoraID = newID
+	if nativeID != "" {
+		process.NativeID = nativeID
+	}
 	process.mu.Unlock()
 	m.processes[newID] = process
 	return nil
@@ -290,7 +401,7 @@ func (m *PiManager) Resume(id, workspace, nativeID, historyPath string) (*PiProc
 	if historyPath == "" {
 		return nil, errors.New("Pi session history path is required")
 	}
-	return m.start(id, workspace, nativeID, historyPath)
+	return m.start(id, workspace, nativeID, historyPath, nil)
 }
 func (m *PiManager) NativeID(id string) string {
 	m.mu.Lock()
@@ -318,16 +429,23 @@ func (m *PiManager) Send(ctx context.Context, id, content string) error {
 		return fmt.Errorf("Pi session %s is not running", id)
 	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.closed {
+		p.mu.Unlock()
 		return errors.New("Pi process is closed")
 	}
 	select {
 	case <-ctx.Done():
+		p.mu.Unlock()
 		return ctx.Err()
 	default:
 	}
 	_, err := io.WriteString(p.master, content+"\r")
+	handler := p.inputHandler
+	agoraID := p.AgoraID
+	p.mu.Unlock()
+	if err == nil && handler != nil && strings.TrimSpace(content) != "" {
+		handler(agoraID, content)
+	}
 	return err
 }
 func (m *PiManager) Interrupt(ctx context.Context, id string) error { return m.Send(ctx, id, "\x03") }
@@ -380,8 +498,12 @@ func (m *PiManager) Close() {
 	}
 }
 
-func (p *PiProcess) nativeID() string      { p.mu.Lock(); defer p.mu.Unlock(); return p.NativeID }
-func (p *PiProcess) setNativeID(id string) { p.mu.Lock(); p.NativeID = id; p.mu.Unlock() }
+func (p *PiProcess) nativeID() string { p.mu.Lock(); defer p.mu.Unlock(); return p.NativeID }
+func (p *PiProcess) setNativeID(id string) {
+	p.mu.Lock()
+	p.NativeID = id
+	p.mu.Unlock()
+}
 func (p *PiProcess) recordOutput(data []byte) {
 	p.replayMu.Lock()
 	p.replay = append(p.replay, append([]byte(nil), data...))
@@ -482,7 +604,7 @@ func (m *PiManager) serveAttach(p *PiProcess) {
 					}
 				}
 			}()
-			_, _ = io.Copy(p.master, conn)
+			copyTerminalInput(p.master, conn, func() string { p.mu.Lock(); defer p.mu.Unlock(); return p.AgoraID }, p.inputHandler)
 		}()
 	}
 }

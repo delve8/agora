@@ -60,17 +60,19 @@ func runDaemon(pairCode string) error {
 		return err
 	}
 	d, err := daemon.New(daemon.Config{
-		ID:             daemonID,
-		Version:        firstEnv("AGORA_VERSION", "dev"),
-		ServerURL:      daemonWSURL(firstEnv("AGORA_SERVER_URL", "http://127.0.0.1:8080")),
-		Credential:     credential,
-		CredentialPath: os.Getenv("AGORA_DEVICE_CREDENTIAL_PATH"),
-		ClaudeBinary:   os.Getenv("AGORA_CLAUDE_BINARY"),
-		PiBinary:       firstEnv("AGORA_PI_BINARY", "PI_BINARY"),
-		PiProvider:     firstEnv("AGORA_PI_PROVIDER", "PI_PROVIDER"),
-		PiModel:        firstEnv("AGORA_PI_MODEL", "PI_MODEL"),
-		PiSessionDir:   firstEnv("AGORA_PI_SESSION_DIR", "PI_SESSION_DIR"),
-		HomeDir:        os.Getenv("HOME"),
+		ID:                 daemonID,
+		Version:            firstEnv("AGORA_VERSION", "dev"),
+		ServerURL:          daemonWSURL(firstEnv("AGORA_SERVER_URL", "http://127.0.0.1:8080")),
+		Credential:         credential,
+		CredentialPath:     os.Getenv("AGORA_DEVICE_CREDENTIAL_PATH"),
+		ClaudeBinary:       os.Getenv("AGORA_CLAUDE_BINARY"),
+		PiBinary:           firstEnv("AGORA_PI_BINARY", "PI_BINARY"),
+		PiProvider:         firstEnv("AGORA_PI_PROVIDER", "PI_PROVIDER"),
+		PiModel:            firstEnv("AGORA_PI_MODEL", "PI_MODEL"),
+		PiSessionDir:       firstEnv("AGORA_PI_SESSION_DIR", "PI_SESSION_DIR"),
+		LocalSocketPath:    os.Getenv("AGORA_DAEMON_SOCKET"),
+		HomeDir:            os.Getenv("HOME"),
+		SessionHostEnabled: true,
 	})
 	if err != nil {
 		return err
@@ -191,14 +193,24 @@ func firstEnv(names ...string) string {
 
 func daemonWSURL(value string) string {
 	value = strings.TrimRight(strings.TrimSpace(value), "/")
+	const suffix = "/api/daemon/ws"
+	if strings.HasSuffix(value, suffix) {
+		if strings.HasPrefix(value, "https://") {
+			return "wss://" + strings.TrimPrefix(value, "https://")
+		}
+		if strings.HasPrefix(value, "http://") {
+			return "ws://" + strings.TrimPrefix(value, "http://")
+		}
+		return value
+	}
 	if strings.HasPrefix(value, "ws://") || strings.HasPrefix(value, "wss://") {
-		return value + "/api/daemon/ws"
+		return value + suffix
 	}
 	if strings.HasPrefix(value, "https://") {
-		return "wss://" + strings.TrimPrefix(value, "https://") + "/api/daemon/ws"
+		return "wss://" + strings.TrimPrefix(value, "https://") + suffix
 	}
 	if strings.HasPrefix(value, "http://") {
-		return "ws://" + strings.TrimPrefix(value, "http://") + "/api/daemon/ws"
+		return "ws://" + strings.TrimPrefix(value, "http://") + suffix
 	}
-	return "ws://" + value + "/api/daemon/ws"
+	return "ws://" + value + suffix
 }

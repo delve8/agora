@@ -1,8 +1,8 @@
 # Session Host 设计
 
-> 状态：Design / Daemon 重启保持 Agent 运行态
+> 状态：Design + Phase B prototype / Daemon 重启保持 Agent 运行态
 >
-> 本文定义 Agora 如何通过独立的 per-session `session-host` 进程托管 Pi、Claude 以及未来其他 Agent，使 Daemon 重启、升级或短暂崩溃不自动终止正在运行的 Agent。本文是目标架构，不代表当前仓库已经完成 session-host 实现。
+> 本文定义 Agora 如何通过独立的 per-session `session-host` 进程托管 Pi、Claude 以及未来其他 Agent，使 Daemon 重启、升级或短暂崩溃不自动终止正在运行的 Agent。当前仓库已提供独立 `agora session-host --config <path>`、control/attach socket、metadata、token handshake、Agent exit cleanup，以及 Daemon 侧的创建/接管基础；完整生产级接管、事件流和所有 provider 路径仍按本文实施计划推进。
 
 ## 1. 背景与目标
 
