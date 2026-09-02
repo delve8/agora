@@ -20,6 +20,7 @@ const (
 	SessionCreate          = "session.create"
 	SessionCreated         = "session.created"
 	SessionUpdate          = "session.update"
+	SessionRebind          = "session.rebind"
 	EventBatch             = "event.batch"
 	SessionHistoryRequest  = "session.history.request"
 	SessionHistoryResponse = "session.history.response"
@@ -71,7 +72,7 @@ func ValidateType(typ string) error {
 	switch typ {
 	case DaemonRegister, DaemonRegistered, DaemonHeartbeat, DaemonHeartbeatAck,
 		DaemonResync, ServerResyncRequest, SessionCreate, SessionCreated,
-		SessionUpdate, EventBatch, SessionHistoryRequest, SessionHistoryResponse,
+		SessionUpdate, SessionRebind, EventBatch, SessionHistoryRequest, SessionHistoryResponse,
 		SnapshotRequest, SnapshotResponse, AttachRequest, AttachResponse, SessionInput, SessionInputResult,
 		SessionStop, SessionStopResult, SessionExit, Ack, Error:
 		return nil
@@ -139,14 +140,15 @@ type ResyncPayload struct {
 }
 
 type SessionCreatePayload struct {
-	SessionID      string `json:"session_id,omitempty"`
-	CoordinationID string `json:"coordination_id,omitempty"`
-	Workspace      string `json:"workspace"`
-	DisplayName    string `json:"display_name,omitempty"`
-	Role           string `json:"role,omitempty"`
-	Agent          string `json:"agent,omitempty"`
-	ResumeID       string `json:"resume_id,omitempty"`
-	HistoryPath    string `json:"history_path,omitempty"`
+	SessionID      string   `json:"session_id,omitempty"`
+	CoordinationID string   `json:"coordination_id,omitempty"`
+	Workspace      string   `json:"workspace"`
+	AgentArgs      []string `json:"agent_args,omitempty"`
+	DisplayName    string   `json:"display_name,omitempty"`
+	Role           string   `json:"role,omitempty"`
+	Agent          string   `json:"agent,omitempty"`
+	ResumeID       string   `json:"resume_id,omitempty"`
+	HistoryPath    string   `json:"history_path,omitempty"`
 	// DaemonID, when set, tells the receiving daemon which device the session
 	// is expected to run on. The server only sends the frame to that daemon's
 	// connection; the field lets the daemon verify the target defensively.
@@ -165,6 +167,15 @@ type SessionCreatedPayload struct {
 	HistoryPath     string          `json:"history_path,omitempty"`
 	Capabilities    map[string]bool `json:"capabilities,omitempty"`
 	Error           string          `json:"error,omitempty"`
+}
+
+type SessionRebindPayload struct {
+	OldSessionID   string `json:"old_session_id"`
+	NewSessionID   string `json:"new_session_id"`
+	DaemonID       string `json:"daemon_id,omitempty"`
+	Agent          string `json:"agent,omitempty"`
+	AgentSessionID string `json:"agent_session_id,omitempty"`
+	HistoryPath    string `json:"history_path,omitempty"`
 }
 
 type SessionUpdatePayload struct {
@@ -214,6 +225,26 @@ type SnapshotPayload struct {
 
 type AttachPayload struct {
 	SessionID string `json:"session_id"`
+	Socket    string `json:"socket,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+// WrapperRequest and WrapperResponse are the local Unix-socket protocol used
+// by the installed `pi`/`claude` command wrappers. The wrapper never carries a
+// Web-user token; the Daemon authenticates to the Server with its device
+// credential and returns an attach address on the same workstation.
+type WrapperRequest struct {
+	SessionID   string   `json:"session_id,omitempty"`
+	Workspace   string   `json:"workspace,omitempty"`
+	AgentArgs   []string `json:"agent_args,omitempty"`
+	DisplayName string   `json:"display_name,omitempty"`
+	Role        string   `json:"role,omitempty"`
+	Agent       string   `json:"agent,omitempty"`
+	Prompts     []string `json:"prompts,omitempty"`
+}
+
+type WrapperResponse struct {
+	SessionID string `json:"session_id,omitempty"`
 	Socket    string `json:"socket,omitempty"`
 	Error     string `json:"error,omitempty"`
 }

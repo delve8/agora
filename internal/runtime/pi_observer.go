@@ -28,22 +28,36 @@ func (m *Manager) StartPiObserver(value session.Session) error {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	m.piObservers[value.ID] = cancel
+	m.piObserverTokens[value.ID]++
+	token := m.piObserverTokens[value.ID]
 	m.mu.Unlock()
-	go m.observePi(ctx, value)
+	go m.observePi(ctx, value, token)
 	return nil
 }
 
 func (m *Manager) StopPiObserver(id string) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.stopPiObserverLocked(id)
+}
+
+func (m *Manager) stopPiObserverLocked(id string) {
 	if cancel := m.piObservers[id]; cancel != nil {
 		cancel()
 		delete(m.piObservers, id)
 	}
+}
+
+func (m *Manager) stopPiObserverIfCurrent(id string, token uint64) {
+	m.mu.Lock()
+	if m.piObserverTokens[id] == token {
+		m.stopPiObserverLocked(id)
+	}
 	m.mu.Unlock()
 }
 
-func (m *Manager) observePi(ctx context.Context, value session.Session) {
-	defer m.StopPiObserver(value.ID)
+func (m *Manager) observePi(ctx context.Context, value session.Session, token uint64) {
+	defer m.stopPiObserverIfCurrent(value.ID, token)
 	cursor, err := m.store.GetObservationCursor(ctx, value.ID)
 	if isCursorNotFound(err) {
 		cursor = store.ObservationCursor{SessionID: value.ID, Path: value.HistoryPath}
@@ -74,6 +88,7 @@ func (m *Manager) observePi(ctx context.Context, value session.Session) {
 				if cursor.Path != "" {
 					value.HistoryPath = cursor.Path
 					_ = m.store.UpdateSessionObservation(ctx, value)
+					m.notifySessionUpdate(value)
 				}
 			}
 		}
@@ -93,12 +108,14 @@ func (m *Manager) observePi(ctx context.Context, value session.Session) {
 						value.DisplayName = record.SessionName
 						value.DisplayNameSource = session.DisplayNameSourceCustom
 						_ = m.store.UpdateSessionDisplayName(ctx, value.ID, record.SessionName, session.DisplayNameSourceCustom)
+						m.notifySessionUpdate(value)
 					} else if record.Event.Kind == event.KindUser && session.CanApplyFirstUserName(value) && !adapter.IsPiBootstrapPrompt(record.Event.Content) {
 						name := session.DescribeMessage(record.Event.Content)
 						if name != "" {
 							value.DisplayName = name
 							value.DisplayNameSource = session.DisplayNameSourceFirstUser
 							_ = m.store.UpdateSessionDisplayName(ctx, value.ID, name, session.DisplayNameSourceFirstUser)
+							m.notifySessionUpdate(value)
 						}
 					}
 					cursor.ByteOffset = record.Cursor.ByteOffset

@@ -84,6 +84,36 @@ done
 	}
 }
 
+func TestPiManagerForwardsAgentArgsUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "pi")
+	argsPath := filepath.Join(dir, "args")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + argsPath + "\nsleep 2\n"
+	if err := os.WriteFile(binary, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewPiManager(PiConfig{Binary: binary})
+	_, err := manager.StartWithArgs("agora-args", dir, "", []string{"--session", "native-id", "--model", "model-id", "initial prompt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if data, readErr := os.ReadFile(argsPath); readErr == nil {
+			got := strings.Split(strings.TrimSpace(string(data)), "\n")
+			want := []string{"--session", "native-id", "--model", "model-id", "initial prompt"}
+			if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+				t.Fatalf("Pi arguments = %#v, want %#v", got, want)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("Pi did not receive forwarded arguments")
+}
+
 func dialUnix(path string) (net.Conn, error) {
 	return net.Dial("unix", path)
 }

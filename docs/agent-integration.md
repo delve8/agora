@@ -34,7 +34,7 @@ Server、Web 和通知层只依赖 canonical ID、规范化事件和能力，不
 |---|---|---|
 | PTY / Unix socket | Claude Code 原生 TUI | terminal attach、raw snapshot、键盘输入、信号控制 |
 | stdio JSONL RPC | Pi | prompt、steer、follow-up、abort、状态查询、结构化事件 |
-| stdio JSON stream | Pi、Claude proxy | 实时观察、旁路解析、进程退出 |
+| Session Host control/attach | Pi、Claude Code 及其他 Agent | 进程生命周期、PTY/stdio/ACP 控制、实时观察 |
 | HTTP / ACP | OpenCode | server session、结构化事件、远程/本地控制 |
 | history-only | 外部已存在或无法实时控制的 Session | discover、read history、resume（如果 provider 支持） |
 
@@ -248,13 +248,13 @@ bound(B)
 
 Agora Daemon 启动并持有 Agent 子进程，负责生命周期、输入和观察。Claude PTY 与 Pi RPC 都属于这一类，但 transport 不同。
 
-### 3.2 Transparent proxy
-
-Wrapper 启动真实 Agent，原始主通道透明转发，Agora 通过旁路复制 stdout/事件或读取 history。解析失败、Server 不可用或观察队列满时不得影响真实 Agent 的退出码和主协议。
-
-### 3.3 External/history-only
+### 3.2 External/history-only
 
 Session 由用户或其他工具启动，Agora 只通过 history catalog 或已有 provider server 发现和读取。不能控制的能力必须为 false；`CanReadHistory` 不推导出 `CanSendInput` 或 `CanResume`。
+
+## 3.3 Session Host
+
+Managed Agent 由独立的 per-session `session-host` 持有。Daemon 通过认证的 control/attach socket 连接 Host；Daemon 重启、升级或短暂断线不等于 Agent 停止。详见 [`docs/session-host.md`](session-host.md)。
 
 ## 4. 能力与降级
 

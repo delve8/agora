@@ -2,119 +2,117 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
-	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"golang.org/x/term"
+
+	"github.com/delve8/agora/internal/protocol"
 )
 
-// runWrapper is the claude-wrapper entry point. With no session id it asks
-// Agora to create a managed session for the current workspace, then attaches
-// the terminal to that session's PTY. With an existing Agora session id it
-// attaches directly. The real Claude process is always a child of agora serve;
-// this process only renders and forwards the terminal bytes.
+// runWrapper is the generic native Agent wrapper entry point. It talks only to
+// the local Daemon over a Unix socket. The Daemon owns the Server connection,
+// device credential, Agent creation, and session ownership.
 func runWrapper(args []string) error {
-	sessionID := ""
+	var sessionID string
 	if len(args) > 0 && looksLikeAgoraSessionID(args[0]) {
 		sessionID = strings.TrimSpace(args[0])
+		args = args[1:]
 	}
-	if sessionID == "" {
-		created, err := createWrapperSession()
-		if err != nil {
-			return err
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "-") {
+			return fmt.Errorf("claude wrapper does not pass Claude options to the Daemon; use the real claude binary for command options")
 		}
-		sessionID = created
 	}
-	return runAttach(sessionID)
-}
-
-func createWrapperSession() (string, error) {
-	workspace, err := os.Getwd()
-	if err != nil {
-		return "", err
+	var attached protocol.WrapperResponse
+	var err error
+	if sessionID == "" {
+		attached, err = createDaemonWrapperSession("claude", args)
+	} else if len(args) > 0 {
+		return errors.New("a session id cannot be combined with an initial prompt")
+	} else {
+		attached, err = attachDaemonWrapperSession(sessionID)
 	}
-	base := filepath.Base(workspace)
-	if base == "." || base == string(filepath.Separator) || base == "" {
-		base = "New session"
-	}
-	apiBase := agoraAPIBase()
-	stateRequest, err := agoraRequest(http.MethodGet, apiBase+"/api/state", nil)
-	if err != nil {
-		return "", fmt.Errorf("create Agora state request: %w", err)
-	}
-	stateResp, err := http.DefaultClient.Do(stateRequest)
-	if err != nil {
-		return "", fmt.Errorf("connect to Agora: %w", err)
-	}
-	defer stateResp.Body.Close()
-	if stateResp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("Agora returned %s while loading state", stateResp.Status)
-	}
-	var state struct {
-		Coordination struct {
-			ID string `json:"id"`
-		} `json:"coordination"`
-	}
-	if err := json.NewDecoder(stateResp.Body).Decode(&state); err != nil {
-		return "", err
-	}
-	if state.Coordination.ID == "" {
-		return "", fmt.Errorf("Agora returned no coordination")
-	}
-	body, _ := json.Marshal(map[string]string{
-		"workspace":    workspace,
-		"display_name": base,
-		"role":         "terminal",
-	})
-	request, err := agoraRequest(http.MethodPost, apiBase+"/api/coordinations/"+url.PathEscape(state.Coordination.ID)+"/sessions", strings.NewReader(string(body)))
-	if err != nil {
-		return "", fmt.Errorf("create Agora session request: %w", err)
-	}
-	request.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(request)
-	if err != nil {
-		return "", fmt.Errorf("create Agora session: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated {
-		return "", fmt.Errorf("Agora returned %s while creating session", resp.Status)
-	}
-	var created struct {
-		ID string `json:"id"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
-		return "", err
-	}
-	if created.ID == "" {
-		return "", fmt.Errorf("Agora returned no session id")
-	}
-	return created.ID, nil
-}
-
-func agoraAPIBase() string {
-	base := firstNonEmptyEnv("AGORA_ADDR", "AGORA_SERVER_URL")
-	if base == "" {
-		return "http://127.0.0.1:8080"
-	}
-	if strings.HasPrefix(base, "http://") || strings.HasPrefix(base, "https://") {
-		return strings.TrimRight(base, "/")
-	}
-	return "http://" + strings.TrimRight(base, "/")
-}
-
-// runAttach connects the current terminal to a managed session's PTY served by
-// Agora. It puts the terminal in raw mode and relays bytes in both directions.
-func runAttach(id string) error {
-	addr, err := attachSocket(id)
 	if err != nil {
 		return err
 	}
+	return runAttachSocket(attached.Socket)
+}
+
+func createDaemonWrapperSession(agent string, prompts []string) (protocol.WrapperResponse, error) {
+	workspace, err := os.Getwd()
+	if err != nil {
+		return protocol.WrapperResponse{}, err
+	}
+	// The workspace is already shown as the parent item in the UI. Keep the
+	// wrapper-created session name generated so provider history (Pi session_info
+	// or Claude title/first user) can replace it after the history is observed.
+	return callLocalDaemon(protocol.WrapperRequest{Workspace: workspace, DisplayName: "New session", Role: "terminal", Agent: agent, Prompts: prompts})
+}
+
+func createDaemonWrapperSessionWithArgs(agent string, args []string) (protocol.WrapperResponse, error) {
+	workspace, err := os.Getwd()
+	if err != nil {
+		return protocol.WrapperResponse{}, err
+	}
+	// The workspace is already shown as the parent item in the UI. Keep the
+	// wrapper-created session name generated so provider history (especially Pi
+	// session_info) can replace it after the history is observed.
+	return callLocalDaemon(protocol.WrapperRequest{Workspace: workspace, DisplayName: "New session", Role: "terminal", Agent: agent, AgentArgs: args})
+}
+
+func attachDaemonWrapperSession(sessionID string) (protocol.WrapperResponse, error) {
+	return callLocalDaemon(protocol.WrapperRequest{SessionID: sessionID})
+}
+
+func callLocalDaemon(payload protocol.WrapperRequest) (protocol.WrapperResponse, error) {
+	path := strings.TrimSpace(os.Getenv("AGORA_DAEMON_SOCKET"))
+	if path == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return protocol.WrapperResponse{}, fmt.Errorf("resolve home directory for Agora daemon socket: %w", err)
+		}
+		path = filepath.Join(home, ".agora", "daemon.sock")
+	}
+	conn, err := net.DialTimeout("unix", path, 5*time.Second)
+	if err != nil {
+		return protocol.WrapperResponse{}, fmt.Errorf("connect to local Agora daemon at %s: %w", path, err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+	if err := json.NewEncoder(conn).Encode(payload); err != nil {
+		return protocol.WrapperResponse{}, fmt.Errorf("send wrapper request to daemon: %w", err)
+	}
+	var result protocol.WrapperResponse
+	if err := json.NewDecoder(conn).Decode(&result); err != nil {
+		return protocol.WrapperResponse{}, fmt.Errorf("read wrapper response from daemon: %w", err)
+	}
+	if result.Error != "" {
+		return protocol.WrapperResponse{}, errors.New(result.Error)
+	}
+	if result.SessionID == "" || result.Socket == "" {
+		return protocol.WrapperResponse{}, errors.New("daemon wrapper response is missing session_id or socket")
+	}
+	return result, nil
+}
+
+// runAttach attaches the current terminal to a managed session's PTY through
+// the local Daemon control path.
+func runAttach(id string) error {
+	attached, err := attachDaemonWrapperSession(id)
+	if err != nil {
+		return err
+	}
+	return runAttachSocket(attached.Socket)
+}
+
+func runAttachSocket(addr string) error {
 	conn, err := net.Dial("unix", addr)
 	if err != nil {
 		return fmt.Errorf("connect to %s: %w", addr, err)
@@ -128,62 +126,8 @@ func runAttach(id string) error {
 	defer func() { _ = term.Restore(int(os.Stdin.Fd()), oldState) }()
 
 	done := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(os.Stdout, conn)
-		done <- err
-	}()
-	go func() {
-		_, err := io.Copy(conn, os.Stdin)
-		done <- err
-	}()
+	go func() { _, err := io.Copy(os.Stdout, conn); done <- err }()
+	go func() { _, err := io.Copy(conn, os.Stdin); done <- err }()
 	<-done
 	return nil
-}
-
-func attachSocket(sessionID string) (string, error) {
-	request, err := agoraRequest(http.MethodGet, agoraAPIBase()+"/api/sessions/"+url.PathEscape(sessionID)+"/attach", nil)
-	if err != nil {
-		return "", fmt.Errorf("create attach request: %w", err)
-	}
-	resp, err := http.DefaultClient.Do(request)
-	if err != nil {
-		return "", fmt.Errorf("query Agora for attach address: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("Agora returned %s for session %s", resp.Status, sessionID)
-	}
-	var body struct {
-		Socket string `json:"socket"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return "", err
-	}
-	if body.Socket == "" {
-		return "", fmt.Errorf("session %s has no attach socket (is it running?)", sessionID)
-	}
-	return body.Socket, nil
-}
-
-// agoraRequest adds the optional CLI bearer token. Local mode does not need
-// it; Logto deployments can use AGORA_ACCESS_TOKEN (or AGORA_TOKEN) when a
-// terminal wrapper needs to call the protected API.
-func agoraRequest(method, endpoint string, body io.Reader) (*http.Request, error) {
-	request, err := http.NewRequest(method, endpoint, body)
-	if err != nil {
-		return nil, err
-	}
-	if token := strings.TrimSpace(firstNonEmptyEnv("AGORA_ACCESS_TOKEN", "AGORA_TOKEN")); token != "" {
-		request.Header.Set("Authorization", "Bearer "+token)
-	}
-	return request, nil
-}
-
-func firstNonEmptyEnv(names ...string) string {
-	for _, name := range names {
-		if value := strings.TrimSpace(os.Getenv(name)); value != "" {
-			return value
-		}
-	}
-	return ""
 }

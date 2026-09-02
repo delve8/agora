@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { createSession, loadEvents, loadState, resumeSession, sendMessage, stopSession, subscribe } from "../api/client";
 import type { CreateSessionInput } from "../api/client";
 import type { Coordination, Event, Session } from "../types";
@@ -17,7 +17,11 @@ export function useCoordination() {
   const [coordination, setCoordination] = useState<Coordination | null>(null);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState("");
+  const sessionsRef = useRef<Session[]>([]);
+  const selectedSessionIdRef = useRef("");
   const [events, setEvents] = useState<Event[]>([]);
+  sessionsRef.current = sessions;
+  selectedSessionIdRef.current = selectedSessionId;
   const [hasOlderEvents, setHasOlderEvents] = useState(false);
   const [loadingOlderEvents, setLoadingOlderEvents] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -28,9 +32,27 @@ export function useCoordination() {
     try {
       const state = await loadState();
       setCoordination(state.coordination);
+      const previousSessions = sessionsRef.current;
+      const previousSelectedID = selectedSessionIdRef.current;
       setSessions(state.sessions);
       const linkedSession = linkedSessionFromLocation();
-      setSelectedSessionId((current) => current && state.sessions.some((session) => session.id === current) ? current : linkedSession && state.sessions.some((session) => session.id === linkedSession) ? linkedSession : state.sessions[0]?.id ?? "");
+      let nextSelectedID = previousSelectedID && state.sessions.some((session) => session.id === previousSelectedID) ? previousSelectedID : "";
+      // A runtime /resume changes the canonical session ID while the PTY and
+      // process continue running. The old ID disappears from /api/state, so
+      // preserving only the string ID would make the UI jump to the first
+      // session (or show a different workspace). Match the replacement by
+      // the stable live-process tuple and follow the rebind automatically.
+      if (!nextSelectedID && previousSelectedID) {
+        const previous = previousSessions.find((session) => session.id === previousSelectedID);
+        const replacement = previous && (previous.process_id ?? 0) > 0
+          ? state.sessions.find((session) => session.id !== previousSelectedID && session.daemon_id === previous.daemon_id && session.agent === previous.agent && session.workspace === previous.workspace && session.process_id === previous.process_id && session.capabilities.can_send_input)
+          : undefined;
+        nextSelectedID = replacement?.id ?? "";
+      }
+      const fallbackID = linkedSession && state.sessions.some((session) => session.id === linkedSession)
+        ? linkedSession
+        : state.sessions[0]?.id ?? "";
+      setSelectedSessionId(nextSelectedID || fallbackID);
       setError("");
     } catch (value) { if (!background) setError(value instanceof Error ? value.message : "Unable to load Agora"); }
     finally { if (!background) setLoading(false); }

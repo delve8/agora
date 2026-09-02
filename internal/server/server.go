@@ -86,6 +86,7 @@ func NewWithWebDirAndAuth(addr string, db *store.Store, manager *runtime.Manager
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /api/daemon/ws", s.daemons.serveHTTP)
 	mux.HandleFunc("POST /api/daemon/pair", s.pairDaemon)
+	mux.HandleFunc("POST /api/daemon/wrap", s.daemonWrap)
 	mux.HandleFunc("GET /api/me", s.me)
 	mux.HandleFunc("POST /api/devices/pair-codes", s.createPairCode)
 	mux.HandleFunc("GET /api/devices", s.listDevices)
@@ -384,6 +385,191 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// daemonWrap is the local terminal wrapper API. It authenticates with the
+// Daemon's device credential, not a Web user's Logto token. This keeps the
+// wrapper independent from browser login while preserving device ownership.
+func (s *Server) daemonWrap(w http.ResponseWriter, r *http.Request) {
+	provided := auth.ExtractBearer(r.Header.Get("Authorization"))
+	daemonID := strings.TrimSpace(r.Header.Get("X-Agora-Daemon-ID"))
+	if daemonID == "" {
+		writeErrorStatus(w, http.StatusUnauthorized, errors.New("daemon id is required"))
+		return
+	}
+	if s.auth.Mode() == config.AuthModeLogto {
+		if provided == "" || s.store == nil {
+			writeErrorStatus(w, http.StatusUnauthorized, errors.New("daemon authentication required"))
+			return
+		}
+		device, err := s.store.GetDeviceByCredentialHash(r.Context(), store.HashSecret(provided))
+		if err != nil || device.RevokedAt != nil || device.ID != daemonID {
+			writeErrorStatus(w, http.StatusUnauthorized, errors.New("daemon authentication required"))
+			return
+		}
+	} else if s.daemons == nil || !s.daemons.isConnected(daemonID) {
+		// Trust-local mode has no device credential. The Unix socket is
+		// permission-protected and the daemon's live WebSocket registration is
+		// the server-side proof that this daemon is currently available.
+		writeErrorStatus(w, http.StatusUnauthorized, errors.New("daemon is not connected"))
+		return
+	}
+	if s.daemons == nil || s.store == nil || !s.daemons.isConnected(daemonID) {
+		writeErrorStatus(w, http.StatusServiceUnavailable, fmt.Errorf("daemon %s is offline or unavailable", daemonID))
+		return
+	}
+	var input struct {
+		SessionID   string   `json:"session_id"`
+		AgentArgs   []string `json:"agent_args"`
+		Workspace   string   `json:"workspace"`
+		DisplayName string   `json:"display_name"`
+		Role        string   `json:"role"`
+		Agent       string   `json:"agent"`
+		Prompts     []string `json:"prompts"`
+	}
+	if err := decodeJSON(r, &input); err != nil {
+		writeErrorStatus(w, http.StatusBadRequest, err)
+		return
+	}
+	if input.SessionID != "" {
+		identity, err := session.ParseSessionID(input.SessionID)
+		if err != nil {
+			writeErrorStatus(w, http.StatusBadRequest, err)
+			return
+		}
+		if identity.DaemonID != daemonID {
+			writeErrorStatus(w, http.StatusForbidden, errors.New("session is not owned by this daemon"))
+			return
+		}
+		if identity.Agent != "claude" && identity.Agent != "pi" {
+			writeErrorStatus(w, http.StatusBadRequest, fmt.Errorf("unsupported agent %q", identity.Agent))
+			return
+		}
+		frame, err := s.daemons.request(r.Context(), input.SessionID, protocol.AttachRequest, protocol.AttachPayload{SessionID: input.SessionID}, protocol.AttachResponse)
+		if err != nil {
+			writeErrorStatus(w, http.StatusBadGateway, err)
+			return
+		}
+		var attached protocol.AttachPayload
+		if err := protocol.DecodePayload(frame, &attached); err != nil || attached.Socket == "" {
+			if err == nil && attached.Error != "" {
+				err = errors.New(attached.Error)
+			}
+			if err == nil {
+				err = errors.New("daemon returned no attach socket")
+			}
+			writeErrorStatus(w, http.StatusBadGateway, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"session_id": input.SessionID, "socket": attached.Socket})
+		return
+	}
+	agent := strings.ToLower(strings.TrimSpace(input.Agent))
+	if agent == "" {
+		agent = "claude"
+	}
+	displayName := strings.TrimSpace(input.DisplayName)
+	if displayName == "" {
+		displayName = "New session"
+	}
+	if agent == "claude-code" {
+		agent = "claude"
+	}
+	if agent != "claude" && agent != "pi" {
+		writeErrorStatus(w, http.StatusBadRequest, fmt.Errorf("unsupported agent %q", agent))
+		return
+	}
+	coordinationID := ""
+	coordinations, err := s.store.ListCoordinations(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if len(coordinations) == 0 {
+		coord := coordination.Coordination{ID: newID("coord"), Name: "Default Coordination", CreatedAt: time.Now().UTC()}
+		if err := s.store.CreateCoordination(r.Context(), coord); err != nil {
+			writeError(w, err)
+			return
+		}
+		coordinationID = coord.ID
+	} else {
+		coordinationID = coordinations[0].ID
+	}
+	rawWorkspace := strings.TrimSpace(input.Workspace)
+	if rawWorkspace == "" {
+		writeErrorStatus(w, http.StatusBadRequest, errors.New("workspace is required"))
+		return
+	}
+	workspace, err := filepath.Abs(rawWorkspace)
+	if err != nil {
+		writeErrorStatus(w, http.StatusBadRequest, err)
+		return
+	}
+
+	// The workspace belongs to the Daemon host, not necessarily the Server
+	// host. The Daemon validates that this absolute path exists locally when it
+	// handles the session.create frame.
+	result, err := s.daemons.createSession(r.Context(), protocol.SessionCreatePayload{CoordinationID: coordinationID, Workspace: workspace, DisplayName: displayName, Role: input.Role, Agent: agent, AgentArgs: input.AgentArgs, DaemonID: daemonID}, daemonID)
+	if err != nil {
+		writeErrorStatus(w, http.StatusBadGateway, err)
+		return
+	}
+	identity, err := session.ParseSessionID(result.SessionID)
+	if err != nil || identity.DaemonID != daemonID || (identity.Agent != "claude" && identity.Agent != "pi") {
+		if err == nil {
+			err = fmt.Errorf("daemon returned session %q for daemon %q", result.SessionID, daemonID)
+		}
+		writeErrorStatus(w, http.StatusBadGateway, err)
+		return
+	}
+	if result.Agent != "" && result.Agent != identity.Agent {
+		writeErrorStatus(w, http.StatusBadGateway, fmt.Errorf("daemon returned agent %q for session agent %q", result.Agent, identity.Agent))
+		return
+	}
+	if result.AgentSessionID == "" {
+		result.AgentSessionID = identity.AgentSessionID
+	}
+	storedWorkspace := workspace
+	if strings.TrimSpace(result.Workspace) != "" {
+		storedWorkspace = result.Workspace
+	}
+	value := session.Session{ID: result.SessionID, CoordinationID: coordinationID, DaemonID: daemonID, Agent: result.Agent, AgentSessionID: result.AgentSessionID, HistoryPath: result.HistoryPath, Workspace: storedWorkspace, DisplayName: displayName, Role: input.Role, State: session.StateRunning, Source: session.SourceManaged, Connection: session.ConnectionObserved, ProcessID: result.PID, Capabilities: capabilitiesFromMap(result.Capabilities), CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	if value.Agent == "" {
+		value.Agent = agent
+	}
+	if err := s.store.CreateSession(r.Context(), value); err != nil {
+		writeError(w, err)
+		return
+	}
+	s.daemons.upsertLiveSession(value)
+	frame, err := s.daemons.request(r.Context(), result.SessionID, protocol.AttachRequest, protocol.AttachPayload{SessionID: result.SessionID}, protocol.AttachResponse)
+	if err != nil {
+		writeErrorStatus(w, http.StatusBadGateway, err)
+		return
+	}
+	var attached protocol.AttachPayload
+	if err := protocol.DecodePayload(frame, &attached); err != nil || attached.Socket == "" {
+		if err == nil && attached.Error != "" {
+			err = errors.New(attached.Error)
+		}
+		if err == nil {
+			err = errors.New("daemon returned no attach socket")
+		}
+		writeErrorStatus(w, http.StatusBadGateway, err)
+		return
+	}
+	// Initial prompts are sent over the daemon protocol after the PTY exists.
+	// They are intentionally not sent through the user-authenticated Web API.
+	for _, prompt := range input.Prompts {
+		if strings.TrimSpace(prompt) == "" {
+			continue
+		}
+		if err := s.daemons.sessionInput(r.Context(), value, prompt); err != nil {
+			writeErrorStatus(w, http.StatusBadGateway, err)
+			return
+		}
+	}
+	writeJSON(w, http.StatusCreated, map[string]string{"session_id": result.SessionID, "socket": attached.Socket})
+}
+
 func (s *Server) authorizeSession(ctx context.Context, value session.Session) error {
 	principal, err := auth.RequirePrincipal(ctx)
 	if err != nil {
@@ -413,7 +599,7 @@ func (s *Server) authorizeSession(ctx context.Context, value session.Session) er
 
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/healthz" || r.URL.Path == "/api/daemon/ws" || r.URL.Path == "/api/daemon/pair" || !strings.HasPrefix(r.URL.Path, "/api/") {
+		if r.URL.Path == "/healthz" || r.URL.Path == "/api/daemon/ws" || r.URL.Path == "/api/daemon/pair" || r.URL.Path == "/api/daemon/wrap" || !strings.HasPrefix(r.URL.Path, "/api/") {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -882,18 +1068,25 @@ func (s *Server) state(w http.ResponseWriter, r *http.Request) {
 	// key would merge every Pi history entry into the first Pi session.
 	sessionKeys := make(map[string]int, len(sessions))
 	for index, value := range sessions {
-		if key := sessionMergeKey(value); key != "" {
+		for _, key := range sessionMergeKeys(value) {
 			sessionKeys[key] = index
 		}
 	}
 	mergeDiscovered := func(value session.Session) {
-		key := sessionMergeKey(value)
-		if key != "" {
+		keys := sessionMergeKeys(value)
+		for _, key := range keys {
 			if index, exists := sessionKeys[key]; exists {
-				// Older Pi sessions may have used the bootstrap prompt `.` as
-				// their display name. Replace that placeholder when the history
-				// catalog now provides an explicit name or a workspace fallback.
-				if value.Agent == "pi" && (strings.TrimSpace(sessions[index].DisplayName) == "" || strings.TrimSpace(sessions[index].DisplayName) == "." || session.IsGeneratedDisplayName(sessions[index].DisplayName) || isOpaqueSessionName(sessions[index].DisplayName, "pi")) && strings.TrimSpace(value.DisplayName) != "" {
+				// A managed session can reach the Server before its observer has
+				// resolved the native URI or history path. Keep the live entry as
+				// the primary record, but enrich it with metadata from discovery.
+				if value.AgentSessionID != "" && sessions[index].AgentSessionID == "" {
+					sessions[index].AgentSessionID = value.AgentSessionID
+				}
+
+				// A managed wrapper starts with a generated name. Let provider
+				// history replace it for every Agent; the workspace is already the
+				// parent Cascader item, so it should not hide the session name.
+				if shouldEnrichSessionName(sessions[index]) && strings.TrimSpace(value.DisplayName) != "" {
 					sessions[index].DisplayName = value.DisplayName
 					sessions[index].DisplayNameSource = value.DisplayNameSource
 				}
@@ -913,8 +1106,31 @@ func (s *Server) state(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		// Legacy daemon summaries may omit both AgentSessionID and a stable
+		// canonical history ID during the identity hand-off. If there is exactly
+		// one live session for this provider/workspace, treat that row as the
+		// same session. Requiring a unique live candidate avoids merging two
+		// independent Pi sessions that happen to share a workspace.
+		if value.Source == session.SourceHistory && value.Agent != "" && value.Workspace != "" {
+			candidate := -1
+			for index, live := range sessions {
+				if !isLiveSession(live) || live.Agent != value.Agent || filepath.Clean(live.Workspace) != filepath.Clean(value.Workspace) {
+					continue
+				}
+				if candidate != -1 {
+					candidate = -2
+					break
+				}
+				candidate = index
+			}
+			if candidate >= 0 {
+				sessionKeys["workspace\x00"+value.Agent+"\x00"+filepath.Clean(value.Workspace)] = candidate
+				mergeDiscoveredIntoSession(&sessions, candidate, value)
+				return
+			}
+		}
 		sessions = append(sessions, value)
-		if key != "" {
+		for _, key := range keys {
 			sessionKeys[key] = len(sessions) - 1
 		}
 	}
@@ -949,14 +1165,73 @@ func (s *Server) state(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"coordination": coord, "sessions": sessions})
 }
 
-func sessionMergeKey(value session.Session) string {
-	// The provider is already part of the canonical URI (claude://..., pi://...)
-	// and this also treats the legacy "claude" and "claude-code" labels as the
-	// same session.
-	if uri := value.NativeSessionURI(); uri != "" {
-		return uri
+func shouldEnrichSessionName(current session.Session) bool {
+	name := strings.TrimSpace(current.DisplayName)
+	if name == "" || name == "." || session.IsGeneratedDisplayName(name) || isOpaqueSessionName(name, current.Agent) {
+		return true
 	}
-	return value.ID
+	// Older wrapper-created rows used the workspace basename as the child name.
+	// This can already be marked custom by an older server, so compare the
+	// actual legacy shape rather than relying only on DisplayNameSource.
+	return current.Workspace != "" && filepath.Base(filepath.Clean(current.Workspace)) == name
+}
+
+func mergeDiscoveredIntoSession(sessions *[]session.Session, index int, value session.Session) {
+	if index < 0 || index >= len(*sessions) {
+		return
+	}
+	current := &(*sessions)[index]
+	if value.AgentSessionID != "" && current.AgentSessionID == "" {
+		current.AgentSessionID = value.AgentSessionID
+	}
+	if current.HistoryPath == "" {
+		current.HistoryPath = value.HistoryPath
+	}
+	if current.Workspace == "" {
+		current.Workspace = value.Workspace
+	}
+	if current.DisplayName == "" || current.DisplayName == "." || session.IsGeneratedDisplayName(current.DisplayName) || isOpaqueSessionName(current.DisplayName, current.Agent) {
+		if value.DisplayName != "" {
+			current.DisplayName = value.DisplayName
+			current.DisplayNameSource = value.DisplayNameSource
+		}
+	}
+	if value.UpdatedAt.After(current.UpdatedAt) {
+		current.UpdatedAt = value.UpdatedAt
+	}
+	if !current.Capabilities.CanSendInput {
+		current.Capabilities.CanReadHistory = true
+		current.Capabilities.CanResume = value.Capabilities.CanResume
+	}
+}
+
+func sessionMergeKey(value session.Session) string {
+	keys := sessionMergeKeys(value)
+	if len(keys) == 0 {
+		return ""
+	}
+	return keys[0]
+}
+
+func sessionMergeKeys(value session.Session) []string {
+	keys := make([]string, 0, 2)
+	if uri := strings.TrimSpace(value.NativeSessionURI()); uri != "" {
+		// The provider is already part of the URI (claude://..., pi://...).
+		keys = append(keys, "uri\x00"+uri)
+	}
+	// During the short interval between PTY creation and observer metadata
+	// reconciliation, a managed session may have no native URI on the Server
+	// while the catalog entry already has the same provider history path. Use
+	// that path as a temporary identity fallback. It prevents one physical
+	// provider session from being rendered as separate TUI and history rows;
+	// the URI remains the authoritative key once available.
+	if path := strings.TrimSpace(value.HistoryPath); path != "" {
+		keys = append(keys, "path\x00"+value.Agent+"\x00"+filepath.Clean(path))
+	}
+	if len(keys) == 0 && value.ID != "" {
+		keys = append(keys, "id\x00"+value.ID)
+	}
+	return keys
 }
 
 func isLiveSession(value session.Session) bool {
@@ -1225,13 +1500,13 @@ func (s *Server) getEvents(w http.ResponseWriter, r *http.Request) {
 		values, err = s.manager.HistoryForSession(r.Context(), value, 0)
 	} else if location == sessionLocationDaemonHistory {
 		values, err = s.requestDaemonHistory(r.Context(), sessionID, historyRequestLimit(limit), before)
-	} else if s.manager != nil && (s.manager.CanManageSessions()) {
+	} else if s.manager != nil && s.manager.CanManageSessions() {
 		values, err = s.manager.History(r.Context(), sessionID, 0)
 	} else {
 		values, err = s.requestDaemonHistory(r.Context(), sessionID, historyRequestLimit(limit), before)
 	}
 	if err != nil {
-		if location == sessionLocationDaemonHistory || (s.manager == nil) {
+		if location == sessionLocationDaemonHistory || s.manager == nil {
 			writeErrorStatus(w, http.StatusBadGateway, err)
 		} else {
 			writeError(w, err)

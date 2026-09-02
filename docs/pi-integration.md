@@ -31,16 +31,13 @@ Pi 和 Agora 现有设计的匹配点：
 
 ### 2.1 启动参数
 
-Agora 启动 Pi 时必须显式指定 provider 和 model，不依赖用户当前默认值：
+`pi-wrapper`/`agora wrap pi` 会把所有 Pi 参数按原顺序、原字符串直接传给真实 Pi，不解析、不过滤、不重写：
 
 ```text
-pi --provider anthropic --model <provider-model> ...
+pi --session <id> --provider anthropic --model <provider-model> ...
 ```
 
-Agora uses the normal interactive Pi TUI under a real PTY. A new managed
-session uses `--session-id <uuid>`; a resumed session uses the exact history
-file path with `--session <history-file>`. Agora does not use `--mode rpc` for
-managed Pi sessions.
+因此 Pi 的版本新增参数也可以直接使用。Agora 只会将 binary 放在参数列表最前面，并通过 PTY 建立 attach；参数含义和运行模式完全由 Pi 决定。传入 `--print`、`--mode json` 或 `--mode rpc` 时，Pi 会按自身语义运行，可能不会显示 TUI，这是预期行为。
 
 非交互观察或一次性运行可以使用：
 
@@ -209,9 +206,9 @@ path + byte_offset + line + last_external_id
 3. 从 byte offset 读取完整 LF 记录；
 4. 最后一个记录不完整时保留 offset，不把半行解析成事件；
 5. 每条记录解析出稳定 external ID 后推进 cursor；
-6. 只保存纳管 Session 的 cursor，不扫描并同步所有 Pi history 到 Server。
+6. 只保存纳管 Session 的 cursor，不把 transcript 扫描并同步到 Server；Daemon 可以持续扫描本地 catalog，并仅上报新增/变化会话的 summary 和 locator。
 
-Pi 的 session catalog 只用于 Agora 显式纳管的工作区/目录，遵循 ADR-013；不要把 `~/.pi/agent/sessions` 全量导入成业务 Session。
+Pi 的 session catalog 用于发现本机 `~/.pi/agent/sessions` 下的有效会话；新建或外部启动的 Pi 会话在下一次 catalog 刷新后通过 Daemon resync 出现在 Server 的会话列表中。Server 不接收或持久化 Pi transcript，完整历史仍由 Daemon 从本地 JSONL 按需读取。
 
 ### 4.3 History parser 映射
 
@@ -281,10 +278,7 @@ response → 请求关联器 / command result
 
 不能把 response 当作 Agent transcript，也不能把异步 event 等同于某个请求的成功响应。
 
-RPC 事件可直接映射为 live observation，但如果同一进程同时启用独立 `--mode json` stdout observer，不得重复消费同一条事件。第一版建议二选一：
-
-- 控制和观察都由 RPC driver 管理；或
-- transparent proxy 仅使用 `--mode json`，不提供远程输入。
+RPC 事件可直接映射为 live observation；同一进程不得同时启用多个 observer 重复消费同一条事件。Pi 的控制和观察应由同一个 managed driver 或 Session Host 管理。
 
 ### 5.3 framing 与缓冲
 

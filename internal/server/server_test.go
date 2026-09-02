@@ -321,6 +321,74 @@ func TestStateDeduplicatesDaemonLiveAndHistory(t *testing.T) {
 	}
 }
 
+func TestStateDeduplicatesLiveAndHistoryByNativeURIWhenIDsDiffer(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "agora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now().UTC()
+	coord := coordination.Coordination{ID: "coord-uri", Name: "Test", CreatedAt: now}
+	if err := db.CreateCoordination(context.Background(), coord); err != nil {
+		t.Fatal(err)
+	}
+	srv := New(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), nil))
+	seedDaemonLiveSession(srv, "daemon-uri", protocol.SessionSummary{
+		SessionID: "live-id", DaemonID: "daemon-uri", Agent: "pi", AgentSessionID: "pi://native-uri",
+		Workspace: "/tmp/pi", DisplayName: "TUI", State: session.StateRunning,
+		Connection: session.ConnectionObserved, PID: 42, CreatedAt: now, UpdatedAt: now,
+	})
+	seedDaemonHistorySession(srv, "daemon-uri", protocol.HistorySessionSummary{
+		SessionID: "history-id", DaemonID: "daemon-uri", Agent: "pi", AgentSessionID: "pi://native-uri",
+		Workspace: "/tmp/pi", DisplayName: "History", CreatedAt: now, UpdatedAt: now,
+	})
+	resp := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/api/state", nil))
+	var state struct {
+		Sessions []session.Session `json:"sessions"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Sessions) != 1 || state.Sessions[0].ID != "live-id" {
+		t.Fatalf("live and history were duplicated: %+v", state.Sessions)
+	}
+}
+
+func TestStateDeduplicatesLegacyLiveAndHistoryByWorkspace(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "agora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now().UTC()
+	coord := coordination.Coordination{ID: "coord-workspace", Name: "Test", CreatedAt: now}
+	if err := db.CreateCoordination(context.Background(), coord); err != nil {
+		t.Fatal(err)
+	}
+	srv := New(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), nil))
+	seedDaemonLiveSession(srv, "daemon-workspace", protocol.SessionSummary{
+		SessionID: "legacy-live", DaemonID: "daemon-workspace", Agent: "pi",
+		Workspace: "/tmp/pi-workspace", DisplayName: "TUI", State: session.StateRunning,
+		Connection: session.ConnectionObserved, PID: 42, CreatedAt: now, UpdatedAt: now,
+	})
+	seedDaemonHistorySession(srv, "daemon-workspace", protocol.HistorySessionSummary{
+		SessionID: "canonical-history", DaemonID: "daemon-workspace", Agent: "pi", AgentSessionID: "pi://native-workspace",
+		Workspace: "/tmp/pi-workspace", DisplayName: "History", CreatedAt: now, UpdatedAt: now,
+	})
+	resp := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/api/state", nil))
+	var state struct {
+		Sessions []session.Session `json:"sessions"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Sessions) != 1 || state.Sessions[0].ID != "legacy-live" {
+		t.Fatalf("legacy live and history were duplicated: %+v", state.Sessions)
+	}
+}
+
 func TestStateReturnsStoppedDaemonSessionAsResumable(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "agora.db"))
 	if err != nil {

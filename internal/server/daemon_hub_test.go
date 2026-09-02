@@ -81,6 +81,28 @@ func TestDaemonResyncReplacesHistoryCatalog(t *testing.T) {
 	}
 }
 
+func TestDaemonSessionUpdateRemovesHistoryAlias(t *testing.T) {
+	hub := newDaemonHub()
+	connection := &daemonConnection{id: "daemon-1", lastSeen: time.Now().UTC()}
+	hub.devices[connection.id] = connection
+	hub.history[connection.id] = map[string]protocol.HistorySessionSummary{
+		"history-id": {SessionID: "history-id", DaemonID: connection.id, Agent: "pi", AgentSessionID: "pi://native-1", HistoryPath: "/tmp/pi/native.jsonl"},
+	}
+	update, err := protocol.NewEnvelope(protocol.SessionUpdate, protocol.SessionUpdatePayload{
+		SessionID: "live-id", DaemonID: connection.id, Agent: "pi", AgentSessionID: "pi://native-1", HistoryPath: "/tmp/pi/native.jsonl",
+		State: session.StateRunning, Connection: session.ConnectionObserved, PID: 42,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := hub.handleFrame(connection, update); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := hub.historySession("history-id", "coord-1"); ok {
+		t.Fatal("history alias survived managed session update")
+	}
+}
+
 func TestSameHostOrigin(t *testing.T) {
 	req := httptest.NewRequest("GET", "http://127.0.0.1:8080/api/daemon/ws", nil)
 	if !sameHostOrigin(req, "http://127.0.0.1:8080") {

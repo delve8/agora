@@ -459,7 +459,7 @@ Web Browser ───────────────┐
 职责与数据边界：
 
 - **Server**：保存用户身份映射、设备归属、配对状态、在线路由和必要的配置元数据；向 Web 提供 REST/SSE；接收 Daemon 上报；将 Web 请求路由给已配对 Daemon；基于实时上报的规范化状态/摘要向 IM webhook 投递。**Server 不持久化业务数据**：transcript、Event、Message、PTY snapshot、通知正文均不落库，转发过程中短暂可见但不落盘。
-- **Daemon**：仅运行在用户电脑；通过 provider-specific driver 启动/恢复 Agent，使用对应的 control transport、live observer 和 history reader；PTY、终端 snapshot 和 attach 只是 Claude 等少数 Agent 的可选 surface。Daemon 不扫描用户全部 Agent 会话，只管理通过 Agora Wrapper/Web/RPC 显式纳管的 Session；完整历史继续由各 provider 的原始事实源提供。
+- **Daemon**：仅运行在用户电脑；通过 provider-specific driver 启动/恢复 Agent，使用对应的 control transport、live observer 和 history reader；PTY、终端 snapshot 和 attach 只是 Claude 等少数 Agent 的可选 surface。Daemon 通过各 provider 的 `SessionCatalog` 持续发现 session metadata/locator，但不复制 transcript；可通过 workspace 或 provider policy 限定发现范围。只有显式纳管的 Session 才获得控制能力，完整历史继续由各 provider 的原始事实源提供。
 - **Agent Runtime/Wrapper**：本地 provider-specific 入口，可能是 Claude PTY wrapper、Pi stdio RPC driver 或未来 OpenCode HTTP/ACP driver；不把某个 Agent 的原始协议暴露给 Server。
 
 Managed 会话的消息路径：
@@ -789,7 +789,7 @@ Claude Code 使用 Agora-owned PTY 保留原生 TUI；Pi 使用 stdio RPC 控制
 
 ### ADR-013：Daemon 只管理 Agora 显式纳管的 Session
 
-Daemon 不扫描或同步用户全部 Agent history。只有通过 Agora Wrapper、Web 创建或显式注册的 Session 才进入管理范围。完整 history 继续留在 provider 原始事实源，Daemon 只保存纳管 Session 的本地映射、observer cursor、进程状态和有界 outbox。断线期间优先保留关键状态和错误，重连后通过稳定事件 ID 或游标补发。
+Daemon 不复制或同步用户全部 Agent transcript。各 provider 通过 `SessionCatalog` 持续发现 session metadata/locator，并可按 workspace 或 provider policy 限定范围；只有通过 Agora Wrapper、Web 创建或显式注册的 Session 才获得控制能力。完整 history 继续留在 provider 原始事实源，Daemon 只保存纳管 Session 的本地映射、observer cursor、进程状态和有界 outbox。断线期间优先保留关键状态和错误，重连后通过稳定事件 ID 或游标补发。
 
 ### ADR-014：IM Provider 适配集中在 Server
 

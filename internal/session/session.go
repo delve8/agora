@@ -137,6 +137,12 @@ func (s Session) NativeSessionURI() string {
 	if s.ClaudeSessionID != "" {
 		return "claude://" + s.ClaudeSessionID
 	}
+	// Resync/live summaries may omit the explicit URI while still carrying a
+	// canonical Agora ID. Recover the provider-native URI from that ID so the
+	// same session cannot appear once as a live TUI row and once as history.
+	if identity, err := ParseSessionID(s.ID); err == nil {
+		return identity.AgentSessionID
+	}
 	return s.ExternalID
 }
 

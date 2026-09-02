@@ -8,10 +8,13 @@
 用户通过 `claude-wrapper` 进入 Claude Code。wrapper 不是另一个 Agent，也不替代 Claude Code：它只是 Agora 持有 PTY 的终端渲染端。
 
 ```text
-claude-wrapper（用户终端）
+claude-wrapper / agora attach（用户终端）
+        │ local Unix socket（wrapper control, then raw PTY I/O）
+        ▼
+Agora Daemon ── device credential / WebSocket ──→ Agora Server
         │ Unix socket（raw terminal I/O）
         ▼
-agora serve / PTYManager（持有 PTY master）
+PTYManager（持有 PTY master）
         │
         ▼
 claude（Agora 子进程，完整原生 TUI）
@@ -41,9 +44,9 @@ Agora 负责启动、持有和观察 Claude；用户仍然看到并操作原生 
 
 ## 会话与观察
 
-- `POST /api/coordinations/{id}/sessions` 创建一个 managed 会话并在 Agora 持有的 PTY 中启动 Claude；
-- `GET /api/sessions/{id}/attach` 返回 wrapper 连接用的 Unix socket；
-- `claude-wrapper [session-id]` 连接 socket，raw mode 双向转发键盘和屏幕；
+- `POST /api/coordinations/{id}/sessions` 创建一个 managed 会话并在 Daemon 持有的 PTY 中启动 Claude；
+- `~/.agora/daemon.sock` 接收 wrapper 的 create/attach 请求；Daemon 使用设备 credential 与 Server 通信；
+- `claude-wrapper [session-id]` / `agora attach [session-id]` 连接返回的 PTY socket，raw mode 双向转发键盘和屏幕；
 - JSONL observer 轮询会话文件，解析 user/assistant/tool/result 内容，入库并通过 SSE 推送到 Web；
 - PTY reader 维护当前 VT screen snapshot，Web 通过只读接口观察 native TUI；
 - 归一化的 Session 状态/attention 可以进入独立通知策略，向 IM 发送摘要和 Session deep link；
@@ -96,7 +99,7 @@ JSONL 仍作为工具名称、参数和历史结果的辅助数据源；PTY/虚�
 | send input | 可用 | Web 写入同一个 PTY master；第一阶段 IM 只发通知，不直接输入 |
 | observe | 可用 | observer 读取 JSONL |
 | stream | 可用 | JSONL observer → SSE |
-| resume | 可用 | Agora 重启后 `--resume <id>` |
+| resume | 可用 | Daemon 重启后 `--resume <id>` |
 | attach | 可用 | `claude-wrapper`/`agora attach` 经 Unix socket |
 | discover/import | 关闭 | wrapper 是唯一入口，不支持独立外部会话导入 |
 | approve | 关闭 | 审批 UI 尚未接入 |

@@ -118,14 +118,20 @@ make start AGORA_PI_BINARY="$HOME/.nvm/versions/node/v24.13.0/bin/pi"
 
 The wrapper calls `agora wrap <agent>`, creates a new Session in the current
 directory and then attaches to the PTY created by the Daemon; an existing Agora
-Session ID is attached directly. Positional arguments after a new Pi invocation are sent as initial
-prompts. This wrapper intentionally exposes the managed interactive-session
-surface, not every Pi administrative option such as `pi auth`, `pi install`,
-or `pi --help`; use the real Pi binary for those commands.
+Session ID is attached directly. For Pi, every argument after `pi` is forwarded
+unchanged to the real Pi binary, including `--session`, `--provider`, `--model`,
+and future Pi options. Pi itself decides whether the invocation is interactive;
+therefore options such as `--print` or `--mode rpc` intentionally produce their
+native non-TUI behavior. Agora only interprets a leading canonical Agora Session
+ID for direct attach.
 
-For a Logto-protected Server, set `AGORA_ACCESS_TOKEN` (or `AGORA_TOKEN`) for
-CLI API requests. The Pi process itself runs on the Daemon machine under a
-real PTY with `pi --session <history-file>` when resuming an existing session.
+Wrappers never read browser tokens and never call the user-authenticated API.
+They connect to the local Daemon socket at `~/.agora/daemon.sock` (override with
+`AGORA_DAEMON_SOCKET`). The Daemon uses its own device credential for a Logto-
+protected Server. In split deployments, pair the Daemon from the Web UI first,
+then start it with the resulting device credential; the wrapper itself needs no
+Logto login. The Pi process runs on the Daemon machine under a real PTY with
+`pi --session <history-file>` when resuming an existing session.
 
 ### 4. Use Web and terminal together
 
@@ -178,7 +184,7 @@ Agora removes inherited Claude/Cursor child-session variables before launching C
 
 ## Restart behavior
 
-On Agora restart, persisted managed sessions are relaunched with `claude --resume <session-id>`, reattached to a fresh PTY, and observed from the existing JSONL history.
+On Daemon restart, persisted managed sessions are relaunched with `claude --resume <session-id>`, reattached to a fresh PTY, and observed from the existing JSONL history. The split Server only retains session metadata and live routes.
 
 ## Makefile commands
 
@@ -205,7 +211,7 @@ make logto-purge  # stop local Logto and remove its database volume
 
 The Server does not persist Daemon transcript or history data. It keeps live Daemon routes and resync summaries in memory, and those are rebuilt after each Daemon reconnect. Claude's local JSONL files remain the history source.
 
-The Daemon reindexes meaningful Claude JSONL files from `~/.claude/projects/*/*.jsonl` into memory at startup. These appear as stopped, resumable history sessions using IDs such as `daemon/<daemon-uuid>/claude://<claude-session-id>`. No PID, PTY, cursor, transcript copy, or Daemon database is restored; resuming one history entry starts a fresh PTY.
+The Daemon continuously reindexes meaningful local Claude JSONL files from `~/.claude/projects/*/*.jsonl` and Pi JSONL files from `~/.pi/agent/sessions`, including sessions created outside the Agora wrapper. A new or changed history file is advertised to the connected Server through an in-memory resync and appears as a stopped, resumable history session using an ID such as `daemon/<daemon-uuid>/pi://<pi-session-id>`. Only session summaries, routes, and operational metadata cross the Daemon–Server boundary; transcripts remain in the provider's local JSONL files and are read on demand. No PID, PTY, cursor, transcript copy, or history record is restored; resuming one history entry starts a fresh managed process.
 
 `make start` does not start a Server or Vite. It starts only the local Daemon and expects `AGORA_SERVER_URL` to point to an already-running Server. On the first run, Agora generates a UUID Daemon identity and stores it in `~/.agora/config.json` with restrictive permissions; later starts reuse it. Set `AGORA_CONFIG_PATH` to choose another config file, or set `AGORA_DAEMON_ID` for an explicit test/development override. The Daemon keeps runtime state in memory only; after a Daemon restart, its old PID/PTY/observer state is gone and a later resume starts a new PTY from the canonical agent URI. The Server is the only SQLite owner.
 

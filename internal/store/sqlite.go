@@ -176,14 +176,14 @@ func (s *Store) CreateSession(ctx context.Context, v session.Session) error {
 		v.DisplayNameSource = session.InitialDisplayNameSource(v.DisplayName)
 	}
 	return s.withBusyRetry(ctx, func() error {
-		_, err = s.db.ExecContext(ctx, `INSERT INTO sessions(id,coordination_id,agent,external_id,claude_session_id,workspace,display_name,display_name_source,role,state,source,connection,process_id,session_meta_path,history_path,last_discovered_at,last_observed_at,last_error,capabilities_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, v.ID, v.CoordinationID, v.Agent, v.ExternalID, v.ClaudeSessionID, v.Workspace, v.DisplayName, v.DisplayNameSource, v.Role, v.State, v.Source, v.Connection, v.ProcessID, v.SessionMetaPath, v.HistoryPath, formatOptionalTime(v.LastDiscoveredAt), formatOptionalTime(v.LastObservedAt), v.LastError, string(caps), v.CreatedAt.UTC().Format(timeFormat), v.UpdatedAt.UTC().Format(timeFormat))
+		_, err = s.db.ExecContext(ctx, `INSERT INTO sessions(id,coordination_id,agent,external_id,daemon_id,agent_session_id,claude_session_id,workspace,display_name,display_name_source,role,state,source,connection,process_id,session_meta_path,history_path,last_discovered_at,last_observed_at,last_error,capabilities_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, v.ID, v.CoordinationID, v.Agent, v.ExternalID, v.DaemonID, v.AgentSessionID, v.ClaudeSessionID, v.Workspace, v.DisplayName, v.DisplayNameSource, v.Role, v.State, v.Source, v.Connection, v.ProcessID, v.SessionMetaPath, v.HistoryPath, formatOptionalTime(v.LastDiscoveredAt), formatOptionalTime(v.LastObservedAt), v.LastError, string(caps), v.CreatedAt.UTC().Format(timeFormat), v.UpdatedAt.UTC().Format(timeFormat))
 		return err
 	})
 }
 func (s *Store) GetSession(ctx context.Context, id string) (session.Session, error) {
 	var v session.Session
 	var caps, t, u, discovered, observed string
-	err := s.db.QueryRowContext(ctx, `SELECT id,coordination_id,agent,external_id,claude_session_id,workspace,display_name,display_name_source,role,state,source,connection,process_id,session_meta_path,history_path,last_discovered_at,last_observed_at,last_error,capabilities_json,created_at,updated_at FROM sessions WHERE id=?`, id).Scan(&v.ID, &v.CoordinationID, &v.Agent, &v.ExternalID, &v.ClaudeSessionID, &v.Workspace, &v.DisplayName, &v.DisplayNameSource, &v.Role, &v.State, &v.Source, &v.Connection, &v.ProcessID, &v.SessionMetaPath, &v.HistoryPath, &discovered, &observed, &v.LastError, &caps, &t, &u)
+	err := s.db.QueryRowContext(ctx, `SELECT id,coordination_id,agent,external_id,daemon_id,agent_session_id,claude_session_id,workspace,display_name,display_name_source,role,state,source,connection,process_id,session_meta_path,history_path,last_discovered_at,last_observed_at,last_error,capabilities_json,created_at,updated_at FROM sessions WHERE id=?`, id).Scan(&v.ID, &v.CoordinationID, &v.Agent, &v.ExternalID, &v.DaemonID, &v.AgentSessionID, &v.ClaudeSessionID, &v.Workspace, &v.DisplayName, &v.DisplayNameSource, &v.Role, &v.State, &v.Source, &v.Connection, &v.ProcessID, &v.SessionMetaPath, &v.HistoryPath, &discovered, &observed, &v.LastError, &caps, &t, &u)
 	if err != nil {
 		return v, err
 	}
@@ -249,7 +249,36 @@ func (s *Store) DeleteSession(ctx context.Context, id string) error {
 }
 
 func (s *Store) RekeySession(ctx context.Context, oldID string, value session.Session) error {
-	return fmt.Errorf("server store does not support runtime session rekey")
+	caps, err := json.Marshal(value.Capabilities)
+	if err != nil {
+		return err
+	}
+	return s.withBusyRetry(ctx, func() error {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		result, err := tx.ExecContext(ctx, `INSERT INTO sessions(id,coordination_id,agent,external_id,claude_session_id,workspace,display_name,display_name_source,role,state,source,connection,process_id,session_meta_path,history_path,last_discovered_at,last_observed_at,last_error,capabilities_json,created_at,updated_at) SELECT ?,coordination_id,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? FROM sessions WHERE id=?`, value.ID, value.Agent, value.ExternalID, value.ClaudeSessionID, value.Workspace, value.DisplayName, value.DisplayNameSource, value.Role, value.State, value.Source, value.Connection, value.ProcessID, value.SessionMetaPath, value.HistoryPath, formatOptionalTime(value.LastDiscoveredAt), formatOptionalTime(value.LastObservedAt), value.LastError, string(caps), value.CreatedAt.UTC().Format(timeFormat), value.UpdatedAt.UTC().Format(timeFormat), oldID)
+		if err != nil {
+			return err
+		}
+		if affected, err := result.RowsAffected(); err != nil {
+			return err
+		} else if affected != 1 {
+			return sql.ErrNoRows
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE sessions SET daemon_id=?,agent_session_id=? WHERE id=?`, value.DaemonID, value.AgentSessionID, value.ID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE observation_cursors SET session_id=? WHERE session_id=?`, value.ID, oldID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE id=?`, oldID); err != nil {
+			return err
+		}
+		return tx.Commit()
+	})
 }
 
 func (s *Store) UpdateSessionDisplayName(ctx context.Context, id, displayName, source string) error {

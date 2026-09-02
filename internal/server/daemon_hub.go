@@ -307,8 +307,88 @@ func (h *daemonHub) handleFrame(c *daemonConnection, frame protocol.Envelope) er
 				h.routes[item.SessionID] = c.id
 			}
 		}
+		// A provider history scan and managed-session rekey can cross in flight.
+		// Reconcile the two views while installing a resync, so one native
+		// session cannot be exposed as separate TUI and history rows even when
+		// their temporary Agora IDs differ.
+		for historyID, item := range history {
+			for _, live := range sessions {
+				if (item.AgentSessionID != "" && item.AgentSessionID == live.AgentSessionID) ||
+					(item.Agent != "" && item.Agent == live.Agent && item.HistoryPath != "" && item.HistoryPath == live.HistoryPath) {
+					delete(history, historyID)
+					if h.routes[historyID] == c.id {
+						delete(h.routes, historyID)
+					}
+					break
+				}
+			}
+		}
 		h.sessions[c.id] = sessions
 		h.history[c.id] = history
+		h.mu.Unlock()
+		return nil
+	case protocol.SessionRebind:
+		var payload protocol.SessionRebindPayload
+		if err := protocol.DecodePayload(frame, &payload); err != nil {
+			return err
+		}
+		if payload.OldSessionID == "" || payload.NewSessionID == "" || payload.OldSessionID == payload.NewSessionID {
+			return errors.New("session rebind requires distinct old and new session ids")
+		}
+		identity, err := session.ParseSessionID(payload.NewSessionID)
+		if err != nil || identity.DaemonID != c.id {
+			if err == nil {
+				err = fmt.Errorf("session %s is not owned by daemon %s", payload.NewSessionID, c.id)
+			}
+			return err
+		}
+		if payload.Agent != "" && payload.Agent != identity.Agent {
+			return fmt.Errorf("session rebind agent %q does not match %q", payload.Agent, identity.Agent)
+		}
+		if payload.AgentSessionID != "" && payload.AgentSessionID != identity.AgentSessionID {
+			return fmt.Errorf("session rebind native id %q does not match %q", payload.AgentSessionID, identity.AgentSessionID)
+		}
+		var stored session.Session
+		if h.store != nil {
+			value, getErr := h.store.GetSession(context.Background(), payload.OldSessionID)
+			if getErr != nil {
+				return getErr
+			}
+			value.ID = payload.NewSessionID
+			value.DaemonID = c.id
+			value.Agent = identity.Agent
+			value.AgentSessionID = identity.AgentSessionID
+			if payload.HistoryPath != "" {
+				value.HistoryPath = payload.HistoryPath
+			}
+			if rekeyErr := h.store.RekeySession(context.Background(), payload.OldSessionID, value); rekeyErr != nil {
+				return rekeyErr
+			}
+			stored = value
+		}
+		h.mu.Lock()
+		old := h.sessions[c.id][payload.OldSessionID]
+		if h.store != nil && old.SessionID == "" {
+			old.SessionID = stored.ID
+			old.DaemonID = stored.DaemonID
+			old.Agent = stored.Agent
+			old.AgentSessionID = stored.AgentSessionID
+			old.HistoryPath = stored.HistoryPath
+		}
+		delete(h.sessions[c.id], payload.OldSessionID)
+		delete(h.routes, payload.OldSessionID)
+		old.SessionID = payload.NewSessionID
+		old.Agent = identity.Agent
+		old.AgentSessionID = identity.AgentSessionID
+		if payload.HistoryPath != "" {
+			old.HistoryPath = payload.HistoryPath
+		}
+		old.DaemonID = c.id
+		if h.sessions[c.id] == nil {
+			h.sessions[c.id] = make(map[string]protocol.SessionSummary)
+		}
+		h.sessions[c.id][payload.NewSessionID] = old
+		h.routes[payload.NewSessionID] = c.id
 		h.mu.Unlock()
 		return nil
 	case protocol.SessionUpdate:
@@ -356,6 +436,11 @@ func (h *daemonHub) handleFrame(c *daemonConnection, frame protocol.Envelope) er
 				existing.PID = payload.PID
 			}
 			h.sessions[c.id][payload.SessionID] = existing
+			// A session can be advertised as history before its managed PTY has
+			// completed native identity reconciliation. Once the live update
+			// arrives, remove the matching history alias immediately instead of
+			// waiting for the next full resync.
+			h.removeHistoryAliasLocked(c.id, existing)
 			h.mu.Unlock()
 			if payload.Attention != "" && h.onSessionAttention != nil {
 				h.onSessionAttention(payload.SessionID, payload.Attention)
@@ -364,7 +449,7 @@ func (h *daemonHub) handleFrame(c *daemonConnection, frame protocol.Envelope) er
 		return nil
 	case protocol.EventBatch:
 		return h.handleEventBatch(c, frame)
-	case protocol.SessionInputResult, protocol.SessionStopResult, protocol.SessionHistoryResponse, protocol.SnapshotResponse, protocol.SessionCreated:
+	case protocol.SessionInputResult, protocol.SessionStopResult, protocol.SessionHistoryResponse, protocol.SnapshotResponse, protocol.AttachResponse, protocol.SessionCreated:
 		log.Printf("agora server: response %s request %s", frame.Type, frame.RequestID)
 		if frame.RequestID == "" {
 			return nil
@@ -696,11 +781,14 @@ func (h *daemonHub) upsertLiveSession(value session.Session) {
 	if err != nil {
 		return
 	}
+	if value.AgentSessionID == "" {
+		value.AgentSessionID = identity.AgentSessionID
+	}
 	h.mu.Lock()
 	if h.sessions[identity.DaemonID] == nil {
 		h.sessions[identity.DaemonID] = make(map[string]protocol.SessionSummary)
 	}
-	h.sessions[identity.DaemonID][value.ID] = protocol.SessionSummary{
+	summary := protocol.SessionSummary{
 		SessionID: value.ID, DaemonID: identity.DaemonID, Agent: value.Agent,
 		AgentSessionID: value.AgentSessionID, ClaudeSessionID: value.ClaudeSessionID,
 		Workspace: value.Workspace, DisplayName: value.DisplayName, DisplayNameSource: value.DisplayNameSource,
@@ -708,7 +796,23 @@ func (h *daemonHub) upsertLiveSession(value session.Session) {
 		State: value.State, Connection: value.Connection, PID: value.ProcessID,
 		CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
 	}
+	h.sessions[identity.DaemonID][value.ID] = summary
+	h.removeHistoryAliasLocked(identity.DaemonID, summary)
 	h.mu.Unlock()
+}
+
+// removeHistoryAliasLocked removes history rows that identify the same native
+// provider session as a live row. It must be called with h.mu held.
+func (h *daemonHub) removeHistoryAliasLocked(daemonID string, live protocol.SessionSummary) {
+	for historyID, history := range h.history[daemonID] {
+		if (live.AgentSessionID != "" && history.AgentSessionID == live.AgentSessionID) ||
+			(live.Agent != "" && live.Agent == history.Agent && live.HistoryPath != "" && history.HistoryPath == live.HistoryPath) {
+			delete(h.history[daemonID], historyID)
+			if h.routes[historyID] == daemonID {
+				delete(h.routes, historyID)
+			}
+		}
+	}
 }
 
 func (h *daemonHub) historySessions(coordinationID string) []session.Session {
