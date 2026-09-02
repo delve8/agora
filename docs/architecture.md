@@ -2,7 +2,7 @@
 
 > 状态：Design / 下一阶段实现目标
 >
-> 本文描述产品化一期的 Server / Daemon / Agent Runtime 架构、数据边界与断连行为。Web UI、事件规范化模型和通知 adapter 基础已在当前仓库实现；Server–Daemon 拆分、设备配对、远程 relay 与按需历史仍是下一阶段实现目标。Claude Code 的 PTY 是当前 provider 实现，Pi 的 stdio RPC/JSONL 是下一接入实现；二者都不是 Server 协议的前提。
+> 本文描述产品化一期的 Server / Daemon / Agent Runtime 架构、数据边界与断连行为。Web UI、事件规范化模型和通知 adapter 基础已在当前仓库实现；Server–Daemon 拆分、设备配对、远程 relay 与按需历史仍是下一阶段实现目标。Claude Code 的 PTY 是当前 provider 实现，Pi 的 stdio RPC/JSONL 是下一接入实现；二者都不是 Server 协议的前提。Daemon 重启期间保持 Agent 运行态的 per-session `session-host` 目标设计见 [session-host.md](session-host.md)。
 
 ## 1. 角色与职责
 
@@ -16,10 +16,14 @@ Web Browser ───────────────┐
                            ▲
                            │ outbound 长连接（自动重连）
                     Agora Daemon（用户电脑）
-              provider registry + Agent Runtime
+              provider registry + Host clients
               live observer + history reader + outbox
-                           ▲
+                           │ control socket
+                           ▼
+                 Session Host（每个 Session 一个）
+                           │
                            │ PTY / stdio RPC / HTTP / ACP
+                           ▼
                     外部 Agent Session
 ```
 
@@ -38,11 +42,21 @@ Web Browser ───────────────┐
 ### Daemon
 
 - 运行在用户电脑；
-- 通过 provider registry 选择 Agent Runtime，启动/恢复目标 Agent；
-- 使用对应的 control transport、live observer 和 history reader；
-- 维护可选的 terminal snapshot/attach（当前主要由 Claude PTY 使用）；
+- 通过 provider registry 选择 Agent Runtime 和 Session Host；
+- 通过 Host control socket 管理目标 Agent，不直接拥有跨 Daemon 重启所需的 Agent process/PTY；
+- 使用对应的 live observer 和 history reader；
 - 通过出站连接自动连接 Server；
-- 断线继续运行本地 Agent，在有限 outbox 内缓存关键状态。
+- 断线继续连接 Session Host，在有限 outbox 内缓存关键状态；
+- 重启后扫描本地 runtime registry，重新接管仍存活的 Session Host。
+
+### Session Host（目标架构）
+
+- 一个 managed Agora Session 对应一个独立 Host；
+- 持有 Agent child process、PTY/stdio/HTTP-ACP transport 及可选 attach surface；
+- Daemon 断线或重启时继续运行，不把 disconnect 当作 stop；
+- Agent 退出后发送退出结果、清理 socket/metadata/PTY 并自行退出；
+- 负责本地 control socket 的 handshake、token 校验和运行态 identity；
+- 详细的进程拓扑、接管、清理、rebind 和安全约束见 [session-host.md](session-host.md)。
 
 ### Wrapper
 
@@ -126,7 +140,10 @@ Claude → Daemon → Server（短暂处理明文） → Web / IM
 ## 5. 流量路径
 
 ```text
-claude-wrapper / Web UI / Pi RPC driver
+pi / claude wrapper
+        │  local Unix socket (~/.agora/daemon.sock)
+        ▼
+Agora Daemon ── device credential / WebSocket ──→ Agora Server
         │  provider-specific control transport
         ▼
 外部 Agent Session
@@ -139,10 +156,14 @@ Observation / History adapters → Daemon → Server 内存 SSE/通知 → Web
 认证模式下的请求路径：
 
 ```text
-Web principal（Logto 登录或 local 用户）
-        │  Server 校验身份
+Native wrapper（无浏览器 token）
+        │  local daemon IPC
         ▼
-Server 校验 session ownership
+Daemon device credential
+        │  Server 校验设备身份
+        ▼
+Web principal（Logto 登录或 local 用户）
+        │  Server 校验 session ownership
         │  session.daemon_id → device.user_id == principal.user_id
         ▼
 Server 向目标 Daemon 发起 relay
@@ -161,10 +182,10 @@ Daemon PTY Manager → Claude Code
 - Web 认证：Logto OIDC（授权码 + PKCE）为推荐身份服务；`TokenValidator` / `UserLookup` 保持接口抽象，可替换为其他 OIDC provider；
 - 运行模式：`AGORA_AUTH_MODE=local`（默认 trust-local，强制 loopback）或 `AGORA_AUTH_MODE=logto`（显式认证 + TLS）；
 - 设备归属：已认证用户签发一次性 pairing code，Daemon 换取 per-device credential，归属在配对时决定；
-- Daemon ↔ Agent Runtime/Wrapper：Unix domain socket / loopback 控制面；Claude wrapper 使用 PTY attach，Pi 由 Daemon 内 stdio RPC driver 控制；
+- Daemon ↔ Agent Runtime/Wrapper：Unix domain socket / loopback 控制面；Claude 和 Pi wrapper 都通过 Daemon 返回的 PTY attach socket 使用原生 TUI；
 - Server 持久化：当前实现中的控制面和 session metadata；不保存 Daemon 的完整业务历史；
 - Daemon identity：首次运行生成 UUID 并写入 `~/.agora/config.json`；该配置文件只保存设备身份，不保存 Session runtime、PID、transport、cursor 或 history；
-- Daemon 启动时按 provider 的 HistoryCatalog 重新建立内存中的 history index；Claude 使用 `~/.claude/projects/*/*.jsonl`，Pi 使用 `~/.pi/agent/sessions`；这些条目可 resume，但不恢复 PID、transport、cursor 或 observer；
+- Daemon 按 provider 的 HistoryCatalog 持续建立和刷新内存中的 history index；Claude 使用 `~/.claude/projects/*/*.jsonl`，Pi 使用 `~/.pi/agent/sessions`，因此 Daemon 启动后新建的外部会话也能被发现并通过 resync 上报；这些条目可 resume，但不恢复 PID、transport、cursor 或 observer；
 - Claude 历史事实源：用户电脑原有项目 JSONL；Pi 历史事实源：`~/.pi/agent/sessions` 下的 session JSONL；OpenCode 未来可使用 SQLite/export；
 - 前端实时更新：WebSocket（Daemon）+ SSE（Web）；
 

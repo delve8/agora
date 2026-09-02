@@ -48,7 +48,7 @@ Server、Web 和通知层只依赖 canonical ID、规范化事件和能力，不
 - `ControlTransport` 负责协议 framing、请求关联和异步事件，不承担业务状态机；
 - `runtime.Manager` 负责把上述组件组合成 Agora Session，而不是理解每个 Agent 的字段细节。
 
-这能避免把 Claude 的 PTY、Pi 的 RPC、OpenCode 的 HTTP/ACP 塞进一个包含大量无意义 no-op 方法的“大而全 Adapter”。
+这能避免把 Claude 的 PTY、Pi 的 RPC、OpenCode 的 HTTP/ACP 塞进一个包含大量无意义 no-op 方法的“大而全 Adapter”。当 Agent 运行态需要跨 Daemon 重启保持时，以上 driver/transport 由独立的 per-session Session Host 持有；Session Host 的生命周期、接管和清理见 [session-host.md](session-host.md)。
 
 ## 2. 推荐的抽象边界
 
@@ -92,7 +92,19 @@ type SessionDriver interface {
 - `StartedSession` 返回原生 session URI、PID（如果有）、workspace、transport metadata 和可选 history locator；
 - `Wait` 是进程/driver 生命周期事实，不等同于 Agent 的“回合结束”；回合结束由 live event 或 driver state 解释。
 
-### 2.3 ControlTransport
+### 2.3 Session Host 与 Daemon 生命周期
+
+目标架构中，一个 managed Session 对应一个独立的 Session Host：
+
+```text
+Daemon → Session Host control socket → Agent process / PTY / RPC / ACP
+```
+
+Daemon 只负责 Host client、Server relay、history/observer 和规范化 metadata；Session Host 持有 Agent process 与 transport。Daemon 重启或短暂断线不能终止 Host/Agent，Agent 退出后 Host 负责通知、清理 runtime metadata、socket 和 transport 并自行退出。Session Host 不是 transcript 存储，也不改变 Session、Event、Capabilities 或 canonical ID 模型。
+
+详细设计见 [session-host.md](session-host.md)。
+
+### 2.4 ControlTransport
 
 ```go
 type ControlTransport interface {
@@ -110,7 +122,7 @@ type ControlTransport interface {
 
 Transport 不把 provider 的业务事件直接写入 Server；它只输出原始消息，由 parser 负责归一化。
 
-### 2.4 Observation 与 parser
+### 2.5 Observation 与 parser
 
 ```go
 type HistoryReader interface {
@@ -137,7 +149,7 @@ parser 必须：
 
 `event.Event` 继续作为跨 Agent 的唯一观察模型：`Kind`、`Type`、`Role`、`Content`、`ToolName`、`ToolInput`、`ToolOutput`、`Thinking`、`IsError` 和 `RawJSON`。
 
-### 2.5 History locator 与 cursor
+### 2.6 History locator 与 cursor
 
 History 不是固定路径。每个 provider 负责定义：
 
@@ -147,6 +159,12 @@ type HistoryLocator struct {
     Path     string
     NativeID string
     Metadata map[string]string
+}
+
+type SessionCatalog interface {
+    Provider() string
+    // 返回会话 metadata/locator，不返回 transcript；Daemon 会持续调用。
+    List(ctx context.Context, coordinationID, daemonID string) ([]Session, error)
 }
 
 type Cursor struct {
@@ -159,7 +177,7 @@ type Cursor struct {
 
 Claude 使用项目目录下的 `<session-id>.jsonl`；Pi 使用项目 key 目录下的 session JSONL；OpenCode 使用 SQLite database/session/message/part 查询或 provider export。通用 runtime 只保存 locator 和 cursor，不假定 `.claude`、文件名或 JSON 字段。
 
-### 2.6 运行时 Session rebind：处理 TUI/上下文切换
+### 2.7 运行时 Session rebind：处理 TUI/上下文切换
 
 一个 managed Agent 进程可能允许用户在原生交互界面中切换上下文，例如在 TUI 中执行 `/resume`，或使用 provider 自己的 session picker、`continue`、`switch`、`new context` 命令。启动时通过 `--session-id`、`--resume` 或等价参数建立的绑定，只能证明**启动时**的 Session identity；不能自动证明整个进程生命周期内 TUI 始终使用同一个 native Session。
 
