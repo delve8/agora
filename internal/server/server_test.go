@@ -358,39 +358,6 @@ func TestStateReturnsStoppedDaemonSessionAsResumable(t *testing.T) {
 	}
 }
 
-func TestStateReturnsExitedProxySessionAsResumable(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "agora.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	now := time.Now().UTC()
-	coord := coordination.Coordination{ID: "coord-1", Name: "Test", CreatedAt: now}
-	if err := db.CreateCoordination(context.Background(), coord); err != nil {
-		t.Fatal(err)
-	}
-	workspace := t.TempDir()
-	value := session.Session{ID: "proxy-1", CoordinationID: coord.ID, ClaudeSessionID: "claude-1", Agent: "claude-code", Workspace: workspace, DisplayName: "Proxy", State: session.StateRunning, Source: session.SourceProxy, ProcessID: 999999, Capabilities: session.Capabilities{CanObserve: true, CanStream: true}, CreatedAt: now, UpdatedAt: now}
-	srv := New(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), nil))
-	srv.setProxySession(value)
-	req := httptest.NewRequest(http.MethodGet, "/api/state", nil)
-	resp := httptest.NewRecorder()
-	srv.HTTP.Handler.ServeHTTP(resp, req)
-	var state struct {
-		Sessions []session.Session `json:"sessions"`
-	}
-	if err := json.Unmarshal(resp.Body.Bytes(), &state); err != nil {
-		t.Fatal(err)
-	}
-	if len(state.Sessions) != 1 {
-		t.Fatalf("unexpected sessions: %+v", state.Sessions)
-	}
-	got := state.Sessions[0]
-	if got.State != session.StateStopped || got.ProcessID != 0 || got.Capabilities.CanStream || !got.Capabilities.CanResume {
-		t.Fatalf("exited proxy session still appears live: %+v", got)
-	}
-}
-
 func TestResumeEphemeralHistoryUsesSameID(t *testing.T) {
 	home := t.TempDir()
 	workspace := filepath.Join(home, "workspace")
@@ -447,55 +414,6 @@ func TestResumeEphemeralHistoryUsesSameID(t *testing.T) {
 	stored, err := db.ListSessions(context.Background(), coord.ID)
 	if err != nil || len(stored) != 1 || stored[0].ID != originalID {
 		t.Fatalf("resume created duplicate metadata: %+v, %v", stored, err)
-	}
-}
-
-func TestProxyEventsAreLiveOnlyAndDeduplicated(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "agora.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	now := time.Now().UTC()
-	coord := coordination.Coordination{ID: "coord-1", Name: "Test", CreatedAt: now}
-	if err := db.CreateCoordination(context.Background(), coord); err != nil {
-		t.Fatal(err)
-	}
-	value := session.Session{ID: "sess-proxy", CoordinationID: coord.ID, Agent: "claude-code", DisplayName: "Proxy", State: session.StateRunning, Source: session.SourceProxy, Capabilities: session.Capabilities{CanObserve: true, CanStream: true}, CreatedAt: now, UpdatedAt: now}
-	if err := db.CreateSession(context.Background(), value); err != nil {
-		t.Fatal(err)
-	}
-	srv := New(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), runtime.NewPTYManager("", "")))
-	ch, unsubscribe := srv.daemons.Subscribe(value.ID)
-	defer unsubscribe()
-	body := []byte(`[{"id":"evt-1","external_id":"external-1","source":"stream","kind":"assistant","content":"live"}]`)
-	for index := 0; index < 2; index++ {
-		req := httptest.NewRequest(http.MethodPost, "/api/proxy/sessions/sess-proxy/events", bytes.NewReader(body))
-		req.RemoteAddr = "127.0.0.1:12345"
-		resp := httptest.NewRecorder()
-		srv.HTTP.Handler.ServeHTTP(resp, req)
-		if resp.Code != http.StatusOK {
-			t.Fatalf("expected 200, got %d: %s", resp.Code, resp.Body.String())
-		}
-	}
-	select {
-	case item := <-ch:
-		if item.Content != "live" {
-			t.Fatalf("unexpected live event: %+v", item)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("live event was not published")
-	}
-	select {
-	case item := <-ch:
-		t.Fatalf("duplicate event was published: %+v", item)
-	case <-time.After(50 * time.Millisecond):
-	}
-	req := httptest.NewRequest(http.MethodGet, "/api/sessions/sess-proxy/events", nil)
-	resp := httptest.NewRecorder()
-	srv.HTTP.Handler.ServeHTTP(resp, req)
-	if resp.Code != http.StatusOK || resp.Body.String() != "[]\n" {
-		t.Fatalf("expected empty proxy history, got %d: %q", resp.Code, resp.Body.String())
 	}
 }
 

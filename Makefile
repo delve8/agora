@@ -5,8 +5,6 @@ NPM ?= npm
 WEB_DIR ?= web
 BIN_DIR ?= bin
 AGORA_BIN ?= $(BIN_DIR)/agora
-PROXY_BIN ?= $(BIN_DIR)/agora-claude-proxy
-
 AGORA_ADDR ?= 127.0.0.1:8080
 AGORA_DB ?= $(CURDIR)/.agora/agora.db
 AGORA_SERVER_ADDR ?= $(AGORA_ADDR)
@@ -54,7 +52,6 @@ build: build-go build-web
 build-go:
 	@mkdir -p "$(BIN_DIR)"
 	$(GO) build -o "$(AGORA_BIN)" ./cmd/agora
-	$(GO) build -o "$(PROXY_BIN)" ./cmd/agora-claude-proxy
 
 web-install:
 	@if [ ! -d "$(WEB_DIR)/node_modules" ]; then \

@@ -21,7 +21,6 @@ const (
 const (
 	SourceManaged  = "managed"
 	SourceExternal = "external"
-	SourceProxy    = "proxy"
 	SourceHistory  = "history"
 )
 

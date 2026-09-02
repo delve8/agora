@@ -3,13 +3,11 @@ package server
 import (
 	"context"
 	"crypto/rand"
-	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -40,10 +38,6 @@ type Server struct {
 	daemons *daemonHub
 	auth    *auth.Authenticator
 
-	// proxySessions holds proxy-registered sessions in memory so the session
-	// list never has to read them back from the store.
-	proxyMu        sync.Mutex
-	proxySessions  map[string]session.Session
 	notifyMu       sync.Mutex
 	notifyPolicies map[string]*notification.Policy
 }
@@ -73,7 +67,7 @@ func NewWithWebDirAndAuth(addr string, db *store.Store, manager *runtime.Manager
 			local = principal
 		}
 	}
-	s := &Server{store: db, manager: manager, daemons: newDaemonHub(db, authConfig.Mode), auth: auth.NewAuthenticatorWithProvisioning(authConfig.Mode, validator, db, local, authConfig.Provisioning), proxySessions: make(map[string]session.Session), notifyPolicies: make(map[string]*notification.Policy)}
+	s := &Server{store: db, manager: manager, daemons: newDaemonHub(db, authConfig.Mode), auth: auth.NewAuthenticatorWithProvisioning(authConfig.Mode, validator, db, local, authConfig.Provisioning), notifyPolicies: make(map[string]*notification.Policy)}
 	s.daemons.onEvents = s.notifyObservedEvents
 	s.daemons.onSessionAttention = s.notifySessionAttention
 	s.daemons.onSessionExit = func(id string, code int, lastError string, _ bool) {
@@ -114,9 +108,6 @@ func NewWithWebDirAndAuth(addr string, db *store.Store, manager *runtime.Manager
 	mux.HandleFunc("POST /api/sessions/{id}/messages", s.createMessage)
 	mux.HandleFunc("GET /api/sessions/{id}/attach", s.attachAddr)
 	mux.HandleFunc("GET /api/sessions/{id}/pty/snapshot", s.ptySnapshot)
-	mux.HandleFunc("POST /api/proxy/sessions", s.registerProxySession)
-	mux.HandleFunc("POST /api/proxy/sessions/{id}/events", s.ingestProxyEvents)
-	mux.HandleFunc("POST /api/proxy/sessions/{id}/exit", s.reportProxyExit)
 	mux.Handle("/", s.frontendHandler(webDir))
 	s.HTTP = &http.Server{Addr: addr, Handler: s.authMiddleware(mux)}
 	return s
@@ -194,7 +185,7 @@ func (s *Server) effectiveStoredSession(ctx context.Context, value session.Sessi
 	if value.Source == session.SourceManaged {
 		return s.daemons.effectiveSession(value), nil
 	}
-	if value.Source == session.SourceProxy || value.Source == session.SourceExternal {
+	if value.Source == session.SourceExternal {
 		if value.ProcessID > 0 && adapter.ProcessAlive(value.ProcessID) {
 			return value, nil
 		}
@@ -802,9 +793,9 @@ func (s *Server) revokeDevice(w http.ResponseWriter, r *http.Request) {
 }
 
 // liveSessions builds the session list from live sources only: connected
-// daemons (daemon mode), the local manager (serve mode), and proxy sessions
-// registered in memory. It never reads sessions back from the store, so stale
-// persisted rows for daemons that are offline never surface.
+// daemons (daemon mode) or the local manager (serve mode). It never reads
+// sessions back from the store, so stale persisted rows for offline daemons
+// never surface.
 func (s *Server) liveSessions(ctx context.Context, coordinationID string) ([]session.Session, error) {
 	sessions := make([]session.Session, 0)
 	if s.manager != nil && s.manager.CanManageSessions() {
@@ -816,7 +807,6 @@ func (s *Server) liveSessions(ctx context.Context, coordinationID string) ([]ses
 	} else {
 		sessions = append(sessions, s.daemons.liveSessions(coordinationID)...)
 	}
-	sessions = append(sessions, s.proxySessionList()...)
 	return sessions, nil
 }
 
@@ -1223,7 +1213,7 @@ func (s *Server) getEvents(w http.ResponseWriter, r *http.Request) {
 	// their history path/workspace metadata. Do not turn that temporary
 	// incompleteness into a permanently empty transcript: the daemon can still
 	// resolve the canonical session from its route/history catalog.
-	remoteDaemonSession := s.manager == nil && value.Source != session.SourceProxy && value.NativeSessionURI() != ""
+	remoteDaemonSession := s.manager == nil && value.NativeSessionURI() != ""
 	if !value.Capabilities.CanReadHistory && !remoteDaemonSession {
 		writeJSON(w, http.StatusOK, []event.Event{})
 		return
@@ -1235,15 +1225,13 @@ func (s *Server) getEvents(w http.ResponseWriter, r *http.Request) {
 		values, err = s.manager.HistoryForSession(r.Context(), value, 0)
 	} else if location == sessionLocationDaemonHistory {
 		values, err = s.requestDaemonHistory(r.Context(), sessionID, historyRequestLimit(limit), before)
-	} else if s.manager != nil && (s.manager.CanManageSessions() || value.Source == session.SourceProxy && value.HistoryPath != "") {
+	} else if s.manager != nil && (s.manager.CanManageSessions()) {
 		values, err = s.manager.History(r.Context(), sessionID, 0)
-	} else if value.Source != session.SourceProxy {
-		values, err = s.requestDaemonHistory(r.Context(), sessionID, historyRequestLimit(limit), before)
 	} else {
-		values = []event.Event{}
+		values, err = s.requestDaemonHistory(r.Context(), sessionID, historyRequestLimit(limit), before)
 	}
 	if err != nil {
-		if location == sessionLocationDaemonHistory || (s.manager == nil && value.Source != session.SourceProxy) {
+		if location == sessionLocationDaemonHistory || (s.manager == nil) {
 			writeErrorStatus(w, http.StatusBadGateway, err)
 		} else {
 			writeError(w, err)
@@ -1332,7 +1320,7 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 	var ch <-chan event.Event
 	var unsubscribe func()
-	if s.manager != nil && s.manager.CanManageSessions() && value.Source != session.SourceProxy {
+	if s.manager != nil && s.manager.CanManageSessions() {
 		ch, unsubscribe = s.manager.Subscribe(value.CoordinationID)
 	} else {
 		ch, unsubscribe = s.daemons.Subscribe(sessionID)
@@ -1499,224 +1487,6 @@ func (s *Server) createMessage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, msg)
 }
 
-func (s *Server) registerProxySession(w http.ResponseWriter, r *http.Request) {
-	if !s.proxyRequestAllowed(r) {
-		writeErrorStatus(w, http.StatusForbidden, fmt.Errorf("proxy endpoint requires a loopback request"))
-		return
-	}
-	var input struct {
-		Workspace   string `json:"workspace"`
-		DisplayName string `json:"display_name"`
-		WrapperPID  int    `json:"wrapper_pid"`
-		RealPID     int    `json:"real_pid"`
-		ResumeID    string `json:"resume_id"`
-	}
-	if err := decodeJSON(r, &input); err != nil {
-		writeErrorStatus(w, http.StatusBadRequest, err)
-		return
-	}
-	coordinations, err := s.store.ListCoordinations(r.Context())
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	var coordinationID string
-	if len(coordinations) == 0 {
-		coord := coordination.Coordination{ID: newID("coord"), Name: "Default Coordination", CreatedAt: time.Now().UTC()}
-		if err := s.store.CreateCoordination(r.Context(), coord); err != nil {
-			writeError(w, err)
-			return
-		}
-		coordinationID = coord.ID
-	} else {
-		coordinationID = coordinations[0].ID
-	}
-	workspace := strings.TrimSpace(input.Workspace)
-	if workspace != "" {
-		workspace, err = filepath.Abs(workspace)
-		if err != nil {
-			writeErrorStatus(w, http.StatusBadRequest, err)
-			return
-		}
-	}
-	displayName := strings.TrimSpace(input.DisplayName)
-	if displayName == "" {
-		displayName = "New session"
-	}
-	now := time.Now().UTC()
-	value := session.Session{
-		ID:                newID("sess"),
-		CoordinationID:    coordinationID,
-		Agent:             "claude-code",
-		ExternalID:        strings.TrimSpace(input.ResumeID),
-		ClaudeSessionID:   strings.TrimSpace(input.ResumeID),
-		Workspace:         workspace,
-		DisplayName:       displayName,
-		DisplayNameSource: session.InitialDisplayNameSource(displayName),
-		State:             session.StateRunning,
-		Source:            session.SourceProxy,
-		Connection:        session.ConnectionObserved,
-		ProcessID:         input.RealPID,
-		Capabilities: session.Capabilities{
-			CanObserve: true,
-			CanStream:  true,
-		},
-		CreatedAt: now,
-		UpdatedAt: now,
-	}
-	if value.ProcessID == 0 {
-		value.ProcessID = input.WrapperPID
-	}
-	if value.ClaudeSessionID != "" && s.manager != nil {
-		value.HistoryPath = adapter.FindHistoryBySessionID("", value.ClaudeSessionID)
-		value.Capabilities.CanReadHistory = value.HistoryPath != ""
-	}
-	if err := s.store.CreateSession(r.Context(), value); err != nil {
-		writeError(w, err)
-		return
-	}
-	s.setProxySession(value)
-	writeJSON(w, http.StatusCreated, value)
-}
-
-func (s *Server) ingestProxyEvents(w http.ResponseWriter, r *http.Request) {
-	if !s.proxyRequestAllowed(r) {
-		writeErrorStatus(w, http.StatusForbidden, fmt.Errorf("proxy endpoint requires a loopback request"))
-		return
-	}
-	sessionID := r.PathValue("id")
-	value, err := s.store.GetSession(r.Context(), sessionID)
-	if errors.Is(err, sql.ErrNoRows) {
-		writeErrorStatus(w, http.StatusNotFound, err)
-		return
-	}
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	if value.Source != session.SourceProxy {
-		writeErrorStatus(w, http.StatusConflict, fmt.Errorf("session is not a proxy session"))
-		return
-	}
-	var values []event.Event
-	if err := decodeJSON(r, &values); err != nil {
-		writeErrorStatus(w, http.StatusBadRequest, err)
-		return
-	}
-	if len(values) > 256 {
-		writeErrorStatus(w, http.StatusRequestEntityTooLarge, fmt.Errorf("event batch is too large"))
-		return
-	}
-	for index := range values {
-		values[index].SessionID = sessionID
-		if values[index].Source == "" {
-			values[index].Source = event.SourceStream
-		}
-		if values[index].ID == "" {
-			identity := values[index].ExternalID
-			if identity == "" {
-				identity = values[index].RawJSON
-			}
-			if identity == "" {
-				identity = values[index].Kind + "\x00" + values[index].Content
-			}
-			values[index].ID = stableProxyEventID(sessionID, identity)
-		}
-		if values[index].CreatedAt.IsZero() {
-			values[index].CreatedAt = time.Now().UTC()
-		}
-	}
-	inserted := s.daemons.Publish(sessionID, values)
-	writeJSON(w, http.StatusOK, map[string]int{"ingested": inserted})
-}
-
-func (s *Server) reportProxyExit(w http.ResponseWriter, r *http.Request) {
-	if !s.proxyRequestAllowed(r) {
-		writeErrorStatus(w, http.StatusForbidden, fmt.Errorf("proxy endpoint requires a loopback request"))
-		return
-	}
-	sessionID := r.PathValue("id")
-	value, err := s.store.GetSession(r.Context(), sessionID)
-	if errors.Is(err, sql.ErrNoRows) {
-		writeErrorStatus(w, http.StatusNotFound, err)
-		return
-	}
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	if value.Source != session.SourceProxy {
-		writeErrorStatus(w, http.StatusConflict, fmt.Errorf("session is not a proxy session"))
-		return
-	}
-	var input struct {
-		State         string `json:"state"`
-		LastError     string `json:"last_error"`
-		ExitCode      int    `json:"exit_code"`
-		Signal        string `json:"signal"`
-		DroppedEvents int    `json:"dropped_events"`
-	}
-	if err := decodeJSON(r, &input); err != nil {
-		writeErrorStatus(w, http.StatusBadRequest, err)
-		return
-	}
-	if input.State != session.StateFailed {
-		input.State = session.StateStopped
-	}
-	now := time.Now().UTC()
-	value.State = input.State
-	value.Connection = session.ConnectionStale
-	value.LastObservedAt = &now
-	value.LastError = input.LastError
-	if err := s.store.UpdateSessionObservation(r.Context(), value); err != nil {
-		writeError(w, err)
-		return
-	}
-	s.setProxySession(value)
-	if input.State == session.StateFailed {
-		s.notifyTaskResult(value.ID, false, value.LastError, "")
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "exit_code": input.ExitCode, "signal": input.Signal, "dropped_events": input.DroppedEvents})
-}
-
-func (s *Server) setProxySession(value session.Session) {
-	s.proxyMu.Lock()
-	s.proxySessions[value.ID] = value
-	s.proxyMu.Unlock()
-}
-
-// proxySessionList returns the proxy sessions registered in memory, dropping
-// entries whose process has exited.
-func (s *Server) proxySessionList() []session.Session {
-	s.proxyMu.Lock()
-	values := make([]session.Session, 0, len(s.proxySessions))
-	for id, value := range s.proxySessions {
-		if value.ProcessID > 0 && !adapter.ProcessAlive(value.ProcessID) {
-			value.State = session.StateStopped
-			value.Connection = session.ConnectionUnavailable
-			value.ProcessID = 0
-			value.Capabilities = session.Capabilities{CanReadHistory: value.HistoryPath != "" || value.ClaudeSessionID != "", CanResume: value.ClaudeSessionID != "" && value.Workspace != ""}
-			s.proxySessions[id] = value
-		}
-		values = append(values, value)
-	}
-	s.proxyMu.Unlock()
-	return values
-}
-
-func (s *Server) proxyRequestAllowed(r *http.Request) bool {
-	if token := os.Getenv("AGORA_PROXY_TOKEN"); token != "" {
-		provided := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
-		return subtle.ConstantTimeCompare([]byte(provided), []byte(token)) == 1
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		host = r.RemoteAddr
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
-}
-
 func decodeJSON(r *http.Request, value any) error {
 	r.Body = http.MaxBytesReader(nil, r.Body, 1<<20)
 	decoder := json.NewDecoder(r.Body)
@@ -1749,15 +1519,6 @@ func writeError(w http.ResponseWriter, err error) {
 func writeErrorStatus(w http.ResponseWriter, status int, err error) {
 	writeJSON(w, status, map[string]string{"error": err.Error()})
 }
-func stableProxyEventID(sessionID, identity string) string {
-	var hash uint64 = 14695981039346656037
-	for _, value := range []byte(sessionID + "\x00" + identity) {
-		hash ^= uint64(value)
-		hash *= 1099511628211
-	}
-	return fmt.Sprintf("evt-%x", hash)
-}
-
 func newID(prefix string) string { return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano()) }
 func newUUID() string {
 	var value [16]byte
