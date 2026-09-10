@@ -493,6 +493,29 @@ Host 可能因 kill -9、机器断电或运行时崩溃来不及删除 metadata�
   ⇒ 确认 context switch
 ```
 
+### 8.1.1 context switch 本身没有任何持久化痕迹
+
+对 Pi 0.84 的实测结论：**切换动作不会写进任何 transcript**。
+
+全部 session 文件的 record type 只有：
+
+```text
+message / text / thinking             会话内容
+session                               每个文件恰好一条 header（resume 不会重写）
+model_change / thinking_level_change  状态类命令（/model、thinking level）
+compaction                            /compact
+session_info                          /name
+image
+```
+
+没有 `resume` / `switch` / `fork` 之类的记录类型，`session` header 每个文件只有一条，`~/.pi/agent` 下也没有 current-session 指针文件（`pi -c` 是按目录内 mtime 推断的）。切换只是把后续写入重定向到另一个文件，两个文件都不会得到标记。
+
+因此：
+
+- 切换发生后、用户在目标会话发出第一条消息之前，history 侧**不存在任何证据**；
+- rebind 必然由“下一条消息”触发，UI 在此期间仍显示旧 canonical ID（history 为空）属于已知行为，不是可以靠监听按键修复的缺陷；
+- 若需要“切换瞬间即可感知”，只能由 provider 结构化暴露（例如 Pi 的 `--mode rpc` 或等价 session-state event），这也符合 `docs/agent-integration.md` 中“有结构化 context/session 变更事件时优先消费”的约定。屏幕指纹等启发式手段过于脆弱，不作为方向。
+
 ### 8.2 文本比较必须容忍输入法噪声
 
 终端字节流 ≠ provider 存储的消息文本：
