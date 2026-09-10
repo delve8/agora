@@ -44,6 +44,29 @@ const (
 	switchEvidenceSkew = 5 * time.Minute
 )
 
+// switchDebugf appends a diagnostic line when AGORA_SWITCH_DEBUG is set. The
+// watcher runs inside the Daemon, whose stdout is the user's terminal, so the
+// state machine writes to a file that can be inspected after the fact.
+func switchDebugf(format string, args ...any) {
+	if strings.TrimSpace(os.Getenv("AGORA_SWITCH_DEBUG")) == "" {
+		return
+	}
+	path := strings.TrimSpace(os.Getenv("AGORA_SWITCH_DEBUG_FILE"))
+	if path == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return
+		}
+		path = filepath.Join(home, ".agora", "switch-debug.log")
+	}
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+	fmt.Fprintf(file, "%s %s\n", time.Now().UTC().Format(time.RFC3339Nano), fmt.Sprintf(format, args...))
+}
+
 // switchCandidate tracks one transcript file that could belong to a session.
 type switchCandidate struct {
 	path      string
@@ -72,6 +95,7 @@ type watchedLine struct {
 // A unique candidate is required, so an ambiguous situation never rebinds.
 type switchWatcher struct {
 	mu         sync.Mutex
+	id         string
 	agent      string
 	workspace  string
 	ownNative  string
@@ -82,8 +106,8 @@ type switchWatcher struct {
 	cancel     context.CancelFunc
 }
 
-func newSwitchWatcher(agent, workspace, ownNative, ownPath string) *switchWatcher {
-	watcher := &switchWatcher{agent: agent, workspace: workspace, ownNative: ownNative, ownPaths: make(map[string]bool), candidates: make(map[string]*switchCandidate)}
+func newSwitchWatcher(id, agent, workspace, ownNative, ownPath string) *switchWatcher {
+	watcher := &switchWatcher{id: id, agent: agent, workspace: workspace, ownNative: ownNative, ownPaths: make(map[string]bool), candidates: make(map[string]*switchCandidate)}
 	if ownPath != "" {
 		watcher.ownPaths[ownPath] = true
 	}
@@ -152,7 +176,8 @@ func (m *Manager) startSwitchWatcher(value session.Session) {
 		return
 	}
 	native := strings.TrimPrefix(value.NativeSessionURI(), agent+"://")
-	watcher := newSwitchWatcher(agent, value.Workspace, native, value.HistoryPath)
+	watcher := newSwitchWatcher(value.ID, agent, value.Workspace, native, value.HistoryPath)
+	switchDebugf("watcher start id=%s agent=%s workspace=%q own_native=%q own_path=%q", value.ID, agent, value.Workspace, native, value.HistoryPath)
 	ctx, cancel := context.WithCancel(context.Background())
 	watcher.cancel = cancel
 	m.mu.Lock()
@@ -219,11 +244,14 @@ func (m *Manager) refreshSwitchCandidates(ctx context.Context, watcher *switchWa
 	if !listedAt.IsZero() && time.Since(listedAt) < switchCatalogInterval {
 		return
 	}
+	started := time.Now()
 	entries, err := m.switchCatalog(ctx, watcher.agent)
 	if err != nil {
 		log.Printf("agora: context switch catalog unavailable: %v", err)
+		switchDebugf("catalog id=%s error=%v", watcher.id, err)
 		return
 	}
+	switchDebugf("catalog id=%s entries=%d took=%s", watcher.id, len(entries), time.Since(started).Round(time.Millisecond))
 	watcher.mu.Lock()
 	defer watcher.mu.Unlock()
 	watcher.listedAt = time.Now()
@@ -263,11 +291,13 @@ func (m *Manager) scanSwitchCandidates(ctx context.Context, id string, watcher *
 	watcher.mu.Unlock()
 
 	matches := make([]switchCandidate, 0, 2)
+	grown := 0
 	for _, candidate := range paths {
 		info, err := os.Stat(candidate.path)
 		if err != nil || info.Size() <= candidate.size {
 			continue
 		}
+		grown++
 		if candidate.workspace != "" && watcher.workspace != "" && !sameRebindWorkspace(candidate.workspace, watcher.workspace) {
 			// Keep the cursor moving so an unrelated project is not rescanned
 			// from the beginning on every cycle.
@@ -278,10 +308,15 @@ func (m *Manager) scanSwitchCandidates(ctx context.Context, id string, watcher *
 		if info.Size()-from > switchIncrementCap {
 			from = info.Size() - switchIncrementCap
 		}
-		if m.switchIncrementHasUser(ctx, watcher.agent, *candidate, from, texts) {
+		matched := m.switchIncrementHasUser(ctx, watcher.agent, *candidate, from, texts)
+		switchDebugf("scan id=%s path=%s from=%d to=%d matched=%v", watcher.id, candidate.path, from, info.Size(), matched)
+		if matched {
 			matches = append(matches, *candidate)
 		}
 		watcher.advance(candidate.path, info.Size())
+	}
+	if grown > 0 {
+		switchDebugf("scan id=%s texts=%d grown=%d matches=%d", watcher.id, len(texts), grown, len(matches))
 	}
 	if len(matches) != 1 {
 		return false
@@ -292,9 +327,11 @@ func (m *Manager) scanSwitchCandidates(ctx context.Context, id string, watcher *
 	}
 	if err := m.rebindSession(id, watcher.agent, target.sessionID, target.path, target.workspace, "", target.size); err != nil {
 		log.Printf("agora: context switch to %s could not be applied: %v", target.sessionID, err)
+		switchDebugf("rebind id=%s target=%s error=%v", id, target.sessionID, err)
 		return false
 	}
 	log.Printf("agora: session %s followed a provider context switch to %s", id, target.sessionID)
+	switchDebugf("rebind id=%s target=%s history=%s ok", id, target.sessionID, target.path)
 	return true
 }
 
@@ -398,9 +435,45 @@ func (m *Manager) handleAgentInput(id, content string) {
 	watcher := m.switchWatchers[id]
 	m.mu.Unlock()
 	if watcher == nil {
+		// A Session Host is registered under its canonical id, which changes on
+		// rebind. Resolve the watcher from the Host's own identity as a fallback
+		// so input observation cannot be lost to a registry key mismatch.
+		watcher = m.switchWatcherByNative(id, text)
+	}
+	if watcher == nil {
+		switchDebugf("input id=%s no watcher for line=%q", id, truncateDebug(text))
 		return
 	}
+	switchDebugf("input id=%s watcher=%s line=%q", id, watcher.id, truncateDebug(text))
 	watcher.recordLine(text, time.Now())
+}
+
+// switchWatcherByNative finds a watcher that owns the given native session id.
+// It is only used when the canonical id lookup misses.
+func (m *Manager) switchWatcherByNative(id, _ string) *switchWatcher {
+	value, err := m.store.GetSession(context.Background(), id)
+	if err != nil {
+		return nil
+	}
+	native := strings.TrimPrefix(value.NativeSessionURI(), value.Agent+"://")
+	if native == "" {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, watcher := range m.switchWatchers {
+		if watcher.ownNative == native {
+			return watcher
+		}
+	}
+	return nil
+}
+
+func truncateDebug(value string) string {
+	if len(value) <= 60 {
+		return value
+	}
+	return value[:60] + "…"
 }
 
 // hasMatchingUser reports whether the provider wrote one of the submitted

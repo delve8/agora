@@ -104,7 +104,7 @@ func TestSwitchIncrementRequiresSubmittedLineInAnotherTranscript(t *testing.T) {
 // Multi-line input and bracketed paste reach the PTY as several submitted lines
 // but the provider stores them as one user message.
 func TestSwitchWatcherEvidenceCoversMultiLineInput(t *testing.T) {
-	watcher := newSwitchWatcher("pi", "/tmp/workspace", "own-native", "")
+	watcher := newSwitchWatcher("id", "pi", "/tmp/workspace", "own-native", "")
 	watcher.recordLine("first line", time.Now())
 	watcher.recordLine("second line", time.Now())
 	texts := watcher.evidenceTexts(time.Now())
@@ -126,7 +126,7 @@ func TestSwitchWatcherEvidenceCoversMultiLineInput(t *testing.T) {
 // The session's own transcript can never be the switch target.
 func TestSwitchWatcherIgnoresOwnTranscript(t *testing.T) {
 	own := filepath.Join(t.TempDir(), "own.jsonl")
-	watcher := newSwitchWatcher("pi", "/tmp/workspace", "own-native", own)
+	watcher := newSwitchWatcher("id", "pi", "/tmp/workspace", "own-native", own)
 	if !watcher.ownedBySession(switchCandidate{path: own, sessionID: "picked"}) {
 		t.Fatal("the session's own history path was treated as a switch candidate")
 	}

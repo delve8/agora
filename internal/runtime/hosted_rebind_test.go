@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -171,10 +172,16 @@ func TestHostedPiResumeRebindFollowsPickedSession(t *testing.T) {
 	}
 
 	// The provider flushes the user's message into the picked session's
-	// transcript, then the same line is submitted into the TUI.
+	// transcript, then the same line is submitted into the TUI. The terminal
+	// wrapper types through the attach socket, so the test does too.
 	writePiTranscriptRecord(t, transcript, picked, message, time.Now())
-	if err := client.Input(ctx, message); err != nil {
-		t.Fatalf("send message: %v", err)
+	attach, err := net.Dial("unix", client.AttachSocket())
+	if err != nil {
+		t.Fatalf("dial attach socket: %v", err)
+	}
+	defer attach.Close()
+	if _, err := attach.Write([]byte(message + "\r")); err != nil {
+		t.Fatalf("type into attach socket: %v", err)
 	}
 
 	rebound, err := session.NewSessionID("daemon-1", "pi", "pi://"+picked)
