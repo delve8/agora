@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/delve8/agora/internal/adapter"
 	"github.com/delve8/agora/internal/event"
@@ -37,11 +38,22 @@ const (
 	// must not happen once per managed session.
 	switchCatalogTTL = 15 * time.Second
 	// switchEvidenceSkew bounds how far a provider record may sit from the
-	// submitted line it is supposed to confirm. The provider writes the user
-	// message when it is submitted, so a wide skew is unnecessary; a tight one
-	// keeps identical text from an unrelated session in the same workspace from
-	// ever counting as proof.
-	switchEvidenceSkew = 5 * time.Minute
+	// submitted line it is supposed to confirm. A provider writes the user
+	// message as it is submitted, so a tight bound is both accurate and a strong
+	// guard: text that merely resembles another session's message minutes apart
+	// can never count as proof.
+	switchEvidenceSkew = time.Minute
+	// messageGramRunes is the phrase width used to compare an observed keystroke
+	// line with a stored user message. The two streams are not identical: an
+	// input method streams preedit text and replacement characters, and editing
+	// arrives as backspaces, so the composer's final text differs from what the
+	// terminal emitted. Matching measures how much of the observed phrase
+	// reappears in the stored message instead of comparing bytes.
+	messageGramRunes = 4
+	// messageGramRatio is the share of observed phrases that must reappear.
+	messageGramRatio = 0.5
+	// messageGramFloor keeps very short messages from matching on one fragment.
+	messageGramFloor = 2
 )
 
 // switchDebugf appends a diagnostic line when AGORA_SWITCH_DEBUG is set. The
@@ -148,10 +160,17 @@ func (w *switchWatcher) ownedBySession(candidate switchCandidate) bool {
 	return candidate.sessionID != "" && candidate.sessionID == w.ownNative
 }
 
-// evidenceTexts maps every user message the submitted lines could represent to
-// the moment it was submitted. Joins of consecutive lines cover multi-line
-// input and paste, which the provider stores as a single user message.
-func (w *switchWatcher) evidenceTexts(now time.Time) map[string]time.Time {
+// evidenceText is one user message the terminal input could represent, with the
+// moment it was submitted.
+type evidenceText struct {
+	text string
+	at   time.Time
+}
+
+// evidenceTexts lists every user message the submitted lines could represent.
+// Joins of consecutive lines cover multi-line input and paste, which the
+// provider stores as a single user message.
+func (w *switchWatcher) evidenceTexts(now time.Time) []evidenceText {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	lines := make([]watchedLine, 0, len(w.lines))
@@ -161,7 +180,7 @@ func (w *switchWatcher) evidenceTexts(now time.Time) map[string]time.Time {
 		}
 		lines = append(lines, line)
 	}
-	values := make(map[string]time.Time)
+	values := make([]evidenceText, 0, len(lines))
 	for length := 1; length <= len(lines); length++ {
 		window := lines[len(lines)-length:]
 		texts := make([]string, 0, len(window))
@@ -169,7 +188,7 @@ func (w *switchWatcher) evidenceTexts(now time.Time) map[string]time.Time {
 			texts = append(texts, line.text)
 		}
 		if text := normalizeRebindText(strings.Join(texts, "\n")); text != "" {
-			values[text] = window[len(window)-1].at
+			values = append(values, evidenceText{text: text, at: window[len(window)-1].at})
 		}
 	}
 	return values
@@ -362,7 +381,7 @@ func (w *switchWatcher) advance(path string, size int64) {
 // pieces, so a scan routinely observes a half-written line. Advancing the
 // cursor to the current file size would silently discard that line, and the
 // confirming message would never be seen again.
-func (m *Manager) readSwitchIncrement(ctx context.Context, agent string, candidate switchCandidate, from int64, texts map[string]time.Time) (bool, int64) {
+func (m *Manager) readSwitchIncrement(ctx context.Context, agent string, candidate switchCandidate, from int64, texts []evidenceText) (bool, int64) {
 	if agent == "pi" {
 		records, err := adapter.ReadPiHistory(ctx, adapter.PiHistoryCursor{Path: candidate.path, ByteOffset: from}, "pi://"+candidate.sessionID)
 		if err != nil {
@@ -372,6 +391,12 @@ func (m *Manager) readSwitchIncrement(ctx context.Context, agent string, candida
 		consumed := from
 		for _, record := range records {
 			values = append(values, record.Event)
+			if !recordOutsideEvidenceWindow(record.Event) {
+				// Records inside the evidence window stay eligible: a scan can
+				// observe them before the confirming line (or a better matching
+				// rule) is available, and consuming them would lose the switch.
+				continue
+			}
 			if record.Cursor.ByteOffset > consumed {
 				consumed = record.Cursor.ByteOffset
 			}
@@ -386,11 +411,20 @@ func (m *Manager) readSwitchIncrement(ctx context.Context, agent string, candida
 	consumed := from
 	for _, record := range records {
 		values = append(values, record.Event)
+		if !recordOutsideEvidenceWindow(record.Event) {
+			continue
+		}
 		if record.Cursor.ByteOffset > consumed {
 			consumed = record.Cursor.ByteOffset
 		}
 	}
 	return hasMatchingUser(values, texts), consumed
+}
+
+// recordOutsideEvidenceWindow reports whether a record is old enough to be
+// dropped from the candidate window.
+func recordOutsideEvidenceWindow(item event.Event) bool {
+	return !item.CreatedAt.IsZero() && time.Since(item.CreatedAt) > switchLineWindow
 }
 
 type switchCatalogCache struct {
@@ -501,11 +535,16 @@ func truncateDebug(value string) string {
 	return value[:60] + "…"
 }
 
-// hasMatchingUser reports whether the provider wrote one of the submitted
-// messages into the transcript. The record must carry the same text and must
-// have been written around the moment the line was submitted, so identical text
-// from an unrelated point in time can never confirm a context switch.
-func hasMatchingUser(values []event.Event, expected map[string]time.Time) bool {
+// hasMatchingUser reports whether the transcript carries a user message that
+// corresponds to one of the submitted lines.
+//
+// The comparison is deliberately tolerant. The terminal stream contains input
+// method preedit text, replacement characters and edits, while the provider
+// stores only the composer's final text, so an observed line and its stored
+// message are rarely byte-identical. A long shared phrase is required, and the
+// caller additionally requires the same workspace, a submission within a minute
+// and a unique candidate.
+func hasMatchingUser(values []event.Event, expected []evidenceText) bool {
 	if len(expected) == 0 {
 		return false
 	}
@@ -513,18 +552,84 @@ func hasMatchingUser(values []event.Event, expected map[string]time.Time) bool {
 		if item.Kind != event.KindUser {
 			continue
 		}
-		submittedAt, ok := expected[normalizeRebindText(item.Content)]
-		if !ok {
+		stored := normalizeRebindText(item.Content)
+		if stored == "" {
 			continue
 		}
-		if item.CreatedAt.IsZero() {
-			return true
-		}
-		if diff := item.CreatedAt.Sub(submittedAt); diff <= switchEvidenceSkew && diff >= -switchEvidenceSkew {
-			return true
+		for _, candidate := range expected {
+			if !item.CreatedAt.IsZero() {
+				if diff := item.CreatedAt.Sub(candidate.at); diff > switchEvidenceSkew || diff < -switchEvidenceSkew {
+					continue
+				}
+			}
+			if sameUserMessage(candidate.text, stored) {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+// sameUserMessage reports whether an observed keystroke line and a stored user
+// message are the same message. It compares shared phrases rather than bytes so
+// that input-method noise and editing do not hide a real switch, while a merely
+// similar message still fails.
+func sameUserMessage(observed, stored string) bool {
+	left := normalizeRebindText(sanitizeObservedText(observed))
+	right := normalizeRebindText(stored)
+	if left == "" || right == "" {
+		return false
+	}
+	if left == right {
+		return true
+	}
+	observedGrams := phraseGrams(left)
+	if len(observedGrams) == 0 {
+		return false
+	}
+	storedGrams := phraseGrams(right)
+	shared := 0
+	for gram := range observedGrams {
+		if _, ok := storedGrams[gram]; ok {
+			shared++
+		}
+	}
+	need := int(float64(len(observedGrams)) * messageGramRatio)
+	if float64(need) < float64(len(observedGrams))*messageGramRatio {
+		need++
+	}
+	if need < messageGramFloor {
+		need = messageGramFloor
+	}
+	return shared >= need
+}
+
+// sanitizeObservedText drops the replacement characters a terminal or input
+// method emits for input it cannot represent. They carry no user intent and
+// would otherwise break every phrase that spans them.
+func sanitizeObservedText(value string) string {
+	if !strings.ContainsRune(value, utf8.RuneError) {
+		return value
+	}
+	return strings.Map(func(r rune) rune {
+		if r == utf8.RuneError {
+			return -1
+		}
+		return r
+	}, value)
+}
+
+// phraseGrams returns the overlapping rune windows of a normalized text.
+func phraseGrams(text string) map[string]struct{} {
+	runes := []rune(text)
+	if len(runes) < messageGramRunes {
+		return nil
+	}
+	grams := make(map[string]struct{}, len(runes)-messageGramRunes+1)
+	for index := 0; index+messageGramRunes <= len(runes); index++ {
+		grams[string(runes[index:index+messageGramRunes])] = struct{}{}
+	}
+	return grams
 }
 
 func sameRebindWorkspace(left, right string) bool {

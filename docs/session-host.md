@@ -472,19 +472,47 @@ Host 可能因 kill -9、机器断电或运行时崩溃来不及删除 metadata�
 
 推荐流程：
 
-1. Daemon/Host 观察到 `/resume` 触发信号；
-2. 捕获后续用户提交消息，但原始 terminal bytes 原样转发；
-3. 根据 history 增量、workspace、native ID 和时间窗口找到唯一候选；
-4. Host 查询或确认 Agent 当前 native context；
-5. 在 Host 内原子更新 `agent_session_id`、history locator 和 logical binding；
-6. Daemon 更新本地 observer/cursor 和 process key；
-7. Daemon 向 Server 发送 `session.rebind` 和新的 Session metadata；
-8. Server rekey route/session/cursor；
-9. Web 跟随新的 canonical Session ID，重新订阅 history/SSE。
+1. Daemon 记录 Host terminal 上提交的每一行输入（原始 bytes 仍原样转发给 Agent）；
+2. 定期检查 provider history：只读取各候选 transcript **新增的字节**（用 `stat` 做廉价门槛），不重新解析历史内容；
+3. 当某个候选 transcript 的增量里出现“与已提交输入行对应”的用户消息，并且 workspace 相同、时间接近、候选唯一时，确认发生了 context switch；
+4. 在 Host 内原子更新 `agent_session_id`、history locator 和 logical binding；
+5. Daemon 更新本地 observer/cursor 和 process key；
+6. Daemon 向 Server 发送 `session.rebind` 和新的 Session metadata；
+7. Server rekey route/session/cursor；
+8. Web 跟随新的 canonical Session ID，重新订阅 history/SSE。
 
-约束：
+### 8.1 触发信号不能依赖按键
 
-- 只有 `/resume` 不能直接证明目标 Session；
+早期方案把“观察到 `/resume` 这一行”当作触发条件，这是不可行的：TUI 提交命令时用的是它自己的输入缓冲区，用户用补全菜单时终端只发出了 `/res` 之类的前缀，用其它方式打开 picker 时甚至没有任何对应按键。因此触发条件改为**证据**而不是按键：
+
+```text
+已提交的终端输入行
+  + 同一 workspace 下另一个 transcript 新增了对应的用户消息
+  + 该记录写入时间与提交时间接近（±1 分钟）
+  + 候选唯一
+  ⇒ 确认 context switch
+```
+
+### 8.2 文本比较必须容忍输入法噪声
+
+终端字节流 ≠ provider 存储的消息文本：
+
+- 输入法会流式发送 preedit 内容以及无法表示时的替换字符（U+FFFD）；
+- 用户编辑会发送退格/删除，宽字符还可能对应多次退格；
+- provider 只保存 composer 最终文本。
+
+因此比较不能要求字节相等，而是比较“短语重合度”：把观察到的行与候选消息都归一化（折叠空白、去掉替换字符），按 4 个 rune 的窗口统计重合短语，要求覆盖观察文本的一半以上（并有下限）。同时收紧时间窗口到 ±1 分钟，用时间+workspace+唯一性来保证证据强度。回退场景（没有“最近记录”可重读时）不会有误判，只是不切换。
+
+### 8.3 未确认的记录不能被跳过
+
+provider 是分片写入 JSONL 的，一次扫描可能正好看到“半条记录”。因此：
+
+- 游标只能按 provider parser 给出的“完整记录结束位置”推进，绝不能直接跳到文件大小；
+- 处于证据窗口内的未确认记录要保留可重读性（否则“先看到记录、后收到输入”的竞态会永久丢失证据）。
+
+### 8.4 约束
+
+- 只有 `/resume`（或任何按键）不能直接证明目标 Session；
 - 没有后续输入、history 延迟、多个候选或证据不足时不得自动切换；
 - rebind 不能杀掉或重启 Agent；
 - rebind 失败时保留旧 binding，不产生半更新状态；

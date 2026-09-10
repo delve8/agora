@@ -73,30 +73,30 @@ func TestSwitchIncrementRequiresSubmittedLineInAnotherTranscript(t *testing.T) {
 	manager := &Manager{}
 	candidate := switchCandidate{path: path, sessionID: "picked", workspace: workspace, size: baseline}
 
-	if matched, _ := manager.readSwitchIncrement(context.Background(), "pi", candidate, baseline, map[string]time.Time{"new question": time.Now()}); matched {
+	if matched, _ := manager.readSwitchIncrement(context.Background(), "pi", candidate, baseline, []evidenceText{{text: "new question", at: time.Now()}}); matched {
 		t.Fatal("matched before the provider appended anything")
 	}
 
 	appendPiUserRecord(t, path, "picked", "新会话里的问题", time.Now())
 
 	// A line the user never typed must not confirm a switch.
-	if matched, _ := manager.readSwitchIncrement(context.Background(), "pi", candidate, baseline, map[string]time.Time{"some other text": time.Now()}); matched {
+	if matched, _ := manager.readSwitchIncrement(context.Background(), "pi", candidate, baseline, []evidenceText{{text: "some other text", at: time.Now()}}); matched {
 		t.Fatal("matched a message the user did not submit")
 	}
-	if matched, _ := manager.readSwitchIncrement(context.Background(), "pi", candidate, baseline, map[string]time.Time{"新会话里的问题": time.Now()}); !matched {
+	if matched, _ := manager.readSwitchIncrement(context.Background(), "pi", candidate, baseline, []evidenceText{{text: "新会话里的问题", at: time.Now()}}); !matched {
 		t.Fatal("did not match the appended user message")
 	}
 
 	// Records far from the submitted line are not proof, so a transcript that
 	// already contains identical text can never confirm a switch by itself.
 	all := piEventsAfter(t, path, 0)
-	if hasMatchingUser(all, map[string]time.Time{"an older question": time.Now()}) {
+	if hasMatchingUser(all, []evidenceText{{text: "an older question", at: time.Now()}}) {
 		t.Fatal("a pre-existing transcript record confirmed a switch")
 	}
-	if hasMatchingUser(all, map[string]time.Time{"新会话里的问题": time.Now().Add(-time.Hour)}) {
+	if hasMatchingUser(all, []evidenceText{{text: "新会话里的问题", at: time.Now().Add(-time.Hour)}}) {
 		t.Fatal("a record outside the evidence skew confirmed a switch")
 	}
-	if !hasMatchingUser(all, map[string]time.Time{"新会话里的问题": time.Now()}) {
+	if !hasMatchingUser(all, []evidenceText{{text: "新会话里的问题", at: time.Now()}}) {
 		t.Fatal("a freshly appended record was not accepted as evidence")
 	}
 }
@@ -107,7 +107,7 @@ func TestSwitchWatcherEvidenceCoversMultiLineInput(t *testing.T) {
 	watcher := newSwitchWatcher("id", "pi", "/tmp/workspace", "own-native", "")
 	watcher.recordLine("first line", time.Now())
 	watcher.recordLine("second line", time.Now())
-	texts := watcher.evidenceTexts(time.Now())
+	texts := evidenceSet(watcher.evidenceTexts(time.Now()))
 	for _, want := range []string{"first line second line", "second line"} {
 		if _, ok := texts[want]; !ok {
 			t.Fatalf("evidence is missing %q: %v", want, texts)
@@ -118,7 +118,7 @@ func TestSwitchWatcherEvidenceCoversMultiLineInput(t *testing.T) {
 	}
 
 	watcher.recordLine("too old", time.Now().Add(-2*switchLineWindow))
-	if _, ok := watcher.evidenceTexts(time.Now())["too old"]; ok {
+	if _, ok := evidenceSet(watcher.evidenceTexts(time.Now()))["too old"]; ok {
 		t.Fatal("an expired line is still treated as evidence")
 	}
 }
@@ -168,7 +168,7 @@ func TestSwitchIncrementWaitsForCompleteRecord(t *testing.T) {
 
 	manager := &Manager{}
 	candidate := switchCandidate{path: path, sessionID: "picked", size: baseline}
-	texts := map[string]time.Time{"half written message": time.Now()}
+	texts := []evidenceText{{text: "half written message", at: time.Now()}}
 
 	matched, consumed := manager.readSwitchIncrement(context.Background(), "pi", candidate, baseline, texts)
 	if matched {
@@ -188,11 +188,83 @@ func TestSwitchIncrementWaitsForCompleteRecord(t *testing.T) {
 	}
 	file.Close()
 
-	matched, consumed = manager.readSwitchIncrement(context.Background(), "pi", candidate, baseline, texts)
+	matched, _ = manager.readSwitchIncrement(context.Background(), "pi", candidate, baseline, texts)
 	if !matched {
 		t.Fatal("the completed record was not matched")
 	}
-	if consumed <= baseline {
-		t.Fatalf("cursor did not advance past the completed record: %d", consumed)
+	// The cursor deliberately stays at the baseline: the record is still inside
+	// the evidence window, so it remains re-readable. Advancing past recent
+	// records is covered by TestSwitchIncrementRetainsRecordsInsideEvidenceWindow.
+}
+
+func evidenceSet(values []evidenceText) map[string]struct{} {
+	result := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		result[value.text] = struct{}{}
+	}
+	return result
+}
+
+// A terminal streams input-method preedit text and replacement characters, and
+// editing arrives as backspaces, so the observed line is rarely identical to the
+// message the provider stored. Shared phrases, not bytes, decide the match.
+func TestSameUserMessageToleratesInputMethodNoise(t *testing.T) {
+	stored := "这次测试的是, daemon 重启,那 pi 进程能与 daemon 自动重新连上吗?"
+	observed := "这次测试的是, daemon 中\ufffd重启,那 pi \ufffd\ufffd进程能与 daemon 自动重新连上吗?"
+	if !sameUserMessage(observed, stored) {
+		t.Fatal("input-method noise hid a matching message")
+	}
+	// A backspace that removed one byte of a multi-byte character is another
+	// common mangling.
+	if !sameUserMessage("这次测试的是, daemon 重\xe5\x90\xaf,那 pi 进程", stored) {
+		t.Fatal("a mangled line was not matched by shared phrases")
+	}
+	if !sameUserMessage("继续", "继续") {
+		t.Fatal("a short identical message did not match")
+	}
+	if sameUserMessage("这次测试的是, daemon 重启", "完全不同的另一条消息,讲的是别的事情,请帮我看看构建失败的日志") {
+		t.Fatal("unrelated messages matched")
+	}
+}
+
+// A record written inside the evidence window must stay eligible: a scan can
+// see it before the confirming line is observed, and consuming it would lose
+// the switch.
+func TestSwitchIncrementRetainsRecordsInsideEvidenceWindow(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	if err := os.WriteFile(path, []byte(`{"type":"session","id":"picked"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := info.Size()
+	appendPiUserRecord(t, path, "picked", "a message that does not match yet", time.Now())
+
+	manager := &Manager{}
+	candidate := switchCandidate{path: path, sessionID: "picked", size: baseline}
+	matched, consumed := manager.readSwitchIncrement(context.Background(), "pi", candidate, baseline, nil)
+	if matched {
+		t.Fatal("matched with no evidence")
+	}
+	if consumed != baseline {
+		t.Fatalf("cursor advanced to %d past a recent unmatched record (baseline %d)", consumed, baseline)
+	}
+
+	// A record older than the evidence window is no longer needed.
+	oldPath := filepath.Join(dir, "old.jsonl")
+	if err := os.WriteFile(oldPath, []byte(`{"type":"session","id":"old"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldInfo, err := os.Stat(oldPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendPiUserRecord(t, oldPath, "old", "an old message", time.Now().Add(-2*switchLineWindow))
+	oldCandidate := switchCandidate{path: oldPath, sessionID: "old", size: oldInfo.Size()}
+	if _, consumed := manager.readSwitchIncrement(context.Background(), "pi", oldCandidate, oldInfo.Size(), nil); consumed <= oldInfo.Size() {
+		t.Fatalf("cursor stayed at %d for a record outside the window", consumed)
 	}
 }
