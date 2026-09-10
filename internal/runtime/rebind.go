@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,8 +16,21 @@ import (
 )
 
 const (
-	resumeMatchWindow = 15 * time.Second
+	// resumeMatchWindow bounds how long a pending /resume trigger may wait for
+	// confirming evidence. It must cover the whole interactive flow: opening the
+	// provider session picker, searching, selecting a conversation, and typing
+	// the next message. That routinely takes minutes, so a short window silently
+	// drops real context switches. What prevents a wrong rebind is the evidence
+	// rules below (workspace, post-trigger append, matching user text), not the
+	// window length.
+	resumeMatchWindow = 30 * time.Minute
 	resumeGrace       = 2 * time.Second
+	// resumeLineLimit caps how many submitted terminal lines are retained for
+	// multi-line message matching.
+	resumeLineLimit = 32
+	// resumePollInterval is the stat cadence while waiting for the provider to
+	// flush the confirming message.
+	resumePollInterval = time.Second
 )
 
 type resumeBaseline struct {
@@ -32,6 +46,10 @@ type resumePending struct {
 	baseline  map[string]resumeBaseline
 	expires   time.Time
 	resolving bool
+	// lines holds the terminal lines submitted after /resume. The provider may
+	// persist them as one message (multi-line input or bracketed paste), so the
+	// confirmation compares against single lines and consecutive joins.
+	lines []string
 }
 
 // handleAgentInput is fed only submitted terminal lines. It deliberately
@@ -61,16 +79,38 @@ func (m *Manager) handleAgentInput(id, content string) {
 
 	m.mu.Lock()
 	pending := m.resumePending[id]
-	if pending == nil || pending.agent != agent || time.Now().After(pending.expires) || pending.resolving {
+	if pending == nil || pending.agent != agent || time.Now().After(pending.expires) {
 		if pending != nil && time.Now().After(pending.expires) {
 			delete(m.resumePending, id)
 		}
 		m.mu.Unlock()
 		return
 	}
+	// Keep every line submitted since the trigger. The message the provider
+	// persists is not necessarily the last single line: multi-line input and
+	// bracketed paste arrive as several submitted lines but one user message.
+	pending.lines = append(pending.lines, text)
+	if len(pending.lines) > resumeLineLimit {
+		pending.lines = pending.lines[len(pending.lines)-resumeLineLimit:]
+	}
+	// A resolver already polling picks the appended line up on its next pass.
+	// Starting another one would only duplicate transcript scans.
+	if pending.resolving {
+		m.mu.Unlock()
+		return
+	}
 	pending.resolving = true
 	m.mu.Unlock()
-	go m.tryResumeRebind(id, text, pending)
+	go m.tryResumeRebind(id, pending)
+}
+
+// clearResumePending drops the trigger state for a session that no longer
+// exists, so a later session reusing the identity cannot inherit a stale
+// baseline.
+func (m *Manager) clearResumePending(id string) {
+	m.mu.Lock()
+	delete(m.resumePending, id)
+	m.mu.Unlock()
 }
 
 func (m *Manager) beginResume(id string, value session.Session, agent string) {
@@ -78,6 +118,7 @@ func (m *Manager) beginResume(id string, value session.Session, agent string) {
 	if agent == "pi" {
 		values, err := adapter.NewPiHistoryCatalog(m.homeDir, m.piHistoryRoot()).List(context.Background())
 		if err != nil {
+			log.Printf("agora: %s /resume detection disabled for %s: history baseline unavailable: %v", agent, id, err)
 			return
 		}
 		for _, item := range values {
@@ -88,6 +129,7 @@ func (m *Manager) beginResume(id string, value session.Session, agent string) {
 	} else {
 		values, err := m.history.List(context.Background())
 		if err != nil {
+			log.Printf("agora: %s /resume detection disabled for %s: history baseline unavailable: %v", agent, id, err)
 			return
 		}
 		for _, item := range values {
@@ -108,7 +150,7 @@ func (m *Manager) beginResume(id string, value session.Session, agent string) {
 	m.mu.Unlock()
 }
 
-func (m *Manager) tryResumeRebind(id, input string, pending *resumePending) {
+func (m *Manager) tryResumeRebind(id string, pending *resumePending) {
 	defer func() {
 		m.mu.Lock()
 		if current := m.resumePending[id]; current == pending && current.resolving {
@@ -119,11 +161,28 @@ func (m *Manager) tryResumeRebind(id, input string, pending *resumePending) {
 
 	deadline := pending.expires
 	for time.Now().Before(deadline) {
+		if m.isClosed() {
+			return
+		}
 		m.mu.Lock()
 		active := m.resumePending[id] == pending
+		// Snapshot the submitted lines under the lock: handleAgentInput appends
+		// to them while this loop polls for the provider's delayed flush.
+		lines := append([]string(nil), pending.lines...)
 		m.mu.Unlock()
 		if !active {
 			return
+		}
+		// Provider transcripts are append-only, so a candidate can only become
+		// confirmable after its file grows past the /resume baseline. Stat the
+		// small baseline set first and only pay for parsing when something grew;
+		// otherwise the long wait window would re-scan every transcript
+		// continuously.
+		if grownResumeFiles(pending.baseline) == 0 {
+			if !waitResumePoll(deadline) {
+				return
+			}
+			continue
 		}
 		type candidate struct {
 			path, native, workspace, name string
@@ -135,7 +194,7 @@ func (m *Manager) tryResumeRebind(id, input string, pending *resumePending) {
 			if err == nil {
 				for _, item := range values {
 					base, ok := pending.baseline[item.Path]
-					if ok && resumePiCandidate(item, base, pending, input) {
+					if ok && resumePiCandidate(item, base, pending, lines) {
 						matches = append(matches, candidate{item.Path, item.SessionID, item.Workspace, item.SessionName, base.Size})
 					}
 				}
@@ -145,7 +204,7 @@ func (m *Manager) tryResumeRebind(id, input string, pending *resumePending) {
 			if err == nil {
 				for _, item := range values {
 					base, ok := pending.baseline[item.Path]
-					if ok && resumeClaudeCandidate(item, base, pending, input) {
+					if ok && resumeClaudeCandidate(item, base, pending, lines) {
 						matches = append(matches, candidate{item.Path, item.SessionID, item.Workspace, item.LatestAITitle, base.Size})
 					}
 				}
@@ -165,17 +224,44 @@ func (m *Manager) tryResumeRebind(id, input string, pending *resumePending) {
 		}
 		// Zero matches can be caused by delayed provider flush. Multiple matches
 		// remain ambiguous and must never select the first file arbitrarily.
-		timer := time.NewTimer(250 * time.Millisecond)
-		select {
-		case <-timer.C:
-		case <-time.After(time.Until(deadline)):
-			timer.Stop()
+		if !waitResumePoll(deadline) {
 			return
 		}
 	}
 }
 
-func resumePiCandidate(item adapter.PiHistorySummary, base resumeBaseline, pending *resumePending, input string) bool {
+// grownResumeFiles counts baseline transcripts that received new bytes since
+// /resume. It is the cheap gate in front of the expensive history parsing.
+func grownResumeFiles(baseline map[string]resumeBaseline) int {
+	grown := 0
+	for path, base := range baseline {
+		info, err := os.Stat(path)
+		if err != nil || info.Size() <= base.Size {
+			continue
+		}
+		grown++
+	}
+	return grown
+}
+
+// waitResumePoll sleeps one poll interval and reports whether the caller may
+// keep waiting. It returns false once the window is exhausted.
+func waitResumePoll(deadline time.Time) bool {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return false
+	}
+	interval := resumePollInterval
+	if remaining < interval {
+		interval = remaining
+	}
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	<-timer.C
+	return time.Now().Before(deadline)
+}
+
+func resumePiCandidate(item adapter.PiHistorySummary, base resumeBaseline, pending *resumePending, lines []string) bool {
 	if item.SessionID == "" || item.SessionID == pending.oldNative || item.Path == "" || item.Size <= base.Size {
 		return false
 	}
@@ -186,10 +272,10 @@ func resumePiCandidate(item adapter.PiHistorySummary, base resumeBaseline, pendi
 	if err != nil {
 		return false
 	}
-	return hasMatchingUser(recordsToEvents(records), input, pending)
+	return hasMatchingUser(recordsToEvents(records), pending, lines)
 }
 
-func resumeClaudeCandidate(item adapter.HistorySummary, base resumeBaseline, pending *resumePending, input string) bool {
+func resumeClaudeCandidate(item adapter.HistorySummary, base resumeBaseline, pending *resumePending, lines []string) bool {
 	if item.SessionID == "" || item.SessionID == pending.oldNative || item.Path == "" || item.Size <= base.Size {
 		return false
 	}
@@ -204,7 +290,7 @@ func resumeClaudeCandidate(item adapter.HistorySummary, base resumeBaseline, pen
 	for _, record := range records {
 		values = append(values, record.Event)
 	}
-	return hasMatchingUser(values, input, pending)
+	return hasMatchingUser(values, pending, lines)
 }
 
 func recordsToEvents(records []adapter.PiHistoryRecord) []event.Event {
@@ -215,18 +301,41 @@ func recordsToEvents(records []adapter.PiHistoryRecord) []event.Event {
 	return values
 }
 
-func hasMatchingUser(values []event.Event, input string, pending *resumePending) bool {
+func hasMatchingUser(values []event.Event, pending *resumePending, lines []string) bool {
+	expected := submittedTexts(lines)
+	if len(expected) == 0 {
+		return false
+	}
 	now := time.Now()
 	for _, item := range values {
-		if item.Kind != event.KindUser || normalizeRebindText(item.Content) != input {
+		if item.Kind != event.KindUser {
 			continue
 		}
+		// Only records appended after the trigger are evidence. Older records in
+		// the same file must never confirm a context switch.
 		if !item.CreatedAt.IsZero() && (item.CreatedAt.Before(pending.triggered.Add(-resumeGrace)) || item.CreatedAt.After(now.Add(resumeGrace))) {
 			continue
 		}
-		return true
+		if _, ok := expected[normalizeRebindText(item.Content)]; ok {
+			return true
+		}
 	}
 	return false
+}
+
+// submittedTexts expands the lines submitted since /resume into every user
+// message they could represent. Single lines cover ordinary input; joins of
+// consecutive lines cover multi-line messages and bracketed paste, which the
+// provider stores as one user message but the terminal delivers as several
+// submitted lines.
+func submittedTexts(lines []string) map[string]struct{} {
+	values := make(map[string]struct{})
+	for length := 1; length <= len(lines); length++ {
+		if text := normalizeRebindText(strings.Join(lines[len(lines)-length:], "\n")); text != "" {
+			values[text] = struct{}{}
+		}
+	}
+	return values
 }
 
 func sameRebindWorkspace(left, right string) bool {
@@ -310,6 +419,11 @@ func (m *Manager) rebindSession(id, agent, nativeID, historyPath, workspace, dis
 				if managerErr == nil {
 					m.hosts.Delete(id)
 					m.hosts.Put(newID, client)
+					// The health watchdog and the input subscription are keyed by the
+					// canonical id, so they must follow the rebind. Otherwise the Host
+					// stops being monitored and later /resume triggers are invisible.
+					m.stopHostMonitor(id)
+					m.monitorHost(newID)
 				}
 			} else {
 				managerErr = fmt.Errorf("managed session %s has no session-host", id)

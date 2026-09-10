@@ -18,6 +18,7 @@ import (
 	"github.com/delve8/agora/internal/event"
 	"github.com/delve8/agora/internal/message"
 	"github.com/delve8/agora/internal/session"
+	"github.com/delve8/agora/internal/sessionhost"
 	"github.com/delve8/agora/internal/store"
 	"github.com/delve8/agora/internal/terminal"
 )
@@ -175,6 +176,21 @@ func managedHostCapabilities() session.Capabilities {
 	return session.Capabilities{CanStart: true, CanAttach: true, CanObserve: true, CanSendInput: true, CanStream: true, CanInterrupt: true, CanResume: true, CanReadHistory: true}
 }
 
+// hostSessionID resolves the canonical session id a Host client is currently
+// registered under. A rebind moves the client to a new key, so the id captured
+// when a subscription started must never be reused for later input lines.
+func (m *Manager) hostSessionID(client *sessionhost.Client) string {
+	if m == nil || m.hosts == nil || client == nil {
+		return ""
+	}
+	for id, current := range m.hosts.Clients() {
+		if current == client {
+			return id
+		}
+	}
+	return ""
+}
+
 func (m *Manager) stopHostMonitor(id string) {
 	m.mu.Lock()
 	if cancel := m.hostWatchCancels[id]; cancel != nil {
@@ -204,11 +220,17 @@ func (m *Manager) monitorHost(id string) {
 			m.mu.Unlock()
 		}()
 		// Keep the provider-neutral input trigger working when the PTY is owned
-		// by a Session Host rather than by this Daemon process.
+		// by a Session Host rather than by this Daemon process. The subscription
+		// resolves the canonical id on every line because a runtime /resume
+		// rebind rekeys the registry while this Host stays alive.
 		if client, ok := m.hosts.Get(id); ok {
-			go func() {
-				_ = client.Subscribe(ctx, func(line string) { m.handleAgentInput(id, line) })
-			}()
+			go func(host *sessionhost.Client) {
+				_ = host.Subscribe(ctx, func(line string) {
+					if current := m.hostSessionID(host); current != "" {
+						m.handleAgentInput(current, line)
+					}
+				})
+			}(client)
 		}
 		for {
 			if m.isClosed() {
@@ -223,6 +245,7 @@ func (m *Manager) monitorHost(id string) {
 					return
 				}
 				m.hosts.Delete(id)
+				m.clearResumePending(id)
 				if value, getErr := m.store.GetSession(context.Background(), id); getErr == nil {
 					value.ProcessID = 0
 					value.State = session.StateStopped
@@ -1368,6 +1391,7 @@ func (m *Manager) SetAttentionHandler(handler func(string, string)) {
 
 func (m *Manager) handlePTYExit(exited PTYExit) {
 	m.clearActive(exited.AgoraID)
+	m.clearResumePending(exited.AgoraID)
 	m.StopObserver(exited.AgoraID)
 	if m.isClosed() {
 		return
@@ -1401,6 +1425,7 @@ func (m *Manager) handlePTYExit(exited PTYExit) {
 
 func (m *Manager) handlePiExit(exited PiExit) {
 	m.clearActive(exited.AgoraID)
+	m.clearResumePending(exited.AgoraID)
 	m.StopObserver(exited.AgoraID)
 	if m.isClosed() || m.store == nil {
 		return
