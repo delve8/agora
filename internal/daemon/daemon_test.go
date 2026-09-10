@@ -2,13 +2,17 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/delve8/agora/internal/protocol"
 	"github.com/delve8/agora/internal/runtime"
 	"github.com/delve8/agora/internal/session"
 )
@@ -140,5 +144,46 @@ func TestLocalWrapperSocketIsPrivateAndCleansUp(t *testing.T) {
 	}
 	if _, err := os.Stat(socketPath); !os.IsNotExist(err) {
 		t.Fatalf("socket still exists after Close: %v", err)
+	}
+}
+
+// The local socket carries both wrapper requests and provider session reports.
+// A report must be routed to the manager path and answered gracefully, never as
+// an invalid wrapper request and never with a panic.
+func TestLocalWrapperSocketRoutesSessionReports(t *testing.T) {
+	socketPath := filepath.Join("/tmp", fmt.Sprintf("agora-report-test-%d.sock", time.Now().UnixNano()))
+	t.Setenv("AGORA_DAEMON_SOCKET", socketPath)
+	t.Cleanup(func() { _ = os.Remove(socketPath) })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d := &Daemon{config: Config{ID: "daemon-test"}}
+	if err := d.startLocalWrapperServer(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
+
+	send := func(body string) protocol.SessionReportResponse {
+		t.Helper()
+		conn, err := net.Dial("unix", socketPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		if _, err := io.WriteString(conn, body); err != nil {
+			t.Fatal(err)
+		}
+		var reply protocol.SessionReportResponse
+		if err := json.NewDecoder(conn).Decode(&reply); err != nil {
+			t.Fatalf("decode reply: %v", err)
+		}
+		return reply
+	}
+
+	if reply := send(`{"type":"session.report"}`); reply.Error != "host_id is required" {
+		t.Fatalf("missing host_id reply = %+v", reply)
+	}
+	reply := send(`{"type":"session.report","host_id":"host-1","reason":"startup","session_id":"abc"}`)
+	if reply.Error == "" || strings.Contains(reply.Error, "invalid wrapper request") {
+		t.Fatalf("report was not routed to the session manager: %+v", reply)
 	}
 }

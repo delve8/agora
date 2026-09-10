@@ -178,9 +178,25 @@ func (d *Daemon) startLocalWrapperServer(ctx context.Context) error {
 func (d *Daemon) handleLocalWrapper(conn net.Conn) {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(60 * time.Second))
-	var payload protocol.WrapperRequest
 	decoder := json.NewDecoder(io.LimitReader(conn, 1<<20))
-	if err := decoder.Decode(&payload); err != nil {
+	// The local socket carries both wrapper requests and provider session
+	// reports from the injected Agent extension. Decode the body once and branch
+	// on the message type so neither shape has to know about the other.
+	var body json.RawMessage
+	if err := decoder.Decode(&body); err != nil {
+		_ = json.NewEncoder(conn).Encode(protocol.WrapperResponse{Error: "invalid wrapper request: " + err.Error()})
+		return
+	}
+	var envelope struct {
+		Type string `json:"type"`
+	}
+	_ = json.Unmarshal(body, &envelope)
+	if envelope.Type == protocol.SessionReport {
+		d.handleSessionReport(conn, body)
+		return
+	}
+	var payload protocol.WrapperRequest
+	if err := json.Unmarshal(body, &payload); err != nil {
 		_ = json.NewEncoder(conn).Encode(protocol.WrapperResponse{Error: "invalid wrapper request: " + err.Error()})
 		return
 	}
@@ -229,6 +245,40 @@ func (d *Daemon) handleLocalWrapper(conn net.Conn) {
 		}
 	}
 	_ = json.NewEncoder(conn).Encode(result)
+}
+
+// handleSessionReport applies a provider-native session report. The injected
+// Agent extension sends it after the provider switches session, which is the
+// only exact signal available: a switch writes nothing to any transcript.
+func (d *Daemon) handleSessionReport(conn net.Conn, body []byte) {
+	var payload protocol.SessionReportPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		_ = json.NewEncoder(conn).Encode(protocol.SessionReportResponse{Error: err.Error()})
+		return
+	}
+	if strings.TrimSpace(payload.HostID) == "" {
+		_ = json.NewEncoder(conn).Encode(protocol.SessionReportResponse{Error: "host_id is required"})
+		return
+	}
+	if d.manager == nil {
+		_ = json.NewEncoder(conn).Encode(protocol.SessionReportResponse{Error: "session manager is unavailable"})
+		return
+	}
+	value, err := d.manager.ReportAgentSession(context.Background(), runtime.AgentSessionReport{
+		HostID:              payload.HostID,
+		Reason:              payload.Reason,
+		SessionFile:         payload.SessionFile,
+		TargetSessionFile:   payload.TargetSessionFile,
+		PreviousSessionFile: payload.PreviousSessionFile,
+		NativeSessionID:     payload.SessionID,
+		SessionName:         payload.SessionName,
+	})
+	if err != nil {
+		log.Printf("agora daemon: session report for host %s was not applied: %v", payload.HostID, err)
+		_ = json.NewEncoder(conn).Encode(protocol.SessionReportResponse{Error: err.Error()})
+		return
+	}
+	_ = json.NewEncoder(conn).Encode(protocol.SessionReportResponse{Applied: true, SessionID: value.ID})
 }
 
 func (d *Daemon) waitRegistered(ctx context.Context) error {

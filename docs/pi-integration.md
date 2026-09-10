@@ -39,6 +39,16 @@ pi --session <id> --provider anthropic --model <provider-model> ...
 
 因此 Pi 的版本新增参数也可以直接使用。Agora 只会将 binary 放在参数列表最前面，并通过 PTY 建立 attach；参数含义和运行模式完全由 Pi 决定。传入 `--print`、`--mode json` 或 `--mode rpc` 时，Pi 会按自身语义运行，可能不会显示 TUI，这是预期行为。
 
+Agora 还会注入一个自有扩展用于上报 session 切换（详见 `docs/session-host.md` §8）：
+
+```text
+pi -e ~/.agora/extensions/pi/agora-session-reporter.ts ...
+```
+
+该 `-e` 路径由 Agora 追加在用户参数之前，用户自己的参数保持原样；即使显式传入 `--no-extensions`，
+显式 `-e` 路径仍然生效（该选项只关闭扩展自动发现）。Host 同时给 Agent 注入 `AGORA_HOST_ID`，
+扩展据此把 `session_before_switch` / `session_start` 事件报给 Daemon。
+
 非交互观察或一次性运行可以使用：
 
 ```text

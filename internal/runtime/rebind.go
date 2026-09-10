@@ -355,7 +355,7 @@ func (m *Manager) scanSwitchCandidates(ctx context.Context, id string, watcher *
 	if target.sessionID == "" {
 		return false
 	}
-	if err := m.rebindSession(id, watcher.agent, target.sessionID, target.path, target.workspace, "", target.size); err != nil {
+	if _, err := m.rebindSession(id, watcher.agent, target.sessionID, target.path, target.workspace, "", target.size); err != nil {
 		log.Printf("agora: context switch to %s could not be applied: %v", target.sessionID, err)
 		switchDebugf("rebind id=%s target=%s error=%v", id, target.sessionID, err)
 		return false
@@ -649,28 +649,30 @@ func normalizeRebindText(value string) string {
 	return strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
 }
 
-func (m *Manager) rebindSession(id, agent, nativeID, historyPath, workspace, displayName string, baseSize int64) error {
+func (m *Manager) rebindSession(id, agent, nativeID, historyPath, workspace, displayName string, baseSize int64) (session.Session, error) {
 	old, err := m.store.GetSession(context.Background(), id)
 	if err != nil {
-		return err
+		return session.Session{}, err
 	}
-	if nativeID == "" || historyPath == "" {
-		return fmt.Errorf("%s rebind target is incomplete", agent)
+	if nativeID == "" {
+		// A fresh provider session is bound by id before its transcript exists;
+		// the observer fills HistoryPath once the file appears.
+		return session.Session{}, fmt.Errorf("%s rebind target is incomplete", agent)
 	}
 	if workspace != "" && old.Workspace != "" && !sameRebindWorkspace(workspace, old.Workspace) {
-		return fmt.Errorf("%s rebind target workspace does not match", agent)
+		return session.Session{}, fmt.Errorf("%s rebind target workspace does not match", agent)
 	}
 	newID := id
 	if m.daemonID != "" {
 		candidate, identityErr := session.NewSessionID(m.daemonID, agent, agent+"://"+nativeID)
 		if identityErr != nil {
-			return identityErr
+			return session.Session{}, identityErr
 		}
 		newID = candidate
 	}
 	if newID != id {
 		if _, getErr := m.store.GetSession(context.Background(), newID); getErr == nil {
-			return fmt.Errorf("session %s already exists", newID)
+			return session.Session{}, fmt.Errorf("session %s already exists", newID)
 		}
 	}
 
@@ -700,7 +702,7 @@ func (m *Manager) rebindSession(id, agent, nativeID, historyPath, workspace, dis
 	}
 	if newID != id {
 		if err := m.store.RekeySession(context.Background(), id, updated); err != nil {
-			return err
+			return session.Session{}, err
 		}
 		var managerErr error
 		if m.hosts != nil {
@@ -724,7 +726,7 @@ func (m *Manager) rebindSession(id, agent, nativeID, historyPath, workspace, dis
 		}
 		if managerErr != nil {
 			_ = m.store.RekeySession(context.Background(), newID, old)
-			return managerErr
+			return session.Session{}, managerErr
 		}
 		m.mu.Lock()
 		if active := m.active[id]; active {
@@ -749,10 +751,10 @@ func (m *Manager) rebindSession(id, agent, nativeID, historyPath, workspace, dis
 			managerErr = m.pty.Rebind(id, newID, nativeID)
 		}
 		if managerErr != nil {
-			return managerErr
+			return session.Session{}, managerErr
 		}
 		if err := m.store.UpdateSessionObservation(context.Background(), updated); err != nil {
-			return err
+			return session.Session{}, err
 		}
 		m.stopSwitchWatcher(id)
 	}
@@ -764,10 +766,10 @@ func (m *Manager) rebindSession(id, agent, nativeID, historyPath, workspace, dis
 	}
 	if agent == "pi" {
 		if err := m.StartPiObserver(updated); err != nil {
-			return err
+			return session.Session{}, err
 		}
 	} else if err := m.StartObserver(updated); err != nil {
-		return err
+		return session.Session{}, err
 	}
 	m.mu.Lock()
 	handler := m.sessionRebind
@@ -775,5 +777,101 @@ func (m *Manager) rebindSession(id, agent, nativeID, historyPath, workspace, dis
 	if handler != nil && id != updated.ID {
 		handler(id, updated)
 	}
-	return nil
+	return updated, nil
+}
+
+// AgentSessionReport is a provider-native session report from the injected Agent
+// extension. It is authoritative: the provider says which session the Agent is
+// using, so no keystroke or transcript inference is involved.
+type AgentSessionReport struct {
+	HostID              string
+	Reason              string
+	SessionFile         string
+	TargetSessionFile   string
+	PreviousSessionFile string
+	NativeSessionID     string
+	SessionName         string
+}
+
+// ReportAgentSession applies an Agent session report and rebinds the managed
+// session when the provider moved to a different one.
+func (m *Manager) ReportAgentSession(ctx context.Context, report AgentSessionReport) (session.Session, error) {
+	if m == nil || m.hosts == nil {
+		return session.Session{}, fmt.Errorf("session hosts are unavailable")
+	}
+	id, ok := m.sessionIDForHost(report.HostID)
+	if !ok {
+		return session.Session{}, fmt.Errorf("no managed session for host %s", report.HostID)
+	}
+	value, err := m.store.GetSession(ctx, id)
+	if err != nil {
+		return session.Session{}, fmt.Errorf("resolve managed session %s for host %s: %w", id, report.HostID, err)
+	}
+	agent := normalizeSwitchAgent(value.Agent)
+	if agent != "pi" {
+		// Only Pi reports through the extension today; other providers keep the
+		// evidence-based path.
+		return value, nil
+	}
+
+	file := strings.TrimSpace(report.SessionFile)
+	if file == "" {
+		file = strings.TrimSpace(report.TargetSessionFile)
+	}
+	native := strings.TrimSpace(report.NativeSessionID)
+	if native == "" {
+		native = piNativeIDFromSessionFile(file)
+	}
+	if native == "" {
+		return session.Session{}, fmt.Errorf("session report for host %s carries no session identity", report.HostID)
+	}
+	if resolved := adapter.FindPiHistoryBySessionID(m.piHistoryRoot(), native); file != "" && resolved != "" && resolved != file {
+		return session.Session{}, fmt.Errorf("session report file %q does not belong to session %s", file, native)
+	}
+
+	current := strings.TrimPrefix(value.NativeSessionURI(), "pi://")
+	if current == native && value.HistoryPath == file {
+		return value, nil
+	}
+	switchDebugf("report id=%s reason=%s native=%s file=%s", id, report.Reason, native, file)
+	// Start the observer at the end of an existing transcript: the user already
+	// has that history, and replaying it would emit it as live events.
+	updated, err := m.rebindSession(id, agent, native, file, value.Workspace, report.SessionName, -1)
+	if err != nil {
+		switchDebugf("report id=%s native=%s failed: %v", id, native, err)
+		return value, err
+	}
+	log.Printf("agora: session %s reported a provider switch to %s", id, native)
+	return updated, nil
+}
+
+// sessionIDForHost resolves the canonical Session ID a Host currently owns. The
+// registry is keyed by Session ID, and Host IDs survive rebinds.
+func (m *Manager) sessionIDForHost(hostID string) (string, bool) {
+	hostID = strings.TrimSpace(hostID)
+	if hostID == "" || m.hosts == nil {
+		return "", false
+	}
+	for id, client := range m.hosts.Clients() {
+		if client == nil {
+			continue
+		}
+		if client.Metadata().HostID == hostID {
+			return id, true
+		}
+	}
+	return "", false
+}
+
+// piNativeIDFromSessionFile extracts the session id from a Pi transcript name,
+// which the provider writes as "<timestamp>_<session-id>.jsonl".
+func piNativeIDFromSessionFile(path string) string {
+	base := strings.TrimSuffix(filepath.Base(strings.TrimSpace(path)), ".jsonl")
+	if base == "" {
+		return ""
+	}
+	if index := strings.LastIndexByte(base, '_'); index >= 0 {
+		base = base[index+1:]
+	}
+	return strings.TrimSpace(base)
 }

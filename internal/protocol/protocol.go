@@ -33,8 +33,12 @@ const (
 	SessionStop            = "session.stop"
 	SessionStopResult      = "session.stop_result"
 	SessionExit            = "session.exit"
-	Ack                    = "ack"
-	Error                  = "error"
+	// SessionReport describes a message the injected Agent extension sends over
+	// the local Daemon socket. It is provider-native evidence: the Agent itself
+	// reports which session it is using, so no keystroke inference is needed.
+	SessionReport = "session.report"
+	Ack           = "ack"
+	Error         = "error"
 )
 
 type Envelope struct {
@@ -226,6 +230,30 @@ type SnapshotPayload struct {
 type AttachPayload struct {
 	SessionID string `json:"session_id"`
 	Socket    string `json:"socket,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+// SessionReportPayload is what the injected Agent extension reports to the
+// local Daemon. Reasons follow the provider's own session lifecycle: "resume"
+// and "new" before a switch, and "startup", "new", "resume", "fork" once the
+// switch completed.
+type SessionReportPayload struct {
+	// HostID identifies the Session Host that owns the Agent. It is stable
+	// across rebinds, unlike the canonical Session ID.
+	HostID              string `json:"host_id"`
+	Reason              string `json:"reason,omitempty"`
+	SessionFile         string `json:"session_file,omitempty"`
+	TargetSessionFile   string `json:"target_session_file,omitempty"`
+	PreviousSessionFile string `json:"previous_session_file,omitempty"`
+	SessionID           string `json:"session_id,omitempty"`
+	SessionName         string `json:"session_name,omitempty"`
+}
+
+// SessionReportResponse acknowledges a report. Reporting is best effort, so the
+// Agent extension never depends on the result.
+type SessionReportResponse struct {
+	Applied   bool   `json:"applied,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
 	Error     string `json:"error,omitempty"`
 }
 

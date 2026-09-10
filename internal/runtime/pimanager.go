@@ -35,6 +35,10 @@ type PiConfig struct {
 	Provider   string
 	Model      string
 	SessionDir string
+	// ReporterExtension is the path of the Agora session reporter extension.
+	// It is injected with `pi -e <path>` so the provider reports session
+	// switches to the Daemon instead of Agora inferring them from keystrokes.
+	ReporterExtension string
 }
 
 type PiEvent struct {
@@ -144,8 +148,26 @@ func (m *PiManager) SessionDir() string { return m.config.SessionDir }
 
 // Command returns the exact provider command used for a managed Pi session.
 // Session Host uses it so the Agent process is created outside the Daemon.
+// SetReporterExtension installs the Agora reporter extension path. It is
+// instrumentation owned by Agora, so it is added to every Pi invocation,
+// including the ones that forward the user's own arguments verbatim.
+func (m *PiManager) SetReporterExtension(path string) {
+	m.mu.Lock()
+	m.config.ReporterExtension = strings.TrimSpace(path)
+	m.mu.Unlock()
+}
+
+func (m *PiManager) reporterExtension() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return strings.TrimSpace(m.config.ReporterExtension)
+}
+
 func (m *PiManager) Command(nativeID, historyPath string, agentArgs []string) []string {
 	args := []string{m.config.Binary}
+	if extension := m.reporterExtension(); extension != "" {
+		args = append(args, "-e", extension)
+	}
 	if len(agentArgs) > 0 {
 		return append(args, agentArgs...)
 	}

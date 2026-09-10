@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/delve8/agora/internal/adapter"
 	"github.com/delve8/agora/internal/event"
 	"github.com/delve8/agora/internal/message"
+	"github.com/delve8/agora/internal/runtime/piextension"
 	"github.com/delve8/agora/internal/session"
 	"github.com/delve8/agora/internal/sessionhost"
 	"github.com/delve8/agora/internal/store"
@@ -88,6 +90,14 @@ func NewPiManagerRuntime(db StateStore, daemonID string, config PiConfig) *Manag
 func (m *Manager) AttachPi(pi *PiManager) {
 	m.pi = pi
 	if pi != nil {
+		// Inject the Agora reporter extension so a provider context switch is
+		// reported by the Agent itself. Failure only disables that fast path:
+		// the evidence-based watcher still detects switches.
+		if path, err := piextension.ReporterPath(m.homeDir); err == nil {
+			pi.SetReporterExtension(path)
+		} else {
+			log.Printf("agora: Pi session reporter extension unavailable: %v", err)
+		}
 		pi.SetInputHandler(m.handleAgentInput)
 		pi.SetExitHandler(m.handlePiExit)
 		m.mu.Lock()

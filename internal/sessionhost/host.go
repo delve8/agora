@@ -159,9 +159,13 @@ func (h *Host) Run() error {
 	}
 	cmd := exec.Command(h.config.Command[0], h.config.Command[1:]...)
 	cmd.Dir = h.config.Workspace
-	if h.config.Env != nil {
-		cmd.Env = h.config.Env
+	env := h.config.Env
+	if env == nil {
+		env = os.Environ()
 	}
+	// The injected Agent extension identifies its Host through this variable.
+	// The Host ID is stable across rebinds, unlike the canonical Session ID.
+	cmd.Env = withEnv(env, "AGORA_HOST_ID", h.config.HostID)
 	master, err := pty.Start(cmd)
 	if err != nil {
 		h.cleanupFiles()
@@ -380,9 +384,9 @@ func (h *Host) handleControl(conn net.Conn) {
 		if payload.AgentSessionID != "" {
 			h.meta.AgentSessionID = payload.AgentSessionID
 		}
-		if payload.HistoryPath != "" {
-			h.meta.HistoryPath = payload.HistoryPath
-		}
+		// A rebind defines the binding, so an empty path clears a stale one
+		// (for example when the Agent moved to a session with no transcript yet).
+		h.meta.HistoryPath = payload.HistoryPath
 		if payload.DisplayName != "" {
 			h.meta.DisplayName = payload.DisplayName
 		}
@@ -411,6 +415,19 @@ func (h *Host) handleControl(conn net.Conn) {
 		result.OK = false
 	}
 	_ = encoder.Encode(result)
+}
+
+// withEnv sets key in an environment slice, replacing an existing entry.
+func withEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	result := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			continue
+		}
+		result = append(result, entry)
+	}
+	return append(result, prefix+value)
 }
 
 func (h *Host) processInput(data []byte) {

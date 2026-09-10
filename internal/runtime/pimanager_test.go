@@ -92,7 +92,8 @@ func TestPiManagerForwardsAgentArgsUnchanged(t *testing.T) {
 	if err := os.WriteFile(binary, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	manager := NewPiManager(PiConfig{Binary: binary})
+	reporter := filepath.Join(dir, "agora-session-reporter.ts")
+	manager := NewPiManager(PiConfig{Binary: binary, ReporterExtension: reporter})
 	_, err := manager.StartWithArgs("agora-args", dir, "", []string{"--session", "native-id", "--model", "model-id", "initial prompt"})
 	if err != nil {
 		t.Fatal(err)
@@ -103,7 +104,9 @@ func TestPiManagerForwardsAgentArgsUnchanged(t *testing.T) {
 	for time.Now().Before(deadline) {
 		if data, readErr := os.ReadFile(argsPath); readErr == nil {
 			got := strings.Split(strings.TrimSpace(string(data)), "\n")
-			want := []string{"--session", "native-id", "--model", "model-id", "initial prompt"}
+			// The Agora reporter extension is Agora-owned instrumentation, so it
+			// is injected in front of the user's arguments, which stay verbatim.
+			want := []string{"-e", reporter, "--session", "native-id", "--model", "model-id", "initial prompt"}
 			if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 				t.Fatalf("Pi arguments = %#v, want %#v", got, want)
 			}
@@ -116,4 +119,31 @@ func TestPiManagerForwardsAgentArgsUnchanged(t *testing.T) {
 
 func dialUnix(path string) (net.Conn, error) {
 	return net.Dial("unix", path)
+}
+
+// New sessions are synthesized from Agora's own flags, and the reporter
+// extension must be present there too, otherwise a switch inside a fresh
+// session could not be reported.
+func TestPiManagerCommandInjectsReporterExtension(t *testing.T) {
+	dir := t.TempDir()
+	reporter := filepath.Join(dir, "agora-session-reporter.ts")
+	manager := NewPiManager(PiConfig{Binary: "pi", Provider: "anthropic", ReporterExtension: reporter})
+	command := manager.Command("native-id", "", nil)
+	joined := strings.Join(command, " ")
+	if !strings.Contains(joined, "-e "+reporter) {
+		t.Fatalf("reporter extension missing from %q", joined)
+	}
+	if !strings.Contains(joined, "--session-id native-id") {
+		t.Fatalf("session id missing from %q", joined)
+	}
+	// A resumed session passes the transcript path instead.
+	command = manager.Command("native-id", "/tmp/session.jsonl", nil)
+	if !strings.Contains(strings.Join(command, " "), "--session /tmp/session.jsonl") {
+		t.Fatalf("history path missing from %q", strings.Join(command, " "))
+	}
+	// Without a reporter the command stays exactly as before.
+	manager.SetReporterExtension("")
+	if got := strings.Join(manager.Command("native-id", "", nil), " "); strings.Contains(got, "-e") {
+		t.Fatalf("reporter extension unexpectedly present: %q", got)
+	}
 }

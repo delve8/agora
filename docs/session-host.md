@@ -470,7 +470,19 @@ Host 可能因 kill -9、机器断电或运行时崩溃来不及删除 metadata�
   └── provider history locator：old → new
 ```
 
-推荐流程：
+推荐流程（按优先级）：
+
+```text
+1. provider 原生报告（首选，精确）
+   Agent 进程由 Host 以 `pi -e <agora-session-reporter.ts>` 启动并带上 AGORA_HOST_ID；
+   扩展在 session_before_switch / session_start 时通过本地 socket 上报
+   {reason, target_session_file, session_file, session_id, previous_session_file}。
+   Daemon 按 Host ID 解析出 managed Session，直接用上报的 file/id 做 rebind。
+2. 证据式推断（fallback：用户自装 pi、扩展不可用、provider 无结构化事件）
+   见下方 2–8 步。
+```
+
+证据式流程：
 
 1. Daemon 记录 Host terminal 上提交的每一行输入（原始 bytes 仍原样转发给 Agent）；
 2. 定期检查 provider history：只读取各候选 transcript **新增的字节**（用 `stat` 做廉价门槛），不重新解析历史内容；
@@ -480,6 +492,43 @@ Host 可能因 kill -9、机器断电或运行时崩溃来不及删除 metadata�
 6. Daemon 向 Server 发送 `session.rebind` 和新的 Session metadata；
 7. Server rekey route/session/cursor；
 8. Web 跟随新的 canonical Session ID，重新订阅 history/SSE。
+
+### 8.0 provider 原生报告（已实现，推荐）
+
+`pi --extension, -e <path>` 支持按会话注入扩展，扩展 API 暴露了切换事件：
+
+```typescript
+pi.on("session_before_switch", (event) => { /* event.reason, event.targetSessionFile */ });
+pi.on("session_start", (event, ctx) => {
+  // event.reason: "startup" | "reload" | "new" | "resume" | "fork"
+  // event.previousSessionFile
+  // ctx.sessionManager.getSessionFile() / getSessionId() / getSessionName()
+});
+```
+
+Agora 的实现：
+
+- `internal/runtime/piextension/agora-session-reporter.ts` 嵌入到二进制，落盘到
+  `~/.agora/extensions/pi/agora-session-reporter.ts`，由 Host 在 spawn 时以 `-e <path>` 注入；
+- Host 给 Agent 注入 `AGORA_HOST_ID`（跨 rebind 稳定，canonical ID 会变化）；
+- 扩展向 `$AGORA_DAEMON_SOCKET`（默认 `~/.agora/daemon.sock`）发送 `session.report`；
+- Daemon 在同一个本地 socket 上分流：`type == "session.report"` 交给
+  `Manager.ReportAgentSession`，其余仍是 wrapper 请求；
+- `ReportAgentSession` 用 Host ID 反查当前 canonical Session，再复用 `rebindSession` 完成
+  rekey / Host metadata / observer / Server route；
+- 上报 best-effort：socket 不可用或扩展抛错时静默降级，绝不阻断 Agent。
+
+实测（真实 pi，非 mock）：
+
+```text
+启动新会话 → reason=startup, session_file=<将来的文件路径>, session_id=<id>
+/resume    → reason=resume, target_session_file=<目标文件>   (切换前)
+             reason=resume, session_file=<目标文件>, session_id=<id>,
+                            previous_session_file=<原文件>   (切换后)
+```
+
+因此 `/resume`、`/new`、`/fork`、`/clone` 以及 `--resume` 启动都能在**用户发消息之前**完成精确 rebind，
+且完全不受输入法/自动补全影响。
 
 ### 8.1 触发信号不能依赖按键
 
