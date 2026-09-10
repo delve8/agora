@@ -779,6 +779,11 @@ func liveSummarySession(summary protocol.SessionSummary, coordinationID string) 
 	case session.StateRunning, session.StateWaiting, session.StateStarting:
 		if value.ProcessID > 0 {
 			value.Capabilities = liveAgentCapabilities(agent)
+			// A managed Agent can be running before its provider transcript
+			// exists, and a context switch can point at a session whose file is
+			// not written yet. Advertising history there shows an empty
+			// conversation that looks like lost history.
+			value.Capabilities.CanReadHistory = strings.TrimSpace(value.HistoryPath) != ""
 		}
 	default:
 		resumable := value.Workspace != ""

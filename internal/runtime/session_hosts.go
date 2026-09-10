@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/delve8/agora/internal/session"
@@ -111,18 +112,69 @@ func (r *SessionHostRegistry) Adopt(ctx context.Context) ([]sessionhost.Metadata
 		metadataPath := filepath.Join(r.root, entry.Name(), "metadata.json")
 		metadata, loadErr := sessionhost.LoadMetadata(metadataPath)
 		if loadErr != nil {
+			// An aborted spawn leaves a directory with no usable metadata.
+			// Nothing can own it, so it is safe to remove.
+			r.discard(entry.Name())
 			continue
 		}
 		client, clientErr := sessionhost.NewClient(metadataPath)
 		if clientErr != nil {
+			r.discard(entry.Name())
 			continue
 		}
 		if state, stateErr := client.State(ctx); stateErr == nil && state.State == "running" {
 			r.Put(metadata.SessionID, client)
 			result = append(result, state)
+			continue
+		}
+		// A Host records a terminal state just before it exits, so this runtime
+		// state is finished even if the PID is still winding down.
+		if hostStateFinished(metadata.State) {
+			r.discard(entry.Name())
+			continue
+		}
+		// Otherwise the Host did not answer. Only remove its runtime state when
+		// the process is provably gone: a live but unresponsive Host still owns
+		// its Agent, and deleting its metadata would orphan that process.
+		if hostProcessGone(metadata.HostPID) {
+			r.discard(entry.Name())
 		}
 	}
 	return result, nil
+}
+
+// discard removes the runtime directory of a Host that no longer exists and any
+// sockets it left behind. A Host that is killed cannot clean up after itself.
+func (r *SessionHostRegistry) discard(hostID string) {
+	if hostID == "" {
+		return
+	}
+	_ = os.RemoveAll(filepath.Join(r.root, hostID))
+	socketDir := sessionhost.SocketDir()
+	for _, suffix := range []string{"-c.sock", "-a.sock"} {
+		_ = os.Remove(filepath.Join(socketDir, hostID+suffix))
+	}
+}
+
+// hostStateFinished reports whether a Host already reached a terminal state.
+func hostStateFinished(state string) bool {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "exited", "stopped", "failed":
+		return true
+	default:
+		return false
+	}
+}
+
+// hostProcessGone reports whether a Host PID is definitely not running. An
+// inconclusive check (permission denied, or a reused PID) keeps the runtime
+// state, so cleanup can never remove a live Agent.
+func hostProcessGone(pid int) bool {
+	if pid <= 0 {
+		return true
+	}
+	err := syscall.Kill(pid, 0)
+	return errors.Is(err, syscall.ESRCH)
 }
 
 func (r *SessionHostRegistry) Clients() map[string]*sessionhost.Client {

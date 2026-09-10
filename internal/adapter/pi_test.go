@@ -142,3 +142,76 @@ func TestPiHistoryRetainsIncompleteTrailingLine(t *testing.T) {
 		t.Fatalf("unexpected completed record: %+v", records)
 	}
 }
+
+// History discovery polls the catalog every couple of seconds, so an unchanged
+// transcript must not be parsed again: a full scan of a large catalog costs
+// about a second of CPU. Removing read permission after the first scan proves
+// the summary came from the cache instead of the file.
+func TestPiHistoryCatalogReusesUnchangedSummaries(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "proj", "2026-01-01T00-00-00-000Z_cached.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	content := `{"type":"session","id":"cached","cwd":"/tmp/ws"}` + "\n" +
+		`{"type":"message","id":"u1","timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":"hello"}}` + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	catalog := NewPiHistoryCatalog("", root)
+	first, err := catalog.List(context.Background())
+	if err != nil {
+		t.Fatalf("first list: %v", err)
+	}
+	if len(first) != 1 || first[0].SessionID != "cached" {
+		t.Fatalf("unexpected first listing: %+v", first)
+	}
+
+	if err := os.Chmod(path, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(path, 0o600)
+	second, err := catalog.List(context.Background())
+	if err != nil {
+		t.Fatalf("second list: %v", err)
+	}
+	if len(second) != 1 || second[0].SessionID != "cached" || second[0].FirstUser != "hello" {
+		t.Fatalf("unchanged transcript was re-parsed instead of reused: %+v", second)
+	}
+}
+
+// The cache must not hide new content: an appended record changes size and mtime
+// and has to be re-read.
+func TestPiHistoryCatalogRefreshesChangedTranscripts(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "2026-01-01T00-00-00-000Z_growing.jsonl")
+	header := `{"type":"session","id":"growing","cwd":"/tmp/ws"}` + "\n"
+	user := `{"type":"message","id":"u1","timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":"first"}}` + "\n"
+	if err := os.WriteFile(path, []byte(header+user), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	catalog := NewPiHistoryCatalog("", root)
+	if _, err := catalog.List(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	assistant := `{"type":"message","id":"a1","timestamp":"2026-01-01T00:00:05Z","message":{"role":"assistant","content":"reply"}}` + "\n"
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString(assistant); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	file.Close()
+	updated, err := catalog.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated) != 1 {
+		t.Fatalf("unexpected listing: %+v", updated)
+	}
+	if !updated[0].LastEventAt.After(updated[0].FirstEventAt) {
+		t.Fatalf("appended record was not picked up: %+v", updated[0])
+	}
+}

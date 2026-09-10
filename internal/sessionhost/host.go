@@ -202,11 +202,18 @@ func (h *Host) Run() error {
 	return waitErr
 }
 
+// SocketDir is where Host control and attach sockets live. It is a short path
+// because Unix socket names are length limited, and it is shared so a Daemon can
+// clean up sockets left behind by a Host that was killed.
+func SocketDir() string {
+	return filepath.Join(os.TempDir(), "agora-host")
+}
+
 func (h *Host) prepareSockets() error {
 	// Unix-domain socket path limits are small on macOS. Keep the long-lived
 	// metadata under ~/.agora, but place the sockets in a short system temp
 	// path and remove them explicitly during cleanup.
-	socketDir := filepath.Join(os.TempDir(), "agora-host")
+	socketDir := SocketDir()
 	if err := os.MkdirAll(socketDir, 0o700); err != nil {
 		return err
 	}

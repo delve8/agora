@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/delve8/agora/internal/event"
@@ -315,12 +316,33 @@ func NewPiHistoryCatalog(homeDir, sessionDir string) *PiHistoryCatalog {
 	return &PiHistoryCatalog{root: sessionDir}
 }
 
-type PiHistoryCatalog struct{ root string }
+type PiHistoryCatalog struct {
+	root string
+
+	// Pi appends to a transcript and never rewrites it, so a file whose size and
+	// mtime are unchanged has an unchanged summary. Parsing only the changed
+	// files keeps a large catalog (tens of MB of JSONL) cheap to poll: a full
+	// parse of ~90MB cost about 0.8s and the Daemon polls every two seconds.
+	// The cache lives in the catalog because callers share one instance.
+	mu    sync.Mutex
+	cache map[string]cachedPiSummary
+}
+
+type cachedPiSummary struct {
+	size       int64
+	modifiedAt time.Time
+	summary    PiHistorySummary
+}
 
 func (c *PiHistoryCatalog) Root() string { return c.root }
 
 func (c *PiHistoryCatalog) List(ctx context.Context) ([]PiHistorySummary, error) {
-	var paths []string
+	type candidate struct {
+		path       string
+		size       int64
+		modifiedAt time.Time
+	}
+	var files []candidate
 	err := filepath.Walk(c.root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -332,19 +354,52 @@ func (c *PiHistoryCatalog) List(ctx context.Context) ([]PiHistorySummary, error)
 			return ctx.Err()
 		}
 		if !info.IsDir() && filepath.Ext(path) == ".jsonl" {
-			paths = append(paths, path)
+			files = append(files, candidate{path: path, size: info.Size(), modifiedAt: info.ModTime()})
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	sort.Strings(paths)
-	result := make([]PiHistorySummary, 0, len(paths))
-	for _, path := range paths {
-		value, err := scanPiHistorySummary(ctx, path)
-		if err == nil && value.Meaningful {
+	sort.Slice(files, func(i, j int) bool { return files[i].path < files[j].path })
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cache == nil {
+		c.cache = make(map[string]cachedPiSummary)
+	}
+	seen := make(map[string]struct{}, len(files))
+	result := make([]PiHistorySummary, 0, len(files))
+	for _, file := range files {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		seen[file.path] = struct{}{}
+		if cached, ok := c.cache[file.path]; ok && cached.size == file.size && cached.modifiedAt.Equal(file.modifiedAt) {
+			if cached.summary.Meaningful {
+				result = append(result, cached.summary)
+			}
+			continue
+		}
+		value, scanErr := scanPiHistorySummary(ctx, file.path)
+		if scanErr != nil {
+			// Keep any previous summary: a transient read failure must not make a
+			// conversation disappear from the catalog.
+			if cached, ok := c.cache[file.path]; ok && cached.summary.Meaningful {
+				result = append(result, cached.summary)
+			}
+			continue
+		}
+		value.Size = file.size
+		value.ModifiedAt = file.modifiedAt.UTC()
+		c.cache[file.path] = cachedPiSummary{size: file.size, modifiedAt: file.modifiedAt, summary: value}
+		if value.Meaningful {
 			result = append(result, value)
+		}
+	}
+	for path := range c.cache {
+		if _, ok := seen[path]; !ok {
+			delete(c.cache, path)
 		}
 	}
 	return result, nil

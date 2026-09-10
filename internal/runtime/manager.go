@@ -34,6 +34,7 @@ type Manager struct {
 	homeDir          string
 	history          *adapter.HistoryCatalog
 	piHistory        *adapter.PiHistoryCatalog
+	piCatalogCache   *adapter.PiHistoryCatalog
 	catalogs         []SessionCatalog
 	catalogSnapshots map[string][]session.Session
 
@@ -163,6 +164,7 @@ func (m *Manager) AdoptSessionHosts(ctx context.Context) error {
 			continue
 		}
 		value := session.Session{ID: metadata.SessionID, CoordinationID: metadata.CoordinationID, DaemonID: metadata.DaemonID, Agent: metadata.Agent, AgentSessionID: metadata.AgentSessionID, Workspace: metadata.Workspace, DisplayName: metadata.DisplayName, HistoryPath: metadata.HistoryPath, State: session.StateRunning, Source: session.SourceManaged, Connection: session.ConnectionObserved, ProcessID: metadata.AgentPID, Capabilities: managedHostCapabilities(), CreatedAt: metadata.CreatedAt, UpdatedAt: metadata.UpdatedAt}
+		applyManagedHistoryCapability(&value)
 		if value.Agent == "claude" {
 			value.ClaudeSessionID = strings.TrimPrefix(value.AgentSessionID, "claude://")
 		}
@@ -185,6 +187,16 @@ func (m *Manager) AdoptSessionHosts(ctx context.Context) error {
 
 func managedHostCapabilities() session.Capabilities {
 	return session.Capabilities{CanStart: true, CanAttach: true, CanObserve: true, CanSendInput: true, CanStream: true, CanInterrupt: true, CanResume: true, CanReadHistory: true}
+}
+
+// applyManagedHistoryCapability keeps a live managed session honest about
+// history. Agora creates the provider session before the provider writes
+// anything, and a context switch can point at a session whose transcript does
+// not exist yet, so claiming CanReadHistory there shows the user an empty
+// conversation that looks like lost history. The observer flips it back on as
+// soon as it resolves the transcript.
+func applyManagedHistoryCapability(value *session.Session) {
+	value.Capabilities.CanReadHistory = strings.TrimSpace(value.HistoryPath) != ""
 }
 
 // hostSessionID resolves the canonical session id a Host client is currently
@@ -357,6 +369,20 @@ func (m *Manager) SetAgentIdentity(ctx context.Context, id, agent, agentSessionI
 		return session.Session{}, err
 	}
 	return value, nil
+}
+
+// piCatalog returns the shared Pi history catalog. The catalog caches parsed
+// summaries per file, so history discovery, live-session enrichment and the
+// switch watcher must reuse one instance instead of building a new one (and
+// re-parsing every transcript) on each call.
+func (m *Manager) piCatalog() *adapter.PiHistoryCatalog {
+	root := m.piHistoryRoot()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.piCatalogCache == nil || m.piCatalogCache.Root() != root {
+		m.piCatalogCache = adapter.NewPiHistoryCatalog(m.homeDir, root)
+	}
+	return m.piCatalogCache
 }
 
 func (m *Manager) piHistoryRoot() string {
@@ -784,6 +810,8 @@ func (m *Manager) createHostedClaudeSession(ctx context.Context, id, coordinatio
 	value.ClaudeSessionID = nativeID
 	value.State = session.StateRunning
 	value.Connection = session.ConnectionObserved
+	value.Capabilities = managedHostCapabilities()
+	applyManagedHistoryCapability(&value)
 	if err := m.store.UpdateSessionObservation(ctx, value); err != nil {
 		return session.Session{}, err
 	}
@@ -825,6 +853,7 @@ func (m *Manager) createHostedPiSession(ctx context.Context, id, coordinationID,
 	value.State = session.StateRunning
 	value.Connection = session.ConnectionObserved
 	value.Capabilities = piCapabilities()
+	applyManagedHistoryCapability(&value)
 	if err := m.store.UpdateSessionObservation(ctx, value); err != nil {
 		return session.Session{}, err
 	}
@@ -1274,6 +1303,7 @@ func (m *Manager) observe(ctx context.Context, value session.Session, token uint
 			cursor.Path = adapter.FindHistoryBySessionID(m.homeDir, value.ClaudeSessionID)
 			if cursor.Path != "" {
 				value.HistoryPath = cursor.Path
+				applyManagedHistoryCapability(&value)
 				_ = m.store.UpdateSessionObservation(ctx, value)
 			}
 		}
@@ -1509,6 +1539,7 @@ func (m *Manager) LiveSessions(ctx context.Context, coordinationID string) ([]se
 			value.State = session.StateRunning
 			value.Connection = session.ConnectionObserved
 			value.Capabilities = managedHostCapabilities()
+			applyManagedHistoryCapability(&value)
 			values = append(values, value)
 		}
 	}
@@ -1568,7 +1599,7 @@ func (m *Manager) LiveSessions(ctx context.Context, coordinationID string) ([]se
 	// table while exposing the same live-session metadata.
 	if m.pi != nil {
 		piNames := make(map[string]adapter.PiHistorySummary)
-		if summaries, listErr := adapter.NewPiHistoryCatalog(m.homeDir, m.piHistoryRoot()).List(ctx); listErr == nil {
+		if summaries, listErr := m.piCatalog().List(ctx); listErr == nil {
 			for _, summary := range summaries {
 				if summary.SessionID != "" {
 					piNames[summary.SessionID] = summary
@@ -1620,6 +1651,7 @@ func (m *Manager) LiveSessions(ctx context.Context, coordinationID string) ([]se
 			value.State = session.StateRunning
 			value.Connection = session.ConnectionObserved
 			value.Capabilities = piCapabilities()
+			applyManagedHistoryCapability(&value)
 			values = append(values, value)
 		}
 	}
@@ -1729,7 +1761,7 @@ func (m *Manager) discoverClaudeHistory(ctx context.Context, coordinationID, dae
 }
 
 func (m *Manager) discoverPiHistory(ctx context.Context, coordinationID, owner string) ([]session.Session, error) {
-	piSummaries, err := adapter.NewPiHistoryCatalog(m.homeDir, m.piHistoryRoot()).List(ctx)
+	piSummaries, err := m.piCatalog().List(ctx)
 	if err != nil {
 		return nil, err
 	}

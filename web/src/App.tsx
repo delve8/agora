@@ -320,7 +320,19 @@ export default function App() {
             <TerminalSnapshot agent={currentSession?.agent} snapshot={terminal.snapshot} error={terminal.error} loading={terminal.loading} />
             {currentSession?.capabilities.can_send_input && <MessageComposer disabled={false} onSend={submit} />}
           </div> : <>
-            <EventStream key={currentSession?.id} events={events} showProcessDetails={showProcessDetails} agent={currentSession?.agent} hasOlderEvents={hasOlderEvents} loadingOlder={loadingOlderEvents} onLoadOlder={() => void loadOlderEvents()} />
+            <EventStream
+              key={currentSession?.id}
+              events={events}
+              showProcessDetails={showProcessDetails}
+              agent={currentSession?.agent}
+              hasOlderEvents={hasOlderEvents}
+              loadingOlder={loadingOlderEvents}
+              onLoadOlder={() => void loadOlderEvents()}
+              // A running session can exist before its provider transcript does
+              // (a fresh session, or right after a context switch). Say so
+              // instead of rendering an empty conversation.
+              awaitingHistory={Boolean(currentSession && !currentSession.capabilities.can_read_history && (currentSession.capabilities.can_send_input || currentSession.capabilities.can_stream))}
+            />
             {currentSession?.capabilities.can_send_input && <div className="live-session-controls"><MessageComposer disabled={false} onSend={submit} /></div>}
           </>}
         </main>

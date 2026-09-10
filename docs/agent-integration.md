@@ -276,6 +276,11 @@ Managed Agent 由独立的 per-session `session-host` 持有。Daemon 通过认�
 
 能力声明必须按“provider + transport + version + 当前运行模式”计算。UI 只展示真实能力；不支持的操作返回可解释错误。
 
+能力还必须反映**当前运行态**，而不是 provider 的理论能力。典型例子：`CanReadHistory` 需要
+provider 的 transcript 已经存在——Agora 新建的会话在 provider 写入第一条消息前没有 JSONL，
+context switch 也可能指向尚未落盘的目标会话。这种情况下必须声明 `CanReadHistory: false`，
+UI 显示"该会话还没有历史记录"，而不是一个看起来像历史丢失的空对话。
+
 ## 5. 现有实现评估
 
 ### 5.1 已经可以复用

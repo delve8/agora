@@ -89,6 +89,7 @@ func (m *Manager) observePi(ctx context.Context, value session.Session, token ui
 				cursor.Path = adapter.FindPiHistoryBySessionID(m.piHistoryRoot(), nativeID)
 				if cursor.Path != "" {
 					value.HistoryPath = cursor.Path
+					applyManagedHistoryCapability(&value)
 					_ = m.store.UpdateSessionObservation(ctx, value)
 					m.notifySessionUpdate(value)
 				}

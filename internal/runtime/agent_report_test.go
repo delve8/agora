@@ -216,3 +216,71 @@ func quoteJSON(value string) string {
 	}
 	return string(body)
 }
+
+// A managed session exists before its provider writes anything, and a context
+// switch can point at a transcript that is not on disk yet. Claiming history
+// there shows the user an empty conversation that looks like lost history, so
+// the capability must follow the transcript.
+func TestManagedSessionAdvertisesHistoryOnlyWithATranscript(t *testing.T) {
+	manager, _, _, sessionDir := newReporterTestManager(t)
+	ctx := context.Background()
+	id, ok := manager.sessionIDForHost(func() string {
+		for _, client := range manager.hosts.Clients() {
+			return client.Metadata().HostID
+		}
+		return ""
+	}())
+	if !ok {
+		t.Fatal("managed session not found for its host")
+	}
+	value, err := manager.store.GetSession(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value.HistoryPath != "" {
+		t.Fatalf("test session unexpectedly has history: %q", value.HistoryPath)
+	}
+	live, err := manager.LiveSessions(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var listed session.Session
+	for _, candidate := range live {
+		if candidate.ID == id {
+			listed = candidate
+		}
+	}
+	if listed.ID == "" {
+		t.Fatalf("session %s is missing from the live list", id)
+	}
+	if listed.Capabilities.CanReadHistory {
+		t.Fatalf("a session without a transcript advertised history: %+v", listed.Capabilities)
+	}
+
+	// Once the provider persists the transcript the observer resolves it and the
+	// capability turns on.
+	native := strings.TrimPrefix(value.NativeSessionURI(), "pi://")
+	transcript := filepath.Join(sessionDir, "2026-01-01T00-00-00-000Z_"+native+".jsonl")
+	header := `{"type":"session","id":"` + native + `","cwd":` + quoteJSON(value.Workspace) + `}` + "\n"
+	record := `{"type":"message","id":"u1","timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":"hello"}}` + "\n"
+	if err := os.WriteFile(transcript, []byte(header+record), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		live, err := manager.LiveSessions(ctx, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, candidate := range live {
+			if candidate.ID == id && candidate.Capabilities.CanReadHistory {
+				if candidate.HistoryPath != transcript {
+					t.Fatalf("history path = %q, want %q", candidate.HistoryPath, transcript)
+				}
+				return
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("history capability never turned on after the transcript appeared")
+}

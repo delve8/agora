@@ -215,3 +215,29 @@ func TestGappedResyncRequestsAFullResync(t *testing.T) {
 		t.Fatal("a gapped resync did not request a full resync")
 	}
 }
+
+// The Server derives capabilities for a live daemon session from the summary it
+// received. A session whose provider transcript does not exist yet must not
+// advertise history: the UI would otherwise show an empty conversation.
+func TestLiveSessionHistoryCapabilityFollowsTheTranscript(t *testing.T) {
+	now := time.Now().UTC()
+	base := protocol.SessionSummary{
+		SessionID: "daemon/d/pi://native", DaemonID: "d", Agent: "pi",
+		AgentSessionID: "pi://native", Workspace: "/tmp/ws", DisplayName: "Pi",
+		State: session.StateRunning, Connection: session.ConnectionObserved, PID: 42,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	fresh := liveSummarySession(base, "coord-1")
+	if fresh.Capabilities.CanReadHistory {
+		t.Fatalf("a session without a transcript advertised history: %+v", fresh.Capabilities)
+	}
+	if !fresh.Capabilities.CanSendInput || !fresh.Capabilities.CanStream {
+		t.Fatalf("live capabilities were lost: %+v", fresh.Capabilities)
+	}
+	withHistory := base
+	withHistory.HistoryPath = "/tmp/ws/session.jsonl"
+	resolved := liveSummarySession(withHistory, "coord-1")
+	if !resolved.Capabilities.CanReadHistory {
+		t.Fatalf("a session with a transcript did not advertise history: %+v", resolved.Capabilities)
+	}
+}

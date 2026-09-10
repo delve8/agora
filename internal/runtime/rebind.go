@@ -455,7 +455,7 @@ func (m *Manager) switchCatalog(ctx context.Context, agent string) ([]switchCand
 
 func (m *Manager) listSwitchCatalog(ctx context.Context, agent string) ([]switchCandidate, error) {
 	if agent == "pi" {
-		values, err := adapter.NewPiHistoryCatalog(m.homeDir, m.piHistoryRoot()).List(ctx)
+		values, err := m.piCatalog().List(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -684,6 +684,11 @@ func (m *Manager) rebindSession(id, agent, nativeID, historyPath, workspace, dis
 		updated.ClaudeSessionID = nativeID
 	}
 	updated.HistoryPath = historyPath
+	updated.Capabilities = managedHostCapabilities()
+	if agent == "pi" {
+		updated.Capabilities = piCapabilities()
+	}
+	applyManagedHistoryCapability(&updated)
 	updated.Workspace = firstNonEmpty(old.Workspace, workspace)
 	updated.State = session.StateRunning
 	updated.Connection = session.ConnectionObserved

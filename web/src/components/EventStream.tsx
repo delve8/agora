@@ -147,7 +147,7 @@ function isProcessEvent(event: Event) {
   return type === "thinking" || type === "tool_call" || type === "tool_update" || type === "tool_result" || type === "status" || event.kind === "thinking" || event.kind === "tool" || event.kind === "result" || event.kind === "system";
 }
 
-export function EventStream({ events, showProcessDetails, agent, hasOlderEvents, loadingOlder, onLoadOlder }: { events: Event[]; showProcessDetails: boolean; agent?: string; hasOlderEvents?: boolean; loadingOlder?: boolean; onLoadOlder?: () => void }) {
+export function EventStream({ events, showProcessDetails, agent, hasOlderEvents, loadingOlder, onLoadOlder, awaitingHistory }: { events: Event[]; showProcessDetails: boolean; agent?: string; hasOlderEvents?: boolean; loadingOlder?: boolean; onLoadOlder?: () => void; awaitingHistory?: boolean }) {
   const visible = events.filter(isVisibleEvent);
   const processCount = visible.filter(isProcessEvent).length;
   const displayed = showProcessDetails ? visible : visible.filter((event) => !isProcessEvent(event));
@@ -221,7 +221,7 @@ export function EventStream({ events, showProcessDetails, agent, hasOlderEvents,
   return <Card className="event-stream">
     <div ref={scrollRef} className="events" aria-live="polite" onScroll={handleScroll}>
       {loadingOlder && <div className="history-load-more"><Text type="secondary">加载更早的消息…</Text></div>}
-      {displayed.length === 0 ? <div className="empty-state"><Text type="secondary">{processCount > 0 ? "Process details are hidden. Use Show process details to inspect them." : "Start a session and send a message; activity will appear here."}</Text></div> : displayed.map((event) => <div className="event-row" key={event.id}><EventRenderer event={event} agent={agent} /></div>)}
+      {displayed.length === 0 ? <div className="empty-state"><Text type="secondary">{processCount > 0 ? "Process details are hidden. Use Show process details to inspect them." : awaitingHistory ? "该会话还没有历史记录——Agent 写入第一条消息后即可查看。" : "Start a session and send a message; activity will appear here."}</Text></div> : displayed.map((event) => <div className="event-row" key={event.id}><EventRenderer event={event} agent={agent} /></div>)}
     </div>
   </Card>;
 }
