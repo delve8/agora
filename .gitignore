@@ -8,8 +8,10 @@
 *.so
 *.dylib
 bin/
-agora
-agora-claude-proxy
+# Built binaries at the repository root. Anchor these: a bare `agora` also
+# matches the cmd/agora directory and would silently hide its Go sources.
+/agora
+/agora-claude-proxy
 
 # Test binary, built with `go test -c`
 *.test
