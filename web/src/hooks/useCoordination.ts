@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { createSession, loadEvents, loadState, resumeSession, sendMessage, stopSession, subscribe } from "../api/client";
 import type { CreateSessionInput } from "../api/client";
 import type { Coordination, Event, Session } from "../types";
-import { derivedSessionName } from "../sessionName";
 
 const INITIAL_EVENT_COUNT = 60;
 const OLDER_EVENT_PAGE_SIZE = 50;
@@ -67,14 +66,6 @@ export function useCoordination() {
   const canReadHistory = currentSession?.capabilities.can_read_history ?? false;
   const canStream = currentSession?.capabilities.can_stream ?? false;
 
-  const applyDerivedName = useCallback((sessionId: string, values: Event[]) => {
-    setSessions((current) => current.map((session) => {
-      if (session.id !== sessionId) return session;
-      const derived = derivedSessionName(session, values);
-      return derived ? { ...session, display_name: derived.name, display_name_source: derived.source } : session;
-    }));
-  }, []);
-
   useEffect(() => {
     if (!selectedSessionId) { setEvents([]); return; }
     const selected = sessions.find((session) => session.id === selectedSessionId);
@@ -99,7 +90,6 @@ export function useCoordination() {
           firstLoad = false;
           historyLoaded = true;
         }
-        applyDerivedName(selectedSessionId, value);
         if (showError) setError("");
       }).catch((value) => {
         if (showError && !cancelled) setError(value instanceof Error ? value.message : "Unable to load events");
@@ -120,13 +110,11 @@ export function useCoordination() {
     const unsubscribe = canStream ? subscribe(selectedSessionId, (value) => {
       setEvents((current) => {
         if (current.some((item) => item.id === value.id)) return current;
-        const next = [...current, value].sort((a, b) => a.created_at.localeCompare(b.created_at));
-        if (value.kind === "user" || value.kind === "ai-title") applyDerivedName(selectedSessionId, next);
-        return next;
+        return [...current, value].sort((a, b) => a.created_at.localeCompare(b.created_at));
       });
     }, () => { if (!cancelled) setError("Event stream disconnected; retrying on refresh"); }) : () => {};
     return () => { cancelled = true; if (historyTimer !== undefined) window.clearInterval(historyTimer); unsubscribe(); };
-  }, [selectedSessionId, canReadHistory, canStream, applyDerivedName]);
+  }, [selectedSessionId, canReadHistory, canStream]);
 
   const loadOlderEvents = useCallback(async () => {
     if (!selectedSessionId || !canReadHistory || !hasOlderEvents || loadingOlderEvents || events.length === 0) return;
@@ -140,13 +128,12 @@ export function useCoordination() {
         return [...byId.values()].sort((a, b) => a.created_at.localeCompare(b.created_at));
       });
       setHasOlderEvents(value.length >= OLDER_EVENT_PAGE_SIZE);
-      applyDerivedName(selectedSessionId, value);
     } catch (value) {
       setError(value instanceof Error ? value.message : "Unable to load older events");
     } finally {
       setLoadingOlderEvents(false);
     }
-  }, [applyDerivedName, canReadHistory, events, hasOlderEvents, loadingOlderEvents, selectedSessionId]);
+  }, [canReadHistory, events, hasOlderEvents, loadingOlderEvents, selectedSessionId]);
 
   const addSession = useCallback(async (input: CreateSessionInput) => {
     if (!coordination) throw new Error("coordination is not ready");

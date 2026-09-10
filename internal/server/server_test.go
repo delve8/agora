@@ -660,3 +660,105 @@ func TestStateListsHistorySessionsBesideLiveSessionInSameWorkspace(t *testing.T)
 		t.Fatalf("unexpected history capabilities: %+v", older.Capabilities)
 	}
 }
+
+// Session naming has one owner (the Server) and one precedence: an explicit
+// rename and an AI title outrank the first user message, which outranks the
+// placeholder a wrapper starts with. Enrichment must only ever fill in a name
+// that carries no information yet; otherwise the label flips between writers.
+func TestStateEnrichesOnlyPlaceholderSessionNames(t *testing.T) {
+	cases := []struct {
+		name           string
+		live           protocol.SessionSummary
+		historyName    string
+		historySource  string
+		wantName       string
+		wantNameSource string
+	}{
+		{
+			name:           "placeholder is replaced",
+			live:           protocol.SessionSummary{DisplayName: "New session", DisplayNameSource: session.DisplayNameSourceInitial},
+			historyName:    "fix the build",
+			historySource:  session.DisplayNameSourceFirstUser,
+			wantName:       "fix the build",
+			wantNameSource: session.DisplayNameSourceFirstUser,
+		},
+		{
+			name:           "explicit rename is kept",
+			live:           protocol.SessionSummary{DisplayName: "my own name", DisplayNameSource: session.DisplayNameSourceCustom},
+			historyName:    "provider title",
+			historySource:  session.DisplayNameSourceAITitle,
+			wantName:       "my own name",
+			wantNameSource: session.DisplayNameSourceCustom,
+		},
+		{
+			name:           "ai title outranks a first user message",
+			live:           protocol.SessionSummary{DisplayName: "polish release notes", DisplayNameSource: session.DisplayNameSourceAITitle},
+			historyName:    "please polish the release notes",
+			historySource:  session.DisplayNameSourceFirstUser,
+			wantName:       "polish release notes",
+			wantNameSource: session.DisplayNameSourceAITitle,
+		},
+		{
+			name:           "legacy workspace-basename name is replaced",
+			live:           protocol.SessionSummary{DisplayName: "agora", Workspace: "/tmp/agora", DisplayNameSource: session.DisplayNameSourceCustom},
+			historyName:    "review the migration",
+			historySource:  session.DisplayNameSourceFirstUser,
+			wantName:       "review the migration",
+			wantNameSource: session.DisplayNameSourceFirstUser,
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			db, err := store.Open(filepath.Join(t.TempDir(), "agora.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			now := time.Now().UTC()
+			coord := coordination.Coordination{ID: "coord-1", Name: "Test", CreatedAt: now}
+			if err := db.CreateCoordination(context.Background(), coord); err != nil {
+				t.Fatal(err)
+			}
+			srv := New(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), nil))
+			live := test.live
+			live.SessionID = "daemon/daemon-1/pi://native"
+			live.DaemonID = "daemon-1"
+			live.Agent = "pi"
+			live.AgentSessionID = "pi://native"
+			if live.Workspace == "" {
+				live.Workspace = "/tmp/workspace"
+			}
+			live.State = session.StateRunning
+			live.Connection = session.ConnectionObserved
+			live.PID = 42
+			live.CreatedAt, live.UpdatedAt = now, now
+			seedDaemonLiveSession(srv, "daemon-1", live)
+			seedDaemonHistorySession(srv, "daemon-1", protocol.HistorySessionSummary{
+				SessionID: live.SessionID, DaemonID: "daemon-1", Agent: "pi", AgentSessionID: "pi://native",
+				Workspace: live.Workspace, DisplayName: test.historyName, DisplayNameSource: test.historySource,
+				CreatedAt: now, UpdatedAt: now,
+			})
+
+			// Two consecutive reads must agree: a name that changes between polls
+			// is exactly the flicker this rule prevents.
+			for attempt := 0; attempt < 2; attempt++ {
+				req := httptest.NewRequest(http.MethodGet, "/api/state", nil)
+				resp := httptest.NewRecorder()
+				srv.HTTP.Handler.ServeHTTP(resp, req)
+				var state struct {
+					Sessions []session.Session `json:"sessions"`
+				}
+				if err := json.Unmarshal(resp.Body.Bytes(), &state); err != nil {
+					t.Fatal(err)
+				}
+				if len(state.Sessions) != 1 {
+					t.Fatalf("unexpected sessions: %+v", state.Sessions)
+				}
+				got := state.Sessions[0]
+				if got.DisplayName != test.wantName || got.DisplayNameSource != test.wantNameSource {
+					t.Fatalf("attempt %d: name = %q (%s), want %q (%s)", attempt, got.DisplayName, got.DisplayNameSource, test.wantName, test.wantNameSource)
+				}
+			}
+		})
+	}
+}

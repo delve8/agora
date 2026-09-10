@@ -276,6 +276,21 @@ Managed Agent 由独立的 per-session `session-host` 持有。Daemon 通过认�
 
 能力声明必须按“provider + transport + version + 当前运行模式”计算。UI 只展示真实能力；不支持的操作返回可解释错误。
 
+### 会话命名的唯一写入方
+
+会话名称只由 Server 侧决定并持久化（`display_name` + `display_name_source`），优先级固定为：
+
+```text
+custom（/name 或显式重命名） > ai_title > first_user > initial（"New session" 等占位名）
+```
+
+补齐（enrichment）只能填充**还没有信息量**的名字：空值、占位名、不透明的旧格式名，以及旧版本
+用 workspace 目录名当子项名的行。已经携带 `custom`/`ai_title`/`first_user` 的名字不会被覆盖。
+
+客户端**不得**自己推导会话名。Web UI 只加载会话的一个事件窗口（默认最近 60 条），窗口里的
+"第一条用户消息"通常是**最近**一条消息，用它命名会与服务端从完整 transcript 得到的名字冲突；
+两边各按自己的定时器重新应用（history 每 2s、state 每 5s），用户就会看到名称来回跳。
+
 能力还必须反映**当前运行态**，而不是 provider 的理论能力。典型例子：`CanReadHistory` 需要
 provider 的 transcript 已经存在——Agora 新建的会话在 provider 写入第一条消息前没有 JSONL，
 context switch 也可能指向尚未落盘的目标会话。这种情况下必须声明 `CanReadHistory: false`，
