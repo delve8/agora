@@ -72,6 +72,11 @@ func (s *Store) findPrincipal(ctx context.Context, provider, subject string) (au
 // refreshUserProfile updates the human readable labels of an existing user.
 // Identity stays (provider, subject): this only replaces the label the UI shows,
 // and only with a value the provider actually supplied.
+//
+// Note that a token validator can only pass on the claims its token carries.
+// Logto's access token, which the API validates, has no profile claims, so the
+// Web UI takes the login name from the ID token it already holds; this refresh
+// covers providers (or deployments) whose access token does carry them.
 func (s *Store) refreshUserProfile(ctx context.Context, userID, displayName, email string) error {
 	displayName = strings.TrimSpace(displayName)
 	email = strings.TrimSpace(email)

@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import { Alert, Button, Flex, Space, Spin } from "antd";
-import { LogtoProvider, useHandleSignInCallback, useLogto } from "@logto/react";
+import { LogtoProvider, useHandleSignInCallback, useLogto, type IdTokenClaims } from "@logto/react";
 import { loadMe, setAccessTokenProvider, type PrincipalResponse } from "./api/client";
 
 // AuthActions lets the app shell render the signed-in identity and sign-out
@@ -55,11 +55,25 @@ function isInvalidTokenError(value: unknown): boolean {
   return value instanceof Error && /invalid JWT format|invalid token/i.test(value.message);
 }
 
+// The API validates Logto's access token, and an access token carries no profile
+// claims: username, name and email exist only in the ID token (or userinfo). The
+// signed-in label therefore comes from the browser's ID token, with the Server's
+// principal as the fallback for providers whose access token does carry claims.
+function preferredUserLabel(claims?: IdTokenClaims | null): string {
+  const record = claims as (Record<string, unknown> | null | undefined);
+  for (const value of [claims?.username, record?.["preferred_username"], claims?.name, claims?.email]) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
 function LogtoGate({ children, audience }: { children: ReactNode; audience?: string }) {
-  const { isAuthenticated, isLoading, error, signIn, signOut, getAccessToken, clearAccessToken, clearAllTokens } = useLogto();
+  const { isAuthenticated, isLoading, error, signIn, signOut, getAccessToken, getIdTokenClaims, clearAccessToken, clearAllTokens } = useLogto();
   const [principal, setPrincipal] = useState<PrincipalResponse["principal"] | null>(null);
   const [identityError, setIdentityError] = useState("");
   const [identityLoading, setIdentityLoading] = useState(true);
+  const [idTokenName, setIdTokenName] = useState("");
+  const [idTokenEmail, setIdTokenEmail] = useState("");
   const invalidation = useRef<Promise<void> | null>(null);
   useEffect(() => {
     const invalidate = async () => {
@@ -111,13 +125,34 @@ function LogtoGate({ children, audience }: { children: ReactNode; audience?: str
     })();
     return () => { cancelled = true; };
   }, [clearAccessToken, clearAllTokens, isAuthenticated, audience]);
+  useEffect(() => {
+    if (!isAuthenticated) {
+      setIdTokenName("");
+      setIdTokenEmail("");
+      return;
+    }
+    let cancelled = false;
+    void getIdTokenClaims()
+      .then((claims) => {
+        if (cancelled || !claims) return;
+        setIdTokenName(preferredUserLabel(claims));
+        setIdTokenEmail(typeof claims.email === "string" ? claims.email.trim() : "");
+      })
+      .catch(() => {
+        // The principal from /api/me stays the fallback label.
+      });
+    return () => { cancelled = true; };
+  }, [isAuthenticated, getIdTokenClaims]);
+
   // Logto marks the provider as loading while refreshing an access token. Keep
   // authenticated children mounted during that request; otherwise a device
   // action can make the Drawer disappear while its API call is authenticating.
   if (isLoading && !isAuthenticated) return <div className="loading-screen"><Spin /> Loading authentication…</div>;
   if (!isAuthenticated) return <div className="loading-screen"><Flex vertical gap="middle" align="center"><h2>Sign in to Agora</h2>{error && <Alert type="error" message={error.message} /> }<Button type="primary" onClick={() => void signIn(authRedirectUri())}>Sign in</Button></Flex></div>;
   if (identityLoading || !principal) return <div className="loading-screen"><Flex vertical gap="middle" align="center"><Spin />{identityError ? <Alert type="error" message="Agora authentication failed" description={identityError} /> : <span>Verifying identity…</span>}<Space>{identityError && <Button onClick={() => void signIn(authRedirectUri())}>Sign in again</Button>}<Button type="link" onClick={() => void signOut(authRedirectUri())}>Sign out</Button></Space></Flex></div>;
-  const identity = `${principal.display_name || principal.user_id}${principal.email ? ` (${principal.email})` : ""}`;
+  const label = idTokenName || principal.display_name || principal.user_id;
+  const email = principal.email || idTokenEmail;
+  const identity = email && !label.includes(email) ? `${label} (${email})` : label;
   const actions: AuthActions = { identity, signOut: () => void signOut(authRedirectUri()) };
   return <AuthActionsContext.Provider value={actions}>{children}</AuthActionsContext.Provider>;
 }
