@@ -60,6 +60,18 @@ button, input, textarea { font: inherit; }
 .event-markdown { color: #1f2937; line-height: 1.65; overflow-wrap: anywhere; }
 .event-markdown p:last-child { margin-bottom: 0; }
 .event-markdown pre, .tool-details pre { max-width: 100%; overflow: auto; padding: 12px; border-radius: 6px; background: #f6f8fa; font-size: 12px; }
+/* GFM tables: agents emit them often, and without remark-gfm the pipes showed
+   up as literal text. Keep them readable and scrollable inside the bubble. */
+.event-markdown table { display: block; width: max-content; max-width: 100%; margin: 8px 0; overflow-x: auto; border-collapse: collapse; font-size: 12.5px; -webkit-overflow-scrolling: touch; }
+.event-markdown thead { background: #f6f8fa; }
+.event-markdown th, .event-markdown td { padding: 6px 10px; border: 1px solid #e5e7eb; text-align: left; vertical-align: top; }
+.event-markdown th { font-weight: 600; white-space: nowrap; }
+.event-markdown tbody tr:nth-child(even) { background: #fafbfc; }
+.event-markdown del { color: #86909c; }
+.event-markdown input[type="checkbox"] { margin: 0 6px 0 0; vertical-align: middle; }
+.event-markdown a { color: #1677ff; text-decoration: none; overflow-wrap: anywhere; }
+.event-markdown a:hover { text-decoration: underline; }
+.event-markdown hr { height: 1px; margin: 12px 0; border: 0; background: #e5e7eb; }
 .event-collapse { border-bottom: 1px solid #f0f0f0; }
 .event-collapse .ant-collapse-header { align-items: center !important; padding: 12px !important; }
 .event-collapse .ant-collapse-content-box { padding: 0 12px 12px 42px !important; }

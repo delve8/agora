@@ -2,6 +2,7 @@ import { useLayoutEffect, useRef, useState } from "react";
 import { Alert, Badge, Button, Card, Collapse, Space, Tag, Tooltip, Typography } from "antd";
 import { BulbOutlined, CheckCircleOutlined, CodeOutlined, ExclamationCircleOutlined, GlobalOutlined, LinkOutlined, ThunderboltOutlined, UserOutlined } from "@ant-design/icons";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import type { Event } from "../types";
 import { AgentBadge } from "./AgentBadge";
 
@@ -60,7 +61,7 @@ function TextEvent({ event, agent }: EventRendererProps & { agent?: string }) {
   const body = long && !expanded ? `${content.slice(0, 900)}…` : content;
   return <Card className={`event-card event-${event.role || event.kind}`} size="small" bordered={false}>
     <EventMeta event={event} user={event.role === "user" || event.kind === "user"} agent={agent} />
-    <div className="event-markdown"><ReactMarkdown>{body}</ReactMarkdown></div>
+    <div className="event-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{body}</ReactMarkdown></div>
     {long && <Button type="link" size="small" onClick={() => setExpanded((value) => !value)}>{expanded ? "Show less" : "Show full message"}</Button>}
   </Card>;
 }
