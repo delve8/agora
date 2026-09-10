@@ -218,9 +218,13 @@ func SpawnWithEnv(ctx context.Context, executable string, config Config, env []s
 	if env != nil {
 		cmd.Env = env
 	}
-	// The Host is intentionally not placed in a Daemon-owned process group.
-	// Daemon.Close never signals this child; the Host becomes orphaned and is
-	// adopted by the system when the Daemon exits.
+	// The Host owns the Agent, so it must not share the Daemon's session or
+	// process group. Otherwise a Ctrl-C in the terminal that started the Daemon
+	// (or a SIGHUP when that terminal closes) is delivered to the whole
+	// foreground process group, kills the Host, and the Agent then exits because
+	// its PTY master closed. Daemon.Close never signals this child; the Host is
+	// orphaned and adopted by the system when the Daemon exits.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
 		_ = os.RemoveAll(config.RuntimeDir)
 		return nil, fmt.Errorf("start session-host: %w", err)

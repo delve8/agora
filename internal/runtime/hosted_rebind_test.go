@@ -37,6 +37,7 @@ func runSessionHostProcess(args []string) int {
 		fmt.Fprintln(os.Stderr, "session-host test helper: --config is required")
 		return 2
 	}
+	sessionhost.IgnoreTerminalSignals()
 	config, err := sessionhost.LoadConfig(configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "session-host test helper: %v\n", err)

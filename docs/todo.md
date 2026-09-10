@@ -32,33 +32,7 @@
 - 新增或修改 transcript 后，Server resync 仍能在 5s 内反映变化（保持现有可观测行为）。
 - 增加回归测试或 benchmark：catalog 未变化时不得重复解析文件内容。
 
-## 2. Session Host 的进程组与信号语义
-
-**现象与证据**
-
-- `internal/sessionhost/client.go` 的 `Spawn` 没有设置 `SysProcAttr`，因此 Session Host 继承 Daemon 的进程组。
-- `cmd/agora/session_host.go` 没有注册任何 signal handler，SIGINT/SIGTERM/SIGHUP 都是默认行为。
-- 实测：在 Daemon 所在终端按 Ctrl-C 重启时，旧 `session-host` 与旧 Agent 进程一起退出；stale metadata 中 `state` 仍是 `running`，说明没有走清理路径。
-- 结果与 `docs/session-host.md` 中「Daemon restart ≠ Agent stop」的目标冲突。
-
-**影响**
-
-- 用 Ctrl-C（或关闭终端产生 SIGHUP）停止 Daemon 时会连带结束 Agent，Session Host 的保活目标只是部分成立。
-- 当前只能靠 `kill <daemon-pid>` 规避。
-
-**建议方案**
-
-- `Spawn` 时让 Host 进入独立进程组/会话（`Setpgid`，必要时 `Setsid`），并确保不成为终端前台进程组。
-- Host 忽略 SIGHUP/SIGINT，只响应显式 `stop`/`shutdown` 以及 Agent 自身退出。
-- 让「`Daemon.Close()` 永不向 Host 发信号」的注释与实际进程组语义一致。
-
-**验收标准**
-
-- 在 Daemon 所在终端按 Ctrl-C 后，Host 与 Agent 的 PID 保持不变，wrapper 仍能 attach。
-- `kill <daemon-pid>` 与 Ctrl-C 两种停止方式行为一致。
-- 补充集成测试覆盖上述两种停止方式。
-
-## 3. runtime registry 的 stale 清理
+## 2. runtime registry 的 stale 清理
 
 **现象与证据**
 

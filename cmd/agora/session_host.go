@@ -27,6 +27,10 @@ func runSessionHost(args []string) error {
 		return err
 	}
 	defer os.Remove(*configPath)
+	// A Host process owns the Agent's lifetime, so terminal signals aimed at the
+	// Daemon must not end it. Spawn also detaches the Host into its own session;
+	// both measures together keep "Daemon restart" from meaning "Agent restart".
+	sessionhost.IgnoreTerminalSignals()
 	if err := host.Run(); err != nil {
 		return fmt.Errorf("session-host: %w", err)
 	}

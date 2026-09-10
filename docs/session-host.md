@@ -99,6 +99,31 @@ Daemon disconnect / restart
 | Host 异常退出 | 操作系统回收资源 | 通常一起退出 | stale，需要重建或 resume |
 | 机器关机 | 由系统终止 | 由系统终止 | 依赖 provider history 恢复 |
 
+### 2.4 进程组与信号
+
+仅仅“让 Host 成为中间进程”不足以实现上面这张表，还需要明确信号归属：
+
+- Daemon 发起的 `Spawn` 让 Host 进入**独立 session / 进程组**（`Setsid`）。否则 Ctrl-C 会发给 Daemon 所在终端的前台进程组，Host 会一起收到 SIGINT 而立刻退出，Agent 则因为 PTY master 被关闭而跟着退出。
+- Host 入口调用 `sessionhost.IgnoreTerminalSignals()`，忽略 SIGINT 与 SIGHUP。这两个信号属于“驱动 Daemon 的终端”，不代表用户要停止 Agent。
+- SIGTERM 仍然生效：它表示明确要求该 Host 进程退出。用户显式 Stop 走 control socket 的 `stop`/`shutdown`，不依赖信号。
+- `Daemon.Close()` 只丢弃 client 连接，绝不向 Host 发信号。
+
+对应约束：
+
+```text
+SIGINT / SIGHUP（终端）        → Host 忽略，Agent 继续运行
+SIGTERM（直接发给 Host）        → Host 退出
+control socket stop/shutdown   → Host 终止 Agent 并清理后退出
+Agent 自己退出                 → Host 清理后退出
+```
+
+因此判定“Daemon 重启不影响 Agent”的验收必须在两种停止方式下都成立：
+
+1. 在 Daemon 所在终端按 Ctrl-C；
+2. 只向 Daemon 进程发送 SIGTERM（或 `kill <daemon-pid>`）。
+
+需要注意的是，Agent 自己由 `pty.Start` 启动，已经拥有独立 session，因此它不会被 Daemon 终端的信号直接命中；在缺少上述措施时，它是因 Host 退出、PTY master 被关闭而退出。
+
 ## 3. 目标进程拓扑
 
 ```text
