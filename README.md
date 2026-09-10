@@ -178,6 +178,58 @@ automation; `agora daemon install` is not a first-phase end-user command. See
 [the deployment boundary in the specification](docs/spec.md#72-daemon-部署与安装边界)
 and [the pairing contract](docs/authentication.md#61-安装与配对流程) for details.
 
+## Container image
+
+A merge to `main` publishes the Server image to the GitHub Container Registry:
+
+```bash
+podman pull ghcr.io/delve8/agora:latest
+# also published: :sha-<commit>, and :<version> / :<major>.<minor> for v* tags
+```
+
+The image contains the API, the Daemon relay, and the Web UI. Agents do not run
+in it: their processes, PTYs, and provider history stay on the workstation that
+runs `agora daemon`.
+
+```bash
+podman run -d --name agora \
+  -p 8080:8080 \
+  -v agora-data:/data \
+  -e AGORA_LOGTO_ISSUER=https://logto.example.com/oidc \
+  -e AGORA_LOGTO_AUDIENCE=https://agora.example.com/api \
+  -e AGORA_LOGTO_PROVISIONING=enabled \
+  ghcr.io/delve8/agora:latest
+```
+
+The container listens on `0.0.0.0:8080`, so it must be authenticated: local
+trust mode refuses a non-loopback address and the process exits with
+`local auth mode requires a loopback listen address`. Provide the Logto settings
+above, and build the bundle with matching `VITE_LOGTO_*` build arguments when
+your tenant differs from the published image (see
+`.github/workflows/image.yaml`; the workflow reads them from repository
+variables).
+
+Useful overrides:
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `AGORA_SERVER_ADDR` | listen address | `0.0.0.0:8080` |
+| `AGORA_SERVER_DB` | SQLite file | `/data/server.db` |
+| `AGORA_WEB_DIR` | Web bundle | `/app/web` |
+| `AGORA_PUBLIC_URL` | base URL used in notification links | unset |
+
+Build it locally with podman:
+
+```bash
+podman build --format docker -f Containerfile -t agora:local .
+```
+
+`--format docker` (or `--oci-mediatypes=false` with buildx) matters: an OCI
+manifest cannot carry the image's `HEALTHCHECK`, which probes `/healthz`. On
+hosts that inject an HTTP proxy into containers, add `--http-proxy=false` so the
+probe and the SPA load are not sent through a proxy that cannot reach the
+container's own loopback address.
+
 ## Environment isolation
 
 Agora removes inherited Claude/Cursor child-session variables before launching Claude. This is required to avoid Claude displaying `Transcript saving is off` and disabling JSONL persistence.

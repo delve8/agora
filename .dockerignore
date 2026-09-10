@@ -1,0 +1,15 @@
+# Build context hygiene: the Web bundle and Go build cache are produced inside
+# the image, and local state must never leak into it.
+.git
+.github
+.vscode
+.agora
+bin
+web/node_modules
+web/dist
+*.db
+*.db-wal
+*.db-shm
+*.test
+coverage.*
+.DS_Store

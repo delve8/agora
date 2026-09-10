@@ -1,0 +1,114 @@
+name: image
+
+# Builds the server image and pushes it to the GitHub Container Registry, so a
+# merge to main yields ghcr.io/<owner>/agora:latest plus an immutable :sha-* tag.
+#
+# The Web bundle inlines its Logto settings at build time. Set the repository
+# variables below (Settings -> Secrets and variables -> Actions -> Variables) to
+# publish an image whose UI points at your Logto tenant:
+#
+#   VITE_LOGTO_ENDPOINT  e.g. https://logto.example.com
+#   VITE_LOGTO_APP_ID    the SPA application id
+#   VITE_LOGTO_AUDIENCE  the API resource indicator, when one is configured
+#
+# The matching runtime settings (AGORA_LOGTO_ISSUER, AGORA_LOGTO_AUDIENCE) are
+# ordinary container environment variables.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Go vet
+        run: go vet ./...
+      # -p 1 keeps the end-to-end suite from competing with itself for PTYs and
+      # loopback ports, which makes it flaky under a parallel package run.
+      - name: Go tests
+        run: go test -p 1 ./...
+      - name: Web build
+        run: |
+          npm --prefix web ci
+          npm --prefix web run build
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required to push to ghcr.io with the workflow's own token.
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lowercase the image name
+        id: image
+        run: echo "name=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Containerfile
+          # arm64 matters for workstations and Apple silicon clusters; drop it if
+          # build minutes are tight.
+          platforms: linux/amd64,linux/arm64
+          # oci-mediatypes=false keeps the Docker image format, which is what
+          # carries the Containerfile's HEALTHCHECK; the registry rejects a
+          # healthcheck on an OCI manifest. Pull requests build without pushing,
+          # so the image is validated but never published.
+          outputs: type=image,oci-mediatypes=false,push=${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VITE_LOGTO_ENDPOINT=${{ vars.VITE_LOGTO_ENDPOINT }}
+            VITE_LOGTO_APP_ID=${{ vars.VITE_LOGTO_APP_ID }}
+            VITE_LOGTO_AUDIENCE=${{ vars.VITE_LOGTO_AUDIENCE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
