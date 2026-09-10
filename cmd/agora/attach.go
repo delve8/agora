@@ -82,7 +82,7 @@ func callLocalDaemon(payload protocol.WrapperRequest) (protocol.WrapperResponse,
 	}
 	conn, err := net.DialTimeout("unix", path, 5*time.Second)
 	if err != nil {
-		return protocol.WrapperResponse{}, fmt.Errorf("connect to local Agora daemon at %s: %w", path, err)
+		return protocol.WrapperResponse{}, daemonUnavailableError{path: path, err: err}
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
@@ -101,6 +101,21 @@ func callLocalDaemon(payload protocol.WrapperRequest) (protocol.WrapperResponse,
 	}
 	return result, nil
 }
+
+// daemonUnavailableError uses EX_TEMPFAIL so the PATH wrapper can distinguish
+// an unreachable local Daemon from validation or Agent errors. Only this error
+// permits falling back to the original provider executable.
+type daemonUnavailableError struct {
+	path string
+	err  error
+}
+
+func (e daemonUnavailableError) Error() string {
+	return fmt.Sprintf("connect to local Agora daemon at %s: %v", e.path, e.err)
+}
+
+func (e daemonUnavailableError) Unwrap() error { return e.err }
+func (e daemonUnavailableError) ExitCode() int { return 75 }
 
 // runAttach attaches the current terminal to a managed session's PTY through
 // the local Daemon control path.
