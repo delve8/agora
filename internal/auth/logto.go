@@ -106,7 +106,11 @@ func (v *LogtoTokenValidator) Validate(ctx context.Context, raw string) (Token, 
 		return Token{}, errors.New("token is missing sub claim")
 	}
 	provider := ProviderLogto
-	return Token{Subject: subject, Provider: provider, DisplayName: stringClaim(claims, "name", "preferred_username"), Email: stringClaim(claims, "email"), EmailVerified: boolClaim(claims, "email_verified")}, nil
+	// The display label prefers the login handle: Logto carries it in "username"
+	// and OIDC in "preferred_username", while "name" is an optional profile
+	// display name that is frequently empty (Logto's bootstrap users have no
+	// name). The stable identity remains (provider, subject).
+	return Token{Subject: subject, Provider: provider, DisplayName: stringClaim(claims, "username", "preferred_username", "name"), Email: stringClaim(claims, "email"), EmailVerified: boolClaim(claims, "email_verified")}, nil
 }
 
 func (v *LogtoTokenValidator) validateClaims(claims map[string]any) error {

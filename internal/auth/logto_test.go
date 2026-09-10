@@ -198,6 +198,51 @@ func TestLogtoValidatorAudienceList(t *testing.T) {
 	}
 }
 
+// The signed-in label must be the login handle, not an optional profile name:
+// Logto carries the handle in "username", and its bootstrap users have no
+// "name" at all, which is why the UI used to fall back to the opaque subject.
+func TestLogtoValidatorPrefersTheLoginHandle(t *testing.T) {
+	key := newRSKey(t, "rsa-key")
+	server, _ := newLogtoServer(t, []jwtKeyFixture{key}, "")
+	validator := newValidator(t, server.URL, "agora-api")
+
+	tests := []struct {
+		name   string
+		claims map[string]any
+		want   string
+	}{
+		{"username wins over name", map[string]any{"username": "tfwang", "name": "T F Wang"}, "tfwang"},
+		{"preferred_username when there is no username", map[string]any{"preferred_username": "tfwang", "name": "T F Wang"}, "tfwang"},
+		{"name is the last resort", map[string]any{"name": "T F Wang"}, "T F Wang"},
+		{"nothing usable stays empty", map[string]any{}, ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			claims := tokenClaims(server.URL, "agora-api")
+			claims["username"] = nil
+			claims["preferred_username"] = nil
+			claims["name"] = nil
+			for key, value := range test.claims {
+				claims[key] = value
+			}
+			delete(claims, "username")
+			delete(claims, "preferred_username")
+			delete(claims, "name")
+			for key, value := range test.claims {
+				claims[key] = value
+			}
+			token := signJWT(t, key, map[string]any{"alg": "RS256", "kid": key.kid}, claims)
+			got, err := validator.Validate(context.Background(), token)
+			if err != nil {
+				t.Fatalf("Validate: %v", err)
+			}
+			if got.DisplayName != test.want {
+				t.Fatalf("DisplayName = %q, want %q", got.DisplayName, test.want)
+			}
+		})
+	}
+}
+
 func TestLogtoValidatorES256AndES384(t *testing.T) {
 	for _, fixture := range []jwtKeyFixture{
 		newECKey(t, elliptic.P256(), "ES256", "ec-p256"),

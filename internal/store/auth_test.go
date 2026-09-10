@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/delve8/agora/internal/auth"
 )
 
 func TestPairCodeAndDeviceOwnership(t *testing.T) {
@@ -113,5 +115,43 @@ func TestUpdateDeviceName(t *testing.T) {
 	// Renaming an unknown device is a no-op, not an error.
 	if err := db.UpdateDeviceName(ctx, "device-nope", "ignored"); err != nil {
 		t.Fatalf("rename unknown device: %v", err)
+	}
+}
+
+// An account provisioned before the provider exposed a login handle (or by an
+// older Agora version that fell back to the subject) must pick up a better
+// label without creating a second user row.
+func TestProvisionUserRefreshesAnExistingLabel(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "agora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	claims := auth.ProvisionClaims{Provider: auth.ProviderLogto, Subject: "zlvnpa0cplyk", DisplayName: "zlvnpa0cplyk"}
+	first, err := db.provisionUser(ctx, claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	claims.DisplayName = "tfwang"
+	claims.Email = "tfwang@example.com"
+	refreshed, err := db.provisionUser(ctx, claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.UserID != first.UserID {
+		t.Fatalf("label refresh created a second user: %s -> %s", first.UserID, refreshed.UserID)
+	}
+	if refreshed.DisplayName != "tfwang" || refreshed.Email != "tfwang@example.com" {
+		t.Fatalf("label was not refreshed: %+v", refreshed)
+	}
+	// An empty claim must not erase what is already known.
+	back, err := db.provisionUser(ctx, auth.ProvisionClaims{Provider: auth.ProviderLogto, Subject: "zlvnpa0cplyk"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back.DisplayName != "tfwang" || back.Email != "tfwang@example.com" {
+		t.Fatalf("empty claims wiped the stored label: %+v", back)
 	}
 }

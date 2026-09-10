@@ -69,22 +69,49 @@ func (s *Store) findPrincipal(ctx context.Context, provider, subject string) (au
 	return p, err
 }
 
+// refreshUserProfile updates the human readable labels of an existing user.
+// Identity stays (provider, subject): this only replaces the label the UI shows,
+// and only with a value the provider actually supplied.
+func (s *Store) refreshUserProfile(ctx context.Context, userID, displayName, email string) error {
+	displayName = strings.TrimSpace(displayName)
+	email = strings.TrimSpace(email)
+	if displayName == "" && email == "" {
+		return nil
+	}
+	return s.withBusyRetry(ctx, func() error {
+		_, err := s.db.ExecContext(ctx, `UPDATE users SET display_name=CASE WHEN ?<>'' THEN ? ELSE display_name END, email=CASE WHEN ?<>'' THEN ? ELSE email END WHERE id=?`, displayName, displayName, email, email, userID)
+		return err
+	})
+}
+
 func (s *Store) provisionUser(ctx context.Context, claims auth.ProvisionClaims) (auth.Principal, error) {
 	provider := strings.TrimSpace(claims.Provider)
 	subject := strings.TrimSpace(claims.Subject)
 	if provider == "" || subject == "" {
 		return auth.Principal{}, errors.New("identity provider and subject are required")
 	}
+	// Only what the provider actually supplied may replace a stored label. The
+	// subject fallback below is for a user that has no label yet, and using it
+	// here would put the opaque subject back on every request that carries no
+	// name claim.
+	claimedName := strings.TrimSpace(claims.DisplayName)
 	if existing, err := s.findPrincipal(ctx, provider, subject); err == nil {
-		return existing, nil
+		// A provider can add or change the login handle after the account was
+		// provisioned, and older Agora versions stored the opaque subject when
+		// the claims carried no name. Refresh the label so the UI stops showing a
+		// stale identifier, without touching the stable (provider, subject).
+		if err := s.refreshUserProfile(ctx, existing.UserID, claimedName, claims.Email); err != nil {
+			return auth.Principal{}, err
+		}
+		return s.findPrincipal(ctx, provider, subject)
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return auth.Principal{}, err
 	}
-	userID := "user-" + HashSecret(provider + "\x00" + subject)[:24]
-	displayName := strings.TrimSpace(claims.DisplayName)
+	displayName := claimedName
 	if displayName == "" {
 		displayName = subject
 	}
+	userID := "user-" + HashSecret(provider + "\x00" + subject)[:24]
 	now := time.Now().UTC().Format(timeFormat)
 	err := s.withBusyRetry(ctx, func() error {
 		_, err := s.db.ExecContext(ctx, `INSERT INTO users(id,display_name,email,status,created_at,last_seen_at) VALUES(?,?,?,'active',?,?) ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name,email=excluded.email,last_seen_at=excluded.last_seen_at`, userID, displayName, claims.Email, now, now)

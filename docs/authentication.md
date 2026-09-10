@@ -97,6 +97,11 @@ Agora user_id（由 subject 映射）
 ```
 
 - 稳定身份是 `(provider="logto", subject=claims.sub)`，**不是 email 或昵称**。
+- 展示用的标签（UI 右上角身份）优先取**登录名**：Logto 放在 `username`，OIDC 标准是
+  `preferred_username`，最后才用可选的 `name`。Logto 的 bootstrap 用户没有 `name`，
+  旧版本因此退化成显示不透明的 `sub`（例如 `zlvnpa0cplyk`）。
+- 已存在用户会在每次认证时用 provider 实际提供的标签刷新 `users.display_name`/`email`；
+  **空 claim 不会清空已有值**，身份本身始终是 `(provider, subject)`。
 - 首次登录可自动创建 Agora 用户（`AGORA_LOGTO_PROVISIONING=enabled`），但首次登录的 claims **绝不授予 admin 或任何特权**。
 - `TokenValidator` 与 `UserLookup` 保持接口抽象；未来可替换为 Auth0、Keycloak、企业 SSO 或其他 OIDC provider，不改变 handler 代码。
 
