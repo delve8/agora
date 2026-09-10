@@ -122,6 +122,14 @@ func (w *switchWatcher) knownCandidate(path string) bool {
 	return w.candidates[path] != nil
 }
 
+// lineCount reports how many submitted lines are retained. It is used by tests
+// to wait until the Daemon observed terminal input.
+func (w *switchWatcher) lineCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.lines)
+}
+
 func (w *switchWatcher) recordLine(text string, at time.Time) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -308,12 +316,15 @@ func (m *Manager) scanSwitchCandidates(ctx context.Context, id string, watcher *
 		if info.Size()-from > switchIncrementCap {
 			from = info.Size() - switchIncrementCap
 		}
-		matched := m.switchIncrementHasUser(ctx, watcher.agent, *candidate, from, texts)
-		switchDebugf("scan id=%s path=%s from=%d to=%d matched=%v", watcher.id, candidate.path, from, info.Size(), matched)
+		matched, consumed := m.readSwitchIncrement(ctx, watcher.agent, *candidate, from, texts)
+		switchDebugf("scan id=%s path=%s from=%d to=%d consumed=%d matched=%v", watcher.id, candidate.path, from, info.Size(), consumed, matched)
 		if matched {
 			matches = append(matches, *candidate)
 		}
-		watcher.advance(candidate.path, info.Size())
+		// Never move the cursor past a partially written record: the provider
+		// appends a record in pieces, and skipping the tail would drop the very
+		// message that confirms the switch.
+		watcher.advance(candidate.path, consumed)
 	}
 	if grown > 0 {
 		switchDebugf("scan id=%s texts=%d grown=%d matches=%d", watcher.id, len(texts), grown, len(matches))
@@ -343,29 +354,43 @@ func (w *switchWatcher) advance(path string, size int64) {
 	w.mu.Unlock()
 }
 
-// switchIncrementHasUser reports whether the transcript's appended bytes carry
-// a user message matching one of the submitted lines.
-func (m *Manager) switchIncrementHasUser(ctx context.Context, agent string, candidate switchCandidate, from int64, texts map[string]time.Time) bool {
+// readSwitchIncrement parses the bytes appended after the cursor and reports
+// whether they confirm one of the submitted lines, together with the offset up
+// to which complete records were consumed.
+//
+// The second value is the important one. Providers append a JSONL record in
+// pieces, so a scan routinely observes a half-written line. Advancing the
+// cursor to the current file size would silently discard that line, and the
+// confirming message would never be seen again.
+func (m *Manager) readSwitchIncrement(ctx context.Context, agent string, candidate switchCandidate, from int64, texts map[string]time.Time) (bool, int64) {
 	if agent == "pi" {
 		records, err := adapter.ReadPiHistory(ctx, adapter.PiHistoryCursor{Path: candidate.path, ByteOffset: from}, "pi://"+candidate.sessionID)
 		if err != nil {
-			return false
+			return false, from
 		}
 		values := make([]event.Event, 0, len(records))
+		consumed := from
 		for _, record := range records {
 			values = append(values, record.Event)
+			if record.Cursor.ByteOffset > consumed {
+				consumed = record.Cursor.ByteOffset
+			}
 		}
-		return hasMatchingUser(values, texts)
+		return hasMatchingUser(values, texts), consumed
 	}
 	records, err := adapter.ReadHistory(ctx, adapter.HistoryCursor{Path: candidate.path, ByteOffset: from}, candidate.sessionID)
 	if err != nil {
-		return false
+		return false, from
 	}
 	values := make([]event.Event, 0, len(records))
+	consumed := from
 	for _, record := range records {
 		values = append(values, record.Event)
+		if record.Cursor.ByteOffset > consumed {
+			consumed = record.Cursor.ByteOffset
+		}
 	}
-	return hasMatchingUser(values, texts)
+	return hasMatchingUser(values, texts), consumed
 }
 
 type switchCatalogCache struct {

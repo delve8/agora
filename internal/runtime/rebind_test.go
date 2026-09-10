@@ -73,17 +73,17 @@ func TestSwitchIncrementRequiresSubmittedLineInAnotherTranscript(t *testing.T) {
 	manager := &Manager{}
 	candidate := switchCandidate{path: path, sessionID: "picked", workspace: workspace, size: baseline}
 
-	if manager.switchIncrementHasUser(context.Background(), "pi", candidate, baseline, map[string]time.Time{"new question": time.Now()}) {
+	if matched, _ := manager.readSwitchIncrement(context.Background(), "pi", candidate, baseline, map[string]time.Time{"new question": time.Now()}); matched {
 		t.Fatal("matched before the provider appended anything")
 	}
 
 	appendPiUserRecord(t, path, "picked", "新会话里的问题", time.Now())
 
 	// A line the user never typed must not confirm a switch.
-	if manager.switchIncrementHasUser(context.Background(), "pi", candidate, baseline, map[string]time.Time{"some other text": time.Now()}) {
+	if matched, _ := manager.readSwitchIncrement(context.Background(), "pi", candidate, baseline, map[string]time.Time{"some other text": time.Now()}); matched {
 		t.Fatal("matched a message the user did not submit")
 	}
-	if !manager.switchIncrementHasUser(context.Background(), "pi", candidate, baseline, map[string]time.Time{"新会话里的问题": time.Now()}) {
+	if matched, _ := manager.readSwitchIncrement(context.Background(), "pi", candidate, baseline, map[string]time.Time{"新会话里的问题": time.Now()}); !matched {
 		t.Fatal("did not match the appended user message")
 	}
 
@@ -135,5 +135,64 @@ func TestSwitchWatcherIgnoresOwnTranscript(t *testing.T) {
 	}
 	if watcher.ownedBySession(switchCandidate{path: "/elsewhere.jsonl", sessionID: "picked"}) {
 		t.Fatal("an unrelated transcript was treated as the session's own")
+	}
+}
+
+// Providers append a JSONL record in pieces, so a scan routinely sees a
+// half-written line. The watcher must leave its cursor in front of that record
+// and re-read it once it is complete; advancing to the file size would drop the
+// message that confirms the switch.
+func TestSwitchIncrementWaitsForCompleteRecord(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	if err := os.WriteFile(path, []byte(`{"type":"session","id":"picked"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := info.Size()
+
+	full := `{"type":"message","sessionId":"picked","timestamp":"` + time.Now().UTC().Format(time.RFC3339Nano) + `","message":{"role":"user","content":"half written message"}}` + "\n"
+	half := len(full) / 2
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString(full[:half]); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	file.Close()
+
+	manager := &Manager{}
+	candidate := switchCandidate{path: path, sessionID: "picked", size: baseline}
+	texts := map[string]time.Time{"half written message": time.Now()}
+
+	matched, consumed := manager.readSwitchIncrement(context.Background(), "pi", candidate, baseline, texts)
+	if matched {
+		t.Fatal("a half-written record confirmed a switch")
+	}
+	if consumed != baseline {
+		t.Fatalf("cursor advanced to %d, want it to stay at %d until the record is complete", consumed, baseline)
+	}
+
+	file, err = os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString(full[half:]); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	file.Close()
+
+	matched, consumed = manager.readSwitchIncrement(context.Background(), "pi", candidate, baseline, texts)
+	if !matched {
+		t.Fatal("the completed record was not matched")
+	}
+	if consumed <= baseline {
+		t.Fatalf("cursor did not advance past the completed record: %d", consumed)
 	}
 }

@@ -54,8 +54,7 @@ func runSessionHostProcess(args []string) int {
 	return 0
 }
 
-func writePiTranscriptRecord(t *testing.T, path, sessionID, content string, at time.Time) {
-	t.Helper()
+func piTranscriptRecord(sessionID, content string, at time.Time) []byte {
 	record := map[string]any{
 		"type":      "message",
 		"id":        fmt.Sprintf("rec-%d", at.UnixNano()),
@@ -68,16 +67,26 @@ func writePiTranscriptRecord(t *testing.T, path, sessionID, content string, at t
 	}
 	body, err := json.Marshal(record)
 	if err != nil {
-		t.Fatal(err)
+		panic(err)
 	}
+	return append(body, '\n')
+}
+
+func appendTranscript(t *testing.T, path string, body []byte) {
+	t.Helper()
 	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer file.Close()
-	if _, err := file.Write(append(body, '\n')); err != nil {
+	if _, err := file.Write(body); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func writePiTranscriptRecord(t *testing.T, path, sessionID, content string, at time.Time) {
+	t.Helper()
+	appendTranscript(t, path, piTranscriptRecord(sessionID, content, at))
 }
 
 // A runtime /resume switches the provider context without restarting the Agent
@@ -128,11 +137,23 @@ func TestHostedPiResumeRebindFollowsPickedSession(t *testing.T) {
 	if nativeID == "" {
 		t.Fatalf("hosted session has no native id: %+v", created)
 	}
+	// Stop the Host through the client captured at creation: a successful
+	// rebind moves it to a new registry key, so looking it up by id afterwards
+	// would leak the Host process and its agent.
+	var hostClient *sessionhost.Client
 	t.Cleanup(func() {
-		if client, ok := manager.hosts.Get("daemon/daemon-1/pi://" + nativeID); ok {
-			stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = client.Stop(stopCtx)
+		if hostClient == nil {
+			return
+		}
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = hostClient.Stop(stopCtx)
+		gone := time.Now().Add(5 * time.Second)
+		for time.Now().Before(gone) {
+			if _, err := hostClient.State(context.Background()); err != nil {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
 		}
 	})
 
@@ -152,15 +173,17 @@ func TestHostedPiResumeRebindFollowsPickedSession(t *testing.T) {
 	if !ok {
 		t.Fatalf("host not registered under %s after rekey", canonical)
 	}
+	hostClient = client
 
 	const message = "switch to the older conversation"
 	deadline := time.Now().Add(30 * time.Second)
 
 	// Wait until the watcher captured the catalog baseline, otherwise the
 	// confirming record would look like pre-existing history.
+	var watcher *switchWatcher
 	for {
 		manager.mu.Lock()
-		watcher := manager.switchWatchers[canonical]
+		watcher = manager.switchWatchers[canonical]
 		manager.mu.Unlock()
 		if watcher != nil && watcher.knownCandidate(transcript) {
 			break
@@ -171,10 +194,10 @@ func TestHostedPiResumeRebindFollowsPickedSession(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	// The provider flushes the user's message into the picked session's
-	// transcript, then the same line is submitted into the TUI. The terminal
-	// wrapper types through the attach socket, so the test does too.
-	writePiTranscriptRecord(t, transcript, picked, message, time.Now())
+	// The terminal wrapper types through the attach socket, so the test does
+	// too. Submit the line first: in the real failure the user pressed Enter
+	// while the provider was still writing the record, and a scan in that
+	// window consumed the half-written line.
 	attach, err := net.Dial("unix", client.AttachSocket())
 	if err != nil {
 		t.Fatalf("dial attach socket: %v", err)
@@ -183,6 +206,23 @@ func TestHostedPiResumeRebindFollowsPickedSession(t *testing.T) {
 	if _, err := attach.Write([]byte(message + "\r")); err != nil {
 		t.Fatalf("type into attach socket: %v", err)
 	}
+	for {
+		if watcher.lineCount() > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the submitted line was never observed")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// The provider then flushes the user's message into the picked session's
+	// transcript, one piece at a time. A scan that runs between the pieces must
+	// not consume the partial record.
+	record := piTranscriptRecord(picked, message, time.Now())
+	appendTranscript(t, transcript, record[:len(record)/2])
+	time.Sleep(switchScanInterval + 700*time.Millisecond)
+	appendTranscript(t, transcript, record[len(record)/2:])
 
 	rebound, err := session.NewSessionID("daemon-1", "pi", "pi://"+picked)
 	if err != nil {
