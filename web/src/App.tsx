@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { Alert, Button, Cascader, Drawer, Layout, Select, Space, Switch, Tooltip } from "antd";
-import { EyeInvisibleOutlined, EyeOutlined, HistoryOutlined, MenuOutlined, PlayCircleOutlined, PlusOutlined, PoweroffOutlined, RobotOutlined } from "@ant-design/icons";
+import { DesktopOutlined, EyeInvisibleOutlined, EyeOutlined, HistoryOutlined, MenuOutlined, PlayCircleOutlined, PlusOutlined, PoweroffOutlined, RobotOutlined } from "@ant-design/icons";
 import { EventStream } from "./components/EventStream";
 import { MessageComposer } from "./components/MessageComposer";
 import { SessionCreate } from "./components/SessionCreate";
@@ -34,7 +34,12 @@ export default function App() {
   const { coordination, sessions, currentSession, setSelectedSessionId, events, hasOlderEvents, loadingOlderEvents, loadOlderEvents, loading, error, setError, addSession, resume, stop, send, refresh } = useCoordination();
   const { devices, refresh: refreshDevices, deviceName } = useDevices();
   const activeDevices = devices.filter((device) => !device.revoked_at);
-  const terminal = usePTYSnapshot(currentSession?.id ?? "", currentSession?.capabilities.can_read_terminal ?? false);
+  const canReadTerminal = currentSession?.capabilities.can_read_terminal ?? false;
+  const [showTUI, setShowTUI] = useState(() => {
+    try { return window.localStorage.getItem("agora.show-tui") === "true"; }
+    catch { return false; }
+  });
+  const terminal = usePTYSnapshot(currentSession?.id ?? "", canReadTerminal && showTUI);
   const [createOpen, setCreateOpen] = useState(false);
   const [showProcessDetails, setShowProcessDetails] = useState(false);
   const [selectorOpen, setSelectorOpen] = useState(false);
@@ -50,6 +55,15 @@ export default function App() {
   const refreshAfterRevoke = useCallback(async () => {
     await refresh(true);
   }, [refresh]);
+
+  useEffect(() => {
+    try { window.localStorage.setItem("agora.show-tui", String(showTUI)); }
+    catch { /* localStorage may be unavailable in private browsing */ }
+  }, [showTUI]);
+
+  useEffect(() => {
+    if (!canReadTerminal && showTUI) setShowTUI(false);
+  }, [canReadTerminal, showTUI]);
 
   useEffect(() => {
     if (deviceFilter && !devices.some((device) => device.device_id === deviceFilter && !device.revoked_at)) {
@@ -183,6 +197,17 @@ export default function App() {
         </Space.Compact>}
       </Space>
       <Space className="header-actions">
+        {canReadTerminal && <Tooltip title={showTUI ? "隐藏原生 TUI" : "显示原生 TUI（占满主区域）"}>
+          <Switch
+            className="tui-toggle"
+            size="small"
+            checked={showTUI}
+            checkedChildren={<DesktopOutlined />}
+            unCheckedChildren={<DesktopOutlined />}
+            aria-label={showTUI ? "隐藏原生 TUI" : "显示原生 TUI"}
+            onChange={setShowTUI}
+          />
+        </Tooltip>}
         <Tooltip title={showProcessDetails ? "隐藏过程详情" : "显示过程详情"}>
           <Switch
             className="process-details-toggle"
@@ -206,6 +231,17 @@ export default function App() {
         {currentSession && <AgentBadge className="mobile-menu-agent" agent={currentSession.agent} compact />}
         <span className="mobile-menu-label">{currentSession ? sessionLabel(currentSession.display_name, currentSession.id) : "会话菜单"}</span>
       </Button>
+      {canReadTerminal && <Tooltip title={showTUI ? "隐藏原生 TUI" : "显示原生 TUI（占满主区域）"}>
+        <Switch
+          className="mobile-tui-toggle"
+          size="small"
+          checked={showTUI}
+          checkedChildren={<DesktopOutlined />}
+          unCheckedChildren={<DesktopOutlined />}
+          aria-label={showTUI ? "隐藏原生 TUI" : "显示原生 TUI"}
+          onChange={setShowTUI}
+        />
+      </Tooltip>}
       <Tooltip title={showProcessDetails ? "隐藏过程详情" : "显示过程详情"}>
         <Switch
           className="mobile-process-details-toggle"
@@ -280,11 +316,13 @@ export default function App() {
           <div className="session-heading">
             {currentSession && <Space size={8} wrap><AgentBadge agent={currentSession.agent} /><span className="session-heading-name">{sessionLabel(currentSession.display_name, currentSession.id)}</span></Space>}
           </div>
-          <EventStream key={currentSession?.id} events={events} showProcessDetails={showProcessDetails} agent={currentSession?.agent} hasOlderEvents={hasOlderEvents} loadingOlder={loadingOlderEvents} onLoadOlder={() => void loadOlderEvents()} />
-          {(currentSession?.capabilities.can_read_terminal || currentSession?.capabilities.can_send_input) && <div className="live-session-controls">
-            {currentSession?.capabilities.can_read_terminal && <TerminalSnapshot agent={currentSession.agent} snapshot={terminal.snapshot} error={terminal.error} loading={terminal.loading} />}
+          {showTUI && canReadTerminal ? <div className="tui-view">
+            <TerminalSnapshot agent={currentSession?.agent} snapshot={terminal.snapshot} error={terminal.error} loading={terminal.loading} />
             {currentSession?.capabilities.can_send_input && <MessageComposer disabled={false} onSend={submit} />}
-          </div>}
+          </div> : <>
+            <EventStream key={currentSession?.id} events={events} showProcessDetails={showProcessDetails} agent={currentSession?.agent} hasOlderEvents={hasOlderEvents} loadingOlder={loadingOlderEvents} onLoadOlder={() => void loadOlderEvents()} />
+            {currentSession?.capabilities.can_send_input && <div className="live-session-controls"><MessageComposer disabled={false} onSend={submit} /></div>}
+          </>}
         </main>
       </div>}
     </Content>

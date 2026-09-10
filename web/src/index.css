@@ -34,6 +34,10 @@ button, input, textarea { font: inherit; }
 .session-selector-sep { color: #c3c9d2; flex: 0 0 auto; }
 .workspace-grid { display: block; flex: 1 1 auto; height: 100%; min-height: 0; }
 .session-main { display: flex; flex-direction: column; gap: 12px; height: 100%; min-width: 0; min-height: 0; }
+.tui-view { display: flex; flex: 1 1 auto; flex-direction: column; gap: 8px; min-width: 0; min-height: 0; }
+.tui-view .terminal-panel { display: flex; flex: 1 1 auto; flex-direction: column; min-height: 0; }
+.tui-view .terminal-panel .ant-card-body { display: flex; flex: 1 1 auto; flex-direction: column; min-height: 0; }
+.tui-view .terminal-screen { flex: 1 1 auto; height: auto; min-height: 0; }
 .session-heading { flex: 0 0 auto; min-height: 28px; display: flex; align-items: center; padding-inline: 4px; }
 .session-heading-name { color: #172033; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .member-card { grid-row: span 2; align-self: start; }
@@ -108,7 +112,8 @@ button, input, textarea { font: inherit; }
 .agent-filter .ant-select-selection-placeholder { display: flex; align-items: center; justify-content: center; width: 100%; padding-inline: 0 !important; }
 .agent-filter .agent-badge-icon-only { width: 22px; }
 .agent-filter-placeholder { display: inline-flex; align-items: center; justify-content: center; color: #667085; font-size: 16px; }
-.process-details-toggle { flex: 0 0 auto; }
+.process-details-toggle, .tui-toggle { flex: 0 0 auto; }
+.mobile-tui-toggle { display: none; flex: 0 0 auto; }
 .session-device-badge { flex: 0 0 auto; padding: 0 6px; border: 1px solid #c9d5e6; border-radius: 999px; background: #f1f5f9; color: #5b6b80; font-size: 11px; line-height: 16px; white-space: nowrap; }
 .device-filter { min-width: 150px; }
 .device-audit { margin-top: 16px; }
@@ -143,7 +148,7 @@ button, input, textarea { font: inherit; }
   .mobile-menu-button .anticon + .mobile-menu-label { margin-left: 6px; }
   .mobile-menu-button .mobile-menu-agent { flex: 0 0 auto; margin: 0 2px 0 4px; border: 0; background: transparent; }
   .mobile-menu-button .mobile-menu-agent .agent-logo { width: 16px; height: 16px; }
-  .mobile-process-details-toggle { display: inline-flex; }
+  .mobile-tui-toggle, .mobile-process-details-toggle { display: inline-flex; }
   .session-heading { display: none; }
 }
 
