@@ -185,3 +185,33 @@ func TestSanitizeDeviceName(t *testing.T) {
 		t.Fatalf("expected truncation to %d, got %d", maxDeviceNameLength, len([]rune(got)))
 	}
 }
+
+// When the Daemon reports that it dropped frames, the Server cannot trust its own
+// view and must ask for a fresh resync instead of silently keeping a partial one.
+func TestGappedResyncRequestsAFullResync(t *testing.T) {
+	hub := newDaemonHub(nil, "local")
+	connection := &daemonConnection{id: "daemon-1", send: make(chan protocol.Envelope, 8)}
+	hub.mu.Lock()
+	hub.devices[connection.id] = connection
+	hub.mu.Unlock()
+
+	frame, err := protocol.NewEnvelope(protocol.DaemonResync, protocol.ResyncPayload{
+		DaemonID: connection.id,
+		Gap:      true,
+		History:  []protocol.HistorySessionSummary{{SessionID: "history-1", Agent: "pi"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := hub.handleFrame(connection, frame); err != nil {
+		t.Fatalf("handle resync: %v", err)
+	}
+	select {
+	case request := <-connection.send:
+		if request.Type != protocol.ServerResyncRequest {
+			t.Fatalf("expected a resync request, got %q", request.Type)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a gapped resync did not request a full resync")
+	}
+}

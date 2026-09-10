@@ -237,6 +237,9 @@ type stateResponse struct {
 		ID             string `json:"id"`
 		Agent          string `json:"agent"`
 		AgentSessionID string `json:"agent_session_id"`
+		Workspace      string `json:"workspace"`
+		Source         string `json:"source"`
+		ProcessID      int    `json:"process_id"`
 	} `json:"sessions"`
 }
 
@@ -278,4 +281,126 @@ func getJSON(t *testing.T, target string) []byte {
 		t.Fatal(err)
 	}
 	return body
+}
+
+// A live session must not hide the other conversations in its workspace. The
+// Daemon advertises history separately from live sessions, and the Server merges
+// both, so all three rows have to survive.
+func TestDaemonStateKeepsHistorySessionsBesideLiveSession(t *testing.T) {
+	home := t.TempDir()
+	workspace := filepath.Join(home, "workspace")
+	if err := os.MkdirAll(workspace, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	claudeBinary := filepath.Join(home, "claude")
+	script := "#!/bin/sh\nprintf 'READY\\r\\n'\nwhile IFS= read -r line; do printf 'received: %s\\r\\n' \"$line\"; done\n"
+	if err := os.WriteFile(claudeBinary, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Two Pi conversations in the same workspace, created outside Agora.
+	piRoot := filepath.Join(home, ".pi", "agent", "sessions", "--workspace--")
+	if err := os.MkdirAll(piRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	olderIDs := []string{"aaaaaaaa-1111-4111-8111-111111111111", "bbbbbbbb-2222-4222-8222-222222222222"}
+	for index, id := range olderIDs {
+		content := fmt.Sprintf(`{"type":"session","version":3,"id":%q,"timestamp":"2026-08-18T09:00:00Z","cwd":%q}
+{"type":"message","id":"u%d","timestamp":"2026-08-18T09:00:01Z","message":{"role":"user","content":"older conversation %d"}}
+{"type":"message","id":"a%d","timestamp":"2026-08-18T09:00:02Z","message":{"role":"assistant","content":"reply %d"}}
+`, id, workspace, index, index, index, index)
+		if err := os.WriteFile(filepath.Join(piRoot, fmt.Sprintf("older-%d.jsonl", index)), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	db, err := store.Open(filepath.Join(t.TempDir(), "server.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	srv := server.New(":0", db, nil)
+	serverListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := serverListener.Addr().String()
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- srv.HTTP.Serve(serverListener) }()
+	defer func() {
+		_ = srv.Shutdown(context.Background())
+		select {
+		case <-serverDone:
+		case <-time.After(2 * time.Second):
+			t.Error("server did not shut down")
+		}
+	}()
+
+	socketPath := filepath.Join("/tmp", fmt.Sprintf("agora-history-live-e2e-%d.sock", time.Now().UnixNano()))
+	d, err := daemon.New(daemon.Config{ID: "history-daemon", ServerURL: "ws://" + addr + "/api/daemon/ws", LocalSocketPath: socketPath, HomeDir: home, ClaudeBinary: claudeBinary, PiBinary: "false", Heartbeat: 100 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	daemonDone := make(chan error, 1)
+	go func() { daemonDone <- d.Run(ctx) }()
+	defer func() {
+		_ = d.Close()
+		cancel()
+		select {
+		case <-daemonDone:
+		case <-time.After(3 * time.Second):
+			t.Error("daemon did not shut down")
+		}
+		_ = os.Remove(socketPath)
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(socketPath); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	conn, err := net.DialTimeout("unix", socketPath, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	if err := json.NewEncoder(conn).Encode(protocol.WrapperRequest{Workspace: workspace, DisplayName: "wrapper test", Role: "terminal", Agent: "claude"}); err != nil {
+		t.Fatal(err)
+	}
+	var response protocol.WrapperResponse
+	if err := json.NewDecoder(conn).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error != "" || response.SessionID == "" {
+		t.Fatalf("unexpected wrapper response: %+v", response)
+	}
+
+	state := waitState(t, "http://"+addr, func(state stateResponse) bool {
+		live, older := 0, 0
+		for _, value := range state.Sessions {
+			if filepath.Clean(value.Workspace) != filepath.Clean(workspace) {
+				continue
+			}
+			switch {
+			case value.Source == "managed" && value.ProcessID > 0:
+				live++
+			case value.AgentSessionID == "pi://"+olderIDs[0] || value.AgentSessionID == "pi://"+olderIDs[1]:
+				older++
+			}
+		}
+		return live == 1 && older == 2
+	})
+	seen := make(map[string]bool, len(state.Sessions))
+	for _, value := range state.Sessions {
+		seen[value.AgentSessionID] = true
+	}
+	for _, id := range olderIDs {
+		if !seen["pi://"+id] {
+			t.Fatalf("history session %s is hidden by the live session: %+v", id, state.Sessions)
+		}
+	}
 }

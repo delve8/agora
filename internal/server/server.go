@@ -1106,15 +1106,26 @@ func (s *Server) state(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		// Legacy daemon summaries may omit both AgentSessionID and a stable
-		// canonical history ID during the identity hand-off. If there is exactly
-		// one live session for this provider/workspace, treat that row as the
-		// same session. Requiring a unique live candidate avoids merging two
-		// independent Pi sessions that happen to share a workspace.
+		// A live session can reach the Server before its observer resolved the
+		// native URI and history path. Only that unresolved hand-off can be
+		// completed from discovery: if there is exactly one live session for this
+		// provider/workspace whose identity is still unknown, treat that row as
+		// the same session.
+		//
+		// A live session that already knows its own native session is a different
+		// conversation from any other history row in the same workspace, so
+		// merging there would hide real sessions. Requiring a unique unresolved
+		// candidate keeps both directions correct.
 		if value.Source == session.SourceHistory && value.Agent != "" && value.Workspace != "" {
 			candidate := -1
 			for index, live := range sessions {
 				if !isLiveSession(live) || live.Agent != value.Agent || filepath.Clean(live.Workspace) != filepath.Clean(value.Workspace) {
+					continue
+				}
+				if strings.TrimSpace(live.AgentSessionID) != "" {
+					continue
+				}
+				if live.HistoryPath != "" && value.HistoryPath != "" && filepath.Clean(live.HistoryPath) != filepath.Clean(value.HistoryPath) {
 					continue
 				}
 				if candidate != -1 {

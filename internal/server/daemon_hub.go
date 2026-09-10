@@ -277,7 +277,11 @@ func (h *daemonHub) handleFrame(c *daemonConnection, frame protocol.Envelope) er
 				acc = resyncAccumulator{part: 0, gap: payload.Gap}
 			}
 			if payload.Part != acc.part {
+				delete(h.resyncParts, c.id)
 				h.mu.Unlock()
+				// A fresh resync replaces whatever the Daemon and Server
+				// currently disagree about.
+				h.requestResync(c)
 				return fmt.Errorf("out-of-order resync part %d, expected %d", payload.Part, acc.part)
 			}
 			acc.sessions = append(acc.sessions, payload.Sessions...)
@@ -325,7 +329,14 @@ func (h *daemonHub) handleFrame(c *daemonConnection, frame protocol.Envelope) er
 		}
 		h.sessions[c.id] = sessions
 		h.history[c.id] = history
+		gapped := acc.gap
 		h.mu.Unlock()
+		if gapped {
+			// The Daemon dropped frames on the way here, so its own view of what
+			// the Server knows may be wrong. A full resync is cheap and makes
+			// both sides converge.
+			h.requestResync(c)
+		}
 		return nil
 	case protocol.SessionRebind:
 		var payload protocol.SessionRebindPayload
@@ -708,6 +719,19 @@ func (h *daemonHub) effectiveSession(value session.Session) session.Session {
 	value.ProcessID = 0
 	value.Capabilities = session.Capabilities{CanReadHistory: value.HistoryPath != "" || resumable, CanResume: value.AgentSessionID != "" && value.Workspace != ""}
 	return value
+}
+
+// requestResync asks a connected Daemon for a full resync. It is best effort:
+// the Daemon re-requests on its own after a reconnect anyway.
+func (h *daemonHub) requestResync(c *daemonConnection) {
+	if c == nil {
+		return
+	}
+	frame, err := protocol.NewEnvelope(protocol.ServerResyncRequest, map[string]any{"reason": "gap"})
+	if err != nil {
+		return
+	}
+	_ = c.write(frame)
 }
 
 func (h *daemonHub) liveSessions(coordinationID string) []session.Session {

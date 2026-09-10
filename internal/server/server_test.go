@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +20,13 @@ import (
 	"github.com/delve8/agora/internal/session"
 	"github.com/delve8/agora/internal/store"
 )
+
+// sessionAPIPath builds a session API URL the way real clients do. Canonical
+// Session IDs contain "://", and an unescaped double slash makes net/http's
+// ServeMux clean the path and answer 307 instead of routing the request.
+func sessionAPIPath(id, suffix string) string {
+	return "/api/sessions/" + url.PathEscape(id) + suffix
+}
 
 func seedDaemonLiveSession(srv *Server, daemonID string, summary protocol.SessionSummary) {
 	srv.daemons.mu.Lock()
@@ -258,7 +266,7 @@ func TestStateListsEphemeralHistoryWithoutPersisting(t *testing.T) {
 	if len(stored) != 0 {
 		t.Fatalf("ephemeral history was persisted: %+v", stored)
 	}
-	eventsReq := httptest.NewRequest(http.MethodGet, "/api/sessions/"+value.ID+"/events", nil)
+	eventsReq := httptest.NewRequest(http.MethodGet, sessionAPIPath(value.ID, "/events"), nil)
 	eventsResp := httptest.NewRecorder()
 	srv.HTTP.Handler.ServeHTTP(eventsResp, eventsReq)
 	if eventsResp.Code != http.StatusOK {
@@ -271,7 +279,7 @@ func TestStateListsEphemeralHistoryWithoutPersisting(t *testing.T) {
 	if len(events) != 1 || events[0]["content"] != "history request" {
 		t.Fatalf("unexpected history events: %+v", events)
 	}
-	streamReq := httptest.NewRequest(http.MethodGet, "/api/sessions/"+value.ID+"/events/stream", nil)
+	streamReq := httptest.NewRequest(http.MethodGet, sessionAPIPath(value.ID, "/events/stream"), nil)
 	streamResp := httptest.NewRecorder()
 	srv.HTTP.Handler.ServeHTTP(streamResp, streamReq)
 	if streamResp.Code != http.StatusConflict {
@@ -466,7 +474,7 @@ func TestResumeEphemeralHistoryUsesSameID(t *testing.T) {
 		t.Fatalf("unexpected state: %+v, %v", state, err)
 	}
 	originalID := state.Sessions[0].ID
-	resumeReq := httptest.NewRequest(http.MethodPost, "/api/sessions/"+originalID+"/resume", nil)
+	resumeReq := httptest.NewRequest(http.MethodPost, sessionAPIPath(originalID, "/resume"), nil)
 	resumeResp := httptest.NewRecorder()
 	srv.HTTP.Handler.ServeHTTP(resumeResp, resumeReq)
 	if resumeResp.Code != http.StatusOK {
@@ -583,5 +591,72 @@ func TestFrontendReturnsNotFoundWhenUnavailable(t *testing.T) {
 	}
 	if err := srv.Shutdown(context.Background()); err != nil && err != http.ErrServerClosed {
 		t.Fatal(err)
+	}
+}
+
+// Every conversation in a workspace must stay visible: a live session only
+// replaces the history row for its own native session, not the other
+// conversations that happen to share the directory.
+func TestStateListsHistorySessionsBesideLiveSessionInSameWorkspace(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "agora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now().UTC()
+	coord := coordination.Coordination{ID: "coord-1", Name: "Test", CreatedAt: now}
+	if err := db.CreateCoordination(context.Background(), coord); err != nil {
+		t.Fatal(err)
+	}
+	srv := New(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), nil))
+	const workspace = "/tmp/pi-workspace"
+	seedDaemonLiveSession(srv, "daemon-1", protocol.SessionSummary{
+		SessionID: "daemon/daemon-1/pi://live-native", DaemonID: "daemon-1", Agent: "pi",
+		AgentSessionID: "pi://live-native", HistoryPath: workspace + "/live-native.jsonl",
+		Workspace: workspace, DisplayName: "Live session", State: session.StateRunning,
+		Connection: session.ConnectionObserved, PID: 42, CreatedAt: now, UpdatedAt: now,
+	})
+	for _, older := range []struct{ id, name string }{{"older-1", "Older one"}, {"older-2", "Older two"}} {
+		seedDaemonHistorySession(srv, "daemon-1", protocol.HistorySessionSummary{
+			SessionID: "daemon/daemon-1/pi://" + older.id, DaemonID: "daemon-1", Agent: "pi",
+			AgentSessionID: "pi://" + older.id, HistoryPath: workspace + "/" + older.id + ".jsonl",
+			Workspace: workspace, DisplayName: older.name, CreatedAt: now, UpdatedAt: now,
+		})
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/state", nil)
+	resp := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.Code, resp.Body.String())
+	}
+	var state struct {
+		Sessions []session.Session `json:"sessions"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Sessions) != 3 {
+		t.Fatalf("workspace conversations were merged away: %+v", state.Sessions)
+	}
+	byID := make(map[string]session.Session, len(state.Sessions))
+	for _, value := range state.Sessions {
+		byID[value.ID] = value
+	}
+	for _, want := range []string{"daemon/daemon-1/pi://live-native", "daemon/daemon-1/pi://older-1", "daemon/daemon-1/pi://older-2"} {
+		if _, ok := byID[want]; !ok {
+			t.Fatalf("session %s is missing from %+v", want, state.Sessions)
+		}
+	}
+	// The live session keeps its own name; history rows keep theirs.
+	if byID["daemon/daemon-1/pi://live-native"].DisplayName != "Live session" {
+		t.Fatalf("live name was overwritten: %+v", byID["daemon/daemon-1/pi://live-native"])
+	}
+	if byID["daemon/daemon-1/pi://older-1"].DisplayName != "Older one" {
+		t.Fatalf("history name was overwritten: %+v", byID["daemon/daemon-1/pi://older-1"])
+	}
+	// A history conversation stays read-only and resumable.
+	older := byID["daemon/daemon-1/pi://older-2"]
+	if !older.Capabilities.CanReadHistory || !older.Capabilities.CanResume || older.Capabilities.CanSendInput {
+		t.Fatalf("unexpected history capabilities: %+v", older.Capabilities)
 	}
 }

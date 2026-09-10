@@ -187,3 +187,26 @@ func TestLocalWrapperSocketRoutesSessionReports(t *testing.T) {
 		t.Fatalf("report was not routed to the session manager: %+v", reply)
 	}
 }
+
+// History is only advertised when the set changes, so a resync that never
+// reached the Server must be remembered; otherwise every provider history
+// session stays hidden until the set changes again.
+func TestShouldResyncHistoryRetriesAfterAFailedSend(t *testing.T) {
+	cases := []struct {
+		name    string
+		changed bool
+		forced  bool
+		dirty   bool
+		want    bool
+	}{
+		{"unchanged and delivered", false, false, false, false},
+		{"changed", true, false, false, true},
+		{"forced", false, true, false, true},
+		{"previous send failed", false, false, true, true},
+	}
+	for _, test := range cases {
+		if got := shouldResyncHistory(test.changed, test.forced, test.dirty); got != test.want {
+			t.Errorf("%s: shouldResyncHistory(%v,%v,%v) = %v, want %v", test.name, test.changed, test.forced, test.dirty, got, test.want)
+		}
+	}
+}

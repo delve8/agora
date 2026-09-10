@@ -62,6 +62,11 @@ type Daemon struct {
 	events           map[string]context.CancelFunc
 	historyMu        sync.RWMutex
 	historySessions  []session.Session
+	// resyncDirty records that the last resync did not reach the Server. History
+	// is only advertised when it changes, so without this flag a single lost
+	// resync would hide every provider history session until the set changes
+	// again. Guarded by resyncMu.
+	resyncDirty bool
 }
 
 func New(config Config) (*Daemon, error) {
@@ -432,7 +437,10 @@ func (d *Daemon) refreshHistory(ctx context.Context, forceResync bool) {
 	changed := !sameHistorySessions(d.historySessions, values)
 	d.historySessions = values
 	d.historyMu.Unlock()
-	if !changed && !forceResync {
+	d.resyncMu.Lock()
+	dirty := d.resyncDirty
+	d.resyncMu.Unlock()
+	if !shouldResyncHistory(changed, forceResync, dirty) {
 		return
 	}
 
@@ -919,13 +927,24 @@ func (d *Daemon) sendResync() error {
 		parts[index].Chunked = len(parts) > 1
 		parts[index].Final = index == len(parts)-1
 		if err := d.send(protocol.DaemonResync, parts[index]); err != nil {
+			// The Server may not have received the history set; make the next
+			// discovery cycle send it again even when nothing changed.
+			d.resyncDirty = true
 			return err
 		}
 	}
+	d.resyncDirty = false
 	return nil
 }
 
 const resyncPartBudget = 512 * 1024
+
+// shouldResyncHistory reports whether a discovery cycle must advertise the
+// history set: it changed, the caller forces it, or the previous attempt did not
+// reach the Server.
+func shouldResyncHistory(changed, forced, dirty bool) bool {
+	return changed || forced || dirty
+}
 
 func splitResync(payload protocol.ResyncPayload) []protocol.ResyncPayload {
 	all := make([]protocol.ResyncPayload, 0, len(payload.Sessions)+len(payload.History))
