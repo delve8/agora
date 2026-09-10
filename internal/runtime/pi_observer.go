@@ -17,6 +17,7 @@ func (m *Manager) StartPiObserver(value session.Session) error {
 	if value.Agent != "pi" {
 		return fmt.Errorf("session %s is not a Pi session", value.ID)
 	}
+	m.startSwitchWatcher(value)
 	m.mu.Lock()
 	if _, exists := m.piObservers[value.ID]; exists {
 		m.mu.Unlock()
@@ -46,6 +47,7 @@ func (m *Manager) stopPiObserverLocked(id string) {
 		cancel()
 		delete(m.piObservers, id)
 	}
+	m.stopSwitchWatcherLocked(id)
 }
 
 func (m *Manager) stopPiObserverIfCurrent(id string, token uint64) {

@@ -48,7 +48,8 @@ type Manager struct {
 	sessionUpdate    func(session.Session)
 	eventHandler     func(event.Event)
 	attentionHandler func(string, string)
-	resumePending    map[string]*resumePending
+	switchWatchers   map[string]*switchWatcher
+	switchCache      map[string]switchCatalogCache
 	hosts            *SessionHostRegistry
 	hostWatchCancels map[string]context.CancelFunc
 	hostWatchTokens  map[string]uint64
@@ -60,7 +61,7 @@ func NewManager(db StateStore, agentAdapter *adapter.ClaudeCodeAdapter, ptyManag
 	if ptyManager != nil && ptyManager.homeDir != "" {
 		homeDir = ptyManager.homeDir
 	}
-	manager := &Manager{store: db, adapter: agentAdapter, pty: ptyManager, homeDir: homeDir, history: adapter.NewHistoryCatalog(homeDir), piHistory: adapter.NewPiHistoryCatalog(homeDir, ""), catalogSnapshots: make(map[string][]session.Session), active: make(map[string]bool), generation: make(map[string]uint64), observers: make(map[string]context.CancelFunc), observerTokens: make(map[string]uint64), piObservers: make(map[string]context.CancelFunc), piObserverTokens: make(map[string]uint64), subs: make(map[string]map[chan event.Event]struct{}), resumePending: make(map[string]*resumePending), hostWatchCancels: make(map[string]context.CancelFunc), hostWatchTokens: make(map[string]uint64)}
+	manager := &Manager{store: db, adapter: agentAdapter, pty: ptyManager, homeDir: homeDir, history: adapter.NewHistoryCatalog(homeDir), piHistory: adapter.NewPiHistoryCatalog(homeDir, ""), catalogSnapshots: make(map[string][]session.Session), active: make(map[string]bool), generation: make(map[string]uint64), observers: make(map[string]context.CancelFunc), observerTokens: make(map[string]uint64), piObservers: make(map[string]context.CancelFunc), piObserverTokens: make(map[string]uint64), subs: make(map[string]map[chan event.Event]struct{}), switchWatchers: make(map[string]*switchWatcher), switchCache: make(map[string]switchCatalogCache), hostWatchCancels: make(map[string]context.CancelFunc), hostWatchTokens: make(map[string]uint64)}
 	manager.catalogs = manager.newSessionCatalogs()
 	if ptyManager != nil {
 		ptyManager.SetExitHandler(manager.handlePTYExit)
@@ -245,7 +246,7 @@ func (m *Manager) monitorHost(id string) {
 					return
 				}
 				m.hosts.Delete(id)
-				m.clearResumePending(id)
+				m.stopSwitchWatcher(id)
 				if value, getErr := m.store.GetSession(context.Background(), id); getErr == nil {
 					value.ProcessID = 0
 					value.State = session.StateStopped
@@ -464,7 +465,8 @@ func (m *Manager) Close() {
 	m.hostWatchCancels = make(map[string]context.CancelFunc)
 	m.hostWatchTokens = make(map[string]uint64)
 	m.piObservers = make(map[string]context.CancelFunc)
-	m.resumePending = make(map[string]*resumePending)
+	m.switchWatchers = make(map[string]*switchWatcher)
+	m.switchCache = make(map[string]switchCatalogCache)
 	for coordinationID, subscribers := range m.subs {
 		for ch := range subscribers {
 			close(ch)
@@ -1151,6 +1153,7 @@ func (m *Manager) StartObserver(value session.Session) error {
 	if value.Agent == "pi" {
 		return m.StartPiObserver(value)
 	}
+	m.startSwitchWatcher(value)
 	m.mu.Lock()
 	if _, exists := m.observers[value.ID]; exists {
 		m.mu.Unlock()
@@ -1190,6 +1193,7 @@ func (m *Manager) stopObserverLocked(id string) {
 		cancel()
 		delete(m.observers, id)
 	}
+	m.stopSwitchWatcherLocked(id)
 }
 
 func (m *Manager) stopObserverIfCurrent(id string, token uint64) {
@@ -1391,7 +1395,7 @@ func (m *Manager) SetAttentionHandler(handler func(string, string)) {
 
 func (m *Manager) handlePTYExit(exited PTYExit) {
 	m.clearActive(exited.AgoraID)
-	m.clearResumePending(exited.AgoraID)
+	m.stopSwitchWatcher(exited.AgoraID)
 	m.StopObserver(exited.AgoraID)
 	if m.isClosed() {
 		return
@@ -1425,7 +1429,7 @@ func (m *Manager) handlePTYExit(exited PTYExit) {
 
 func (m *Manager) handlePiExit(exited PiExit) {
 	m.clearActive(exited.AgoraID)
-	m.clearResumePending(exited.AgoraID)
+	m.stopSwitchWatcher(exited.AgoraID)
 	m.StopObserver(exited.AgoraID)
 	if m.isClosed() || m.store == nil {
 		return

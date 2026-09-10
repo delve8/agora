@@ -1,7 +1,9 @@
 package runtime
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,137 +13,127 @@ import (
 	"github.com/delve8/agora/internal/event"
 )
 
-func TestResumePiCandidateRequiresPostTriggerAppendAndMatchingTime(t *testing.T) {
-	workspace := t.TempDir()
-	path := filepath.Join(workspace, "session.jsonl")
-	header := `{"type":"session","id":"pi-new","cwd":` + quoteJSONString(workspace) + `}` + "\n"
-	old := `{"type":"user","sessionId":"pi-new","timestamp":"2020-01-01T00:00:00Z","message":{"role":"user","content":"hello"}}` + "\n"
-	if err := os.WriteFile(path, []byte(header+old), 0o600); err != nil {
-		t.Fatal(err)
+func appendPiUserRecord(t *testing.T, path, sessionID, content string, at time.Time) {
+	t.Helper()
+	record := map[string]any{
+		"type":      "message",
+		"id":        fmt.Sprintf("rec-%d", at.UnixNano()),
+		"sessionId": sessionID,
+		"timestamp": at.UTC().Format(time.RFC3339Nano),
+		"message": map[string]any{
+			"role":    "user",
+			"content": []map[string]any{{"type": "text", "text": content}},
+		},
 	}
-	baseSize := int64(len(header) + len(old))
-	pending := &resumePending{agent: "pi", workspace: workspace, oldNative: "pi-old", triggered: time.Now().UTC(), baseline: map[string]resumeBaseline{path: {Path: path, Size: baseSize}}, lines: []string{"hello"}}
-	item := adapter.PiHistorySummary{SessionID: "pi-new", Path: path, Workspace: workspace, Size: baseSize}
-	if resumePiCandidate(item, pending.baseline[path], pending, pending.lines) {
-		t.Fatal("matched a message that existed before /resume")
-	}
-
-	fresh := `{"type":"user","sessionId":"pi-new","timestamp":` + quoteJSONString(time.Now().UTC().Format(time.RFC3339Nano)) + `,"message":{"role":"user","content":"continue checking auth"}}` + "\n"
-	if file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0); err != nil {
-		t.Fatal(err)
-	} else {
-		if _, err := file.WriteString(fresh); err != nil {
-			file.Close()
-			t.Fatal(err)
-		}
-		file.Close()
-	}
-	info, err := os.Stat(path)
+	body, err := json.Marshal(record)
 	if err != nil {
 		t.Fatal(err)
 	}
-	item.Size = info.Size()
-	pending.lines = []string{"continue checking auth"}
-	if !resumePiCandidate(item, pending.baseline[path], pending, pending.lines) {
-		t.Fatal("did not match the post-/resume user message")
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if _, err := file.Write(append(body, '\n')); err != nil {
+		t.Fatal(err)
 	}
 }
 
-// A real /resume flow takes minutes: the user opens the picker, searches,
-// selects a conversation, and only then types the next message. The pending
-// trigger must still confirm that switch instead of expiring in seconds.
-func TestResumeMatchSurvivesSlowInteractiveResume(t *testing.T) {
+func piEventsAfter(t *testing.T, path string, from int64) []event.Event {
+	t.Helper()
+	records, err := adapter.ReadPiHistory(context.Background(), adapter.PiHistoryCursor{Path: path, ByteOffset: from}, "pi://picked")
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := make([]event.Event, 0, len(records))
+	for _, record := range records {
+		values = append(values, record.Event)
+	}
+	return values
+}
+
+// The keystroke itself is never proof. Only a user message the provider wrote
+// into another transcript confirms a context switch.
+func TestSwitchIncrementRequiresSubmittedLineInAnotherTranscript(t *testing.T) {
+	dir := t.TempDir()
 	workspace := t.TempDir()
-	path := filepath.Join(workspace, "session.jsonl")
-	header := `{"type":"session","id":"pi-new","cwd":` + quoteJSONString(workspace) + `}` + "\n"
+	path := filepath.Join(dir, "session.jsonl")
+	header := fmt.Sprintf(`{"type":"session","id":"picked","cwd":%q}`, workspace) + "\n"
 	if err := os.WriteFile(path, []byte(header), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	base := int64(len(header))
-	pending := &resumePending{
-		agent: "pi", workspace: workspace, oldNative: "pi-old",
-		triggered: time.Now().UTC().Add(-5 * time.Minute),
-		expires:   time.Now().UTC().Add(resumeMatchWindow - 5*time.Minute),
-		baseline:  map[string]resumeBaseline{path: {Path: path, Size: base}},
-		lines:     []string{"继续检查"},
-	}
-	if !pending.expires.After(time.Now()) {
-		t.Fatal("resume window is shorter than the interactive flow it must cover")
-	}
-	fresh := `{"type":"user","sessionId":"pi-new","timestamp":` + quoteJSONString(time.Now().UTC().Format(time.RFC3339Nano)) + `,"message":{"role":"user","content":"继续检查"}}` + "\n"
-	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := file.WriteString(fresh); err != nil {
-		file.Close()
-		t.Fatal(err)
-	}
-	file.Close()
+	appendPiUserRecord(t, path, "picked", "an older question", time.Now().Add(-time.Hour))
+
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	item := adapter.PiHistorySummary{SessionID: "pi-new", Path: path, Workspace: workspace, Size: info.Size()}
-	if !resumePiCandidate(item, pending.baseline[path], pending, pending.lines) {
-		t.Fatal("a switch that took minutes was not confirmed")
+	baseline := info.Size()
+
+	manager := &Manager{}
+	candidate := switchCandidate{path: path, sessionID: "picked", workspace: workspace, size: baseline}
+
+	if manager.switchIncrementHasUser(context.Background(), "pi", candidate, baseline, map[string]time.Time{"new question": time.Now()}) {
+		t.Fatal("matched before the provider appended anything")
+	}
+
+	appendPiUserRecord(t, path, "picked", "新会话里的问题", time.Now())
+
+	// A line the user never typed must not confirm a switch.
+	if manager.switchIncrementHasUser(context.Background(), "pi", candidate, baseline, map[string]time.Time{"some other text": time.Now()}) {
+		t.Fatal("matched a message the user did not submit")
+	}
+	if !manager.switchIncrementHasUser(context.Background(), "pi", candidate, baseline, map[string]time.Time{"新会话里的问题": time.Now()}) {
+		t.Fatal("did not match the appended user message")
+	}
+
+	// Records far from the submitted line are not proof, so a transcript that
+	// already contains identical text can never confirm a switch by itself.
+	all := piEventsAfter(t, path, 0)
+	if hasMatchingUser(all, map[string]time.Time{"an older question": time.Now()}) {
+		t.Fatal("a pre-existing transcript record confirmed a switch")
+	}
+	if hasMatchingUser(all, map[string]time.Time{"新会话里的问题": time.Now().Add(-time.Hour)}) {
+		t.Fatal("a record outside the evidence skew confirmed a switch")
+	}
+	if !hasMatchingUser(all, map[string]time.Time{"新会话里的问题": time.Now()}) {
+		t.Fatal("a freshly appended record was not accepted as evidence")
 	}
 }
 
-// The long wait window must not turn into a continuous full-transcript scan:
-// only files that actually grew past the /resume baseline are worth parsing.
-func TestGrownResumeFilesGatesHistoryParsing(t *testing.T) {
-	dir := t.TempDir()
-	unchanged := filepath.Join(dir, "unchanged.jsonl")
-	grown := filepath.Join(dir, "grown.jsonl")
-	for _, path := range []string{unchanged, grown} {
-		if err := os.WriteFile(path, []byte("{\n"), 0o600); err != nil {
-			t.Fatal(err)
+// Multi-line input and bracketed paste reach the PTY as several submitted lines
+// but the provider stores them as one user message.
+func TestSwitchWatcherEvidenceCoversMultiLineInput(t *testing.T) {
+	watcher := newSwitchWatcher("pi", "/tmp/workspace", "own-native", "")
+	watcher.recordLine("first line", time.Now())
+	watcher.recordLine("second line", time.Now())
+	texts := watcher.evidenceTexts(time.Now())
+	for _, want := range []string{"first line second line", "second line"} {
+		if _, ok := texts[want]; !ok {
+			t.Fatalf("evidence is missing %q: %v", want, texts)
 		}
 	}
-	baseline := map[string]resumeBaseline{
-		unchanged: {Path: unchanged, Size: 2},
-		grown:     {Path: grown, Size: 1},
+	if _, ok := texts["first line"]; ok {
+		t.Fatalf("a prefix of older lines must not be evidence: %v", texts)
 	}
-	if got := grownResumeFiles(baseline); got != 1 {
-		t.Fatalf("grownResumeFiles = %d, want 1", got)
-	}
-	// A missing file is not growth: a provider may remove or rotate it.
-	baseline[filepath.Join(dir, "missing.jsonl")] = resumeBaseline{Path: filepath.Join(dir, "missing.jsonl"), Size: 5}
-	if got := grownResumeFiles(baseline); got != 1 {
-		t.Fatalf("grownResumeFiles counted a missing file: %d", got)
+
+	watcher.recordLine("too old", time.Now().Add(-2*switchLineWindow))
+	if _, ok := watcher.evidenceTexts(time.Now())["too old"]; ok {
+		t.Fatal("an expired line is still treated as evidence")
 	}
 }
 
-// Multi-line input and bracketed paste reach the PTY as several submitted
-// lines but are persisted by the provider as one user message.
-func TestResumeMatchAcceptsMultiLineSubmittedMessage(t *testing.T) {
-	lines := []string{"first line", "second line"}
-	expected := submittedTexts(lines)
-	// Only suffixes are candidates: the provider persists one user message per
-	// submit, so the confirming message must end at the newest submitted line.
-	if _, ok := expected["first line second line"]; !ok {
-		t.Fatalf("joined lines are not considered: %v", expected)
+// The session's own transcript can never be the switch target.
+func TestSwitchWatcherIgnoresOwnTranscript(t *testing.T) {
+	own := filepath.Join(t.TempDir(), "own.jsonl")
+	watcher := newSwitchWatcher("pi", "/tmp/workspace", "own-native", own)
+	if !watcher.ownedBySession(switchCandidate{path: own, sessionID: "picked"}) {
+		t.Fatal("the session's own history path was treated as a switch candidate")
 	}
-	if _, ok := expected["second line"]; !ok {
-		t.Fatalf("the newest single line is not considered: %v", expected)
+	if !watcher.ownedBySession(switchCandidate{path: "/elsewhere.jsonl", sessionID: "own-native"}) {
+		t.Fatal("the session's own native id was treated as a switch candidate")
 	}
-	if _, ok := expected["first line"]; ok {
-		t.Fatalf("a prefix of older lines must not be a candidate: %v", expected)
+	if watcher.ownedBySession(switchCandidate{path: "/elsewhere.jsonl", sessionID: "picked"}) {
+		t.Fatal("an unrelated transcript was treated as the session's own")
 	}
-	pending := &resumePending{triggered: time.Now().UTC()}
-	values := []event.Event{{Kind: event.KindUser, Content: "first line\nsecond line", CreatedAt: time.Now().UTC()}}
-	if !hasMatchingUser(values, pending, lines) {
-		t.Fatal("multi-line user message was not matched")
-	}
-	// A record written before the trigger must never confirm the switch.
-	stale := []event.Event{{Kind: event.KindUser, Content: "first line\nsecond line", CreatedAt: pending.triggered.Add(-time.Hour)}}
-	if hasMatchingUser(stale, pending, lines) {
-		t.Fatal("pre-existing transcript content confirmed the switch")
-	}
-}
-
-func quoteJSONString(value string) string {
-	quoted, _ := json.Marshal(value)
-	return string(quoted)
 }

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/delve8/agora/internal/adapter"
@@ -16,326 +17,416 @@ import (
 )
 
 const (
-	// resumeMatchWindow bounds how long a pending /resume trigger may wait for
-	// confirming evidence. It must cover the whole interactive flow: opening the
-	// provider session picker, searching, selecting a conversation, and typing
-	// the next message. That routinely takes minutes, so a short window silently
-	// drops real context switches. What prevents a wrong rebind is the evidence
-	// rules below (workspace, post-trigger append, matching user text), not the
-	// window length.
-	resumeMatchWindow = 30 * time.Minute
-	resumeGrace       = 2 * time.Second
-	// resumeLineLimit caps how many submitted terminal lines are retained for
-	// multi-line message matching.
-	resumeLineLimit = 32
-	// resumePollInterval is the stat cadence while waiting for the provider to
-	// flush the confirming message.
-	resumePollInterval = time.Second
+	// switchScanInterval is the stat cadence for candidate transcripts. Provider
+	// history is append-only, so between scans only a cheap stat is needed.
+	switchScanInterval = 2 * time.Second
+	// switchCatalogInterval bounds how often the full provider catalog is
+	// re-listed to discover transcripts created after the watcher started.
+	switchCatalogInterval = 60 * time.Second
+	// switchLineWindow is how long a submitted line stays eligible as evidence.
+	// A context switch can only be confirmed by a message the user actually
+	// sent, but the provider may flush it long after the keystroke.
+	switchLineWindow = 30 * time.Minute
+	// switchLineLimit bounds retained submitted lines.
+	switchLineLimit = 32
+	// switchIncrementCap bounds how many bytes of a candidate transcript are
+	// parsed per scan.
+	switchIncrementCap = 1 << 20
+	// switchCatalogTTL shares one provider catalog snapshot between watchers.
+	// Listing a large provider history means parsing every transcript, so it
+	// must not happen once per managed session.
+	switchCatalogTTL = 15 * time.Second
+	// switchEvidenceSkew bounds how far a provider record may sit from the
+	// submitted line it is supposed to confirm. The provider writes the user
+	// message when it is submitted, so a wide skew is unnecessary; a tight one
+	// keeps identical text from an unrelated session in the same workspace from
+	// ever counting as proof.
+	switchEvidenceSkew = 5 * time.Minute
 )
 
-type resumeBaseline struct {
-	Path string
-	Size int64
-}
-
-type resumePending struct {
-	agent     string
+// switchCandidate tracks one transcript file that could belong to a session.
+type switchCandidate struct {
+	path      string
+	sessionID string
 	workspace string
-	oldNative string
-	triggered time.Time
-	baseline  map[string]resumeBaseline
-	expires   time.Time
-	resolving bool
-	// lines holds the terminal lines submitted after /resume. The provider may
-	// persist them as one message (multi-line input or bracketed paste), so the
-	// confirmation compares against single lines and consecutive joins.
-	lines []string
+	size      int64
 }
 
-// handleAgentInput is fed only submitted terminal lines. It deliberately
-// treats /resume as a trigger, not as proof that the Agent changed context.
-// The same state machine is used for every provider that exposes a history
-// catalog and a managed terminal process.
+type watchedLine struct {
+	text string
+	at   time.Time
+}
+
+// switchWatcher detects a provider context switch (/resume, /fork, a resume
+// picker, or starting pi directly into an old session) by evidence instead of
+// by keystroke. Relying on the literal "/resume" text is not reliable: the TUI
+// may submit a command chosen from a completion menu, the user may reach the
+// picker another way, and the wrapper forwards the provider's own arguments.
+//
+// The watcher therefore compares what the user actually typed with messages the
+// provider wrote into a transcript that is NOT this session's transcript.
+//
+//	submitted line  +  new user record in another transcript of the same
+//	workspace  =>  the Agent switched context
+//
+// A unique candidate is required, so an ambiguous situation never rebinds.
+type switchWatcher struct {
+	mu         sync.Mutex
+	agent      string
+	workspace  string
+	ownNative  string
+	ownPaths   map[string]bool
+	candidates map[string]*switchCandidate
+	lines      []watchedLine
+	listedAt   time.Time
+	cancel     context.CancelFunc
+}
+
+func newSwitchWatcher(agent, workspace, ownNative, ownPath string) *switchWatcher {
+	watcher := &switchWatcher{agent: agent, workspace: workspace, ownNative: ownNative, ownPaths: make(map[string]bool), candidates: make(map[string]*switchCandidate)}
+	if ownPath != "" {
+		watcher.ownPaths[ownPath] = true
+	}
+	return watcher
+}
+
+// knownCandidate reports whether the watcher already tracks a transcript. It is
+// used by tests to wait for the initial catalog snapshot.
+func (w *switchWatcher) knownCandidate(path string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.candidates[path] != nil
+}
+
+func (w *switchWatcher) recordLine(text string, at time.Time) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.lines = append(w.lines, watchedLine{text: text, at: at})
+	if len(w.lines) > switchLineLimit {
+		w.lines = w.lines[len(w.lines)-switchLineLimit:]
+	}
+}
+
+// ownedBySession reports whether a transcript already belongs to the session
+// the watcher guards, in which case it can never be switch evidence.
+func (w *switchWatcher) ownedBySession(candidate switchCandidate) bool {
+	if w.ownPaths[candidate.path] {
+		return true
+	}
+	return candidate.sessionID != "" && candidate.sessionID == w.ownNative
+}
+
+// evidenceTexts maps every user message the submitted lines could represent to
+// the moment it was submitted. Joins of consecutive lines cover multi-line
+// input and paste, which the provider stores as a single user message.
+func (w *switchWatcher) evidenceTexts(now time.Time) map[string]time.Time {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	lines := make([]watchedLine, 0, len(w.lines))
+	for _, line := range w.lines {
+		if now.Sub(line.at) > switchLineWindow {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	values := make(map[string]time.Time)
+	for length := 1; length <= len(lines); length++ {
+		window := lines[len(lines)-length:]
+		texts := make([]string, 0, len(window))
+		for _, line := range window {
+			texts = append(texts, line.text)
+		}
+		if text := normalizeRebindText(strings.Join(texts, "\n")); text != "" {
+			values[text] = window[len(window)-1].at
+		}
+	}
+	return values
+}
+
+func (m *Manager) startSwitchWatcher(value session.Session) {
+	if m == nil || m.store == nil || m.closed {
+		return
+	}
+	agent := normalizeSwitchAgent(value.Agent)
+	if agent == "" || value.Source != session.SourceManaged {
+		return
+	}
+	native := strings.TrimPrefix(value.NativeSessionURI(), agent+"://")
+	watcher := newSwitchWatcher(agent, value.Workspace, native, value.HistoryPath)
+	ctx, cancel := context.WithCancel(context.Background())
+	watcher.cancel = cancel
+	m.mu.Lock()
+	m.stopSwitchWatcherLocked(value.ID)
+	m.switchWatchers[value.ID] = watcher
+	m.mu.Unlock()
+	go m.watchContextSwitch(ctx, value.ID, watcher)
+}
+
+func (m *Manager) stopSwitchWatcher(id string) {
+	m.mu.Lock()
+	m.stopSwitchWatcherLocked(id)
+	m.mu.Unlock()
+}
+
+// stopSwitchWatcherLocked requires m.mu to be held.
+func (m *Manager) stopSwitchWatcherLocked(id string) {
+	watcher := m.switchWatchers[id]
+	delete(m.switchWatchers, id)
+	if watcher != nil && watcher.cancel != nil {
+		watcher.cancel()
+	}
+}
+
+func normalizeSwitchAgent(agent string) string {
+	switch strings.ToLower(strings.TrimSpace(agent)) {
+	case "pi":
+		return "pi"
+	case "claude", "claude-code":
+		return "claude"
+	default:
+		return ""
+	}
+}
+
+// watchContextSwitch keeps the watcher's candidate set fresh and scans only the
+// bytes appended since the previous scan.
+func (m *Manager) watchContextSwitch(ctx context.Context, id string, watcher *switchWatcher) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		if m.isClosed() {
+			return
+		}
+		m.refreshSwitchCandidates(ctx, watcher)
+		if m.scanSwitchCandidates(ctx, id, watcher) {
+			return
+		}
+		timer := time.NewTimer(switchScanInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+func (m *Manager) refreshSwitchCandidates(ctx context.Context, watcher *switchWatcher) {
+	watcher.mu.Lock()
+	listedAt := watcher.listedAt
+	watcher.mu.Unlock()
+	if !listedAt.IsZero() && time.Since(listedAt) < switchCatalogInterval {
+		return
+	}
+	entries, err := m.switchCatalog(ctx, watcher.agent)
+	if err != nil {
+		log.Printf("agora: context switch catalog unavailable: %v", err)
+		return
+	}
+	watcher.mu.Lock()
+	defer watcher.mu.Unlock()
+	watcher.listedAt = time.Now()
+	for _, entry := range entries {
+		if entry.path == "" || watcher.ownedBySessionLocked(entry) {
+			continue
+		}
+		if existing, ok := watcher.candidates[entry.path]; ok {
+			// The provider may rewrite metadata (workspace, name) while the
+			// transcript keeps growing; keep the freshest values.
+			existing.workspace = firstNonEmpty(entry.workspace, existing.workspace)
+			existing.sessionID = firstNonEmpty(entry.sessionID, existing.sessionID)
+			continue
+		}
+		candidate := entry
+		watcher.candidates[entry.path] = &candidate
+	}
+}
+
+func (w *switchWatcher) ownedBySessionLocked(candidate switchCandidate) bool {
+	if w.ownPaths[candidate.path] {
+		return true
+	}
+	return candidate.sessionID != "" && candidate.sessionID == w.ownNative
+}
+
+func (m *Manager) scanSwitchCandidates(ctx context.Context, id string, watcher *switchWatcher) bool {
+	texts := watcher.evidenceTexts(time.Now())
+	if len(texts) == 0 {
+		return false
+	}
+	watcher.mu.Lock()
+	paths := make([]*switchCandidate, 0, len(watcher.candidates))
+	for _, candidate := range watcher.candidates {
+		paths = append(paths, candidate)
+	}
+	watcher.mu.Unlock()
+
+	matches := make([]switchCandidate, 0, 2)
+	for _, candidate := range paths {
+		info, err := os.Stat(candidate.path)
+		if err != nil || info.Size() <= candidate.size {
+			continue
+		}
+		if candidate.workspace != "" && watcher.workspace != "" && !sameRebindWorkspace(candidate.workspace, watcher.workspace) {
+			// Keep the cursor moving so an unrelated project is not rescanned
+			// from the beginning on every cycle.
+			watcher.advance(candidate.path, info.Size())
+			continue
+		}
+		from := candidate.size
+		if info.Size()-from > switchIncrementCap {
+			from = info.Size() - switchIncrementCap
+		}
+		if m.switchIncrementHasUser(ctx, watcher.agent, *candidate, from, texts) {
+			matches = append(matches, *candidate)
+		}
+		watcher.advance(candidate.path, info.Size())
+	}
+	if len(matches) != 1 {
+		return false
+	}
+	target := matches[0]
+	if target.sessionID == "" {
+		return false
+	}
+	if err := m.rebindSession(id, watcher.agent, target.sessionID, target.path, target.workspace, "", target.size); err != nil {
+		log.Printf("agora: context switch to %s could not be applied: %v", target.sessionID, err)
+		return false
+	}
+	log.Printf("agora: session %s followed a provider context switch to %s", id, target.sessionID)
+	return true
+}
+
+func (w *switchWatcher) advance(path string, size int64) {
+	w.mu.Lock()
+	if candidate := w.candidates[path]; candidate != nil && size > candidate.size {
+		candidate.size = size
+	}
+	w.mu.Unlock()
+}
+
+// switchIncrementHasUser reports whether the transcript's appended bytes carry
+// a user message matching one of the submitted lines.
+func (m *Manager) switchIncrementHasUser(ctx context.Context, agent string, candidate switchCandidate, from int64, texts map[string]time.Time) bool {
+	if agent == "pi" {
+		records, err := adapter.ReadPiHistory(ctx, adapter.PiHistoryCursor{Path: candidate.path, ByteOffset: from}, "pi://"+candidate.sessionID)
+		if err != nil {
+			return false
+		}
+		values := make([]event.Event, 0, len(records))
+		for _, record := range records {
+			values = append(values, record.Event)
+		}
+		return hasMatchingUser(values, texts)
+	}
+	records, err := adapter.ReadHistory(ctx, adapter.HistoryCursor{Path: candidate.path, ByteOffset: from}, candidate.sessionID)
+	if err != nil {
+		return false
+	}
+	values := make([]event.Event, 0, len(records))
+	for _, record := range records {
+		values = append(values, record.Event)
+	}
+	return hasMatchingUser(values, texts)
+}
+
+type switchCatalogCache struct {
+	at      time.Time
+	entries []switchCandidate
+	err     error
+}
+
+// switchCatalog snapshots every transcript the provider knows about. The
+// snapshot is shared between watchers for a short period because building it
+// parses the whole provider history.
+func (m *Manager) switchCatalog(ctx context.Context, agent string) ([]switchCandidate, error) {
+	m.mu.Lock()
+	cached, ok := m.switchCache[agent]
+	m.mu.Unlock()
+	if ok && time.Since(cached.at) < switchCatalogTTL {
+		return cached.entries, cached.err
+	}
+	entries, err := m.listSwitchCatalog(ctx, agent)
+	m.mu.Lock()
+	if m.switchCache == nil {
+		m.switchCache = make(map[string]switchCatalogCache)
+	}
+	m.switchCache[agent] = switchCatalogCache{at: time.Now(), entries: entries, err: err}
+	m.mu.Unlock()
+	return entries, err
+}
+
+func (m *Manager) listSwitchCatalog(ctx context.Context, agent string) ([]switchCandidate, error) {
+	if agent == "pi" {
+		values, err := adapter.NewPiHistoryCatalog(m.homeDir, m.piHistoryRoot()).List(ctx)
+		if err != nil {
+			return nil, err
+		}
+		entries := make([]switchCandidate, 0, len(values))
+		for _, item := range values {
+			if item.Path == "" || item.SessionID == "" {
+				continue
+			}
+			entries = append(entries, switchCandidate{path: item.Path, sessionID: item.SessionID, workspace: item.Workspace, size: item.Size})
+		}
+		return entries, nil
+	}
+	values, err := m.history.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]switchCandidate, 0, len(values))
+	for _, item := range values {
+		if item.Path == "" || item.SessionID == "" {
+			continue
+		}
+		entries = append(entries, switchCandidate{path: item.Path, sessionID: item.SessionID, workspace: item.Workspace, size: item.Size})
+	}
+	return entries, nil
+}
+
+// handleAgentInput is fed only submitted terminal lines. Agora never infers a
+// context switch from the line itself; the line becomes evidence only when the
+// provider writes the same user message into a different transcript.
 func (m *Manager) handleAgentInput(id, content string) {
 	text := normalizeRebindText(content)
 	if text == "" || m.store == nil {
 		return
 	}
-	value, err := m.store.GetSession(context.Background(), id)
-	if err != nil {
-		return
-	}
-	agent := strings.ToLower(strings.TrimSpace(value.Agent))
-	if agent == "claude-code" {
-		agent = "claude"
-	}
-	if agent != "pi" && agent != "claude" {
-		return
-	}
-	if text == "/resume" || strings.HasPrefix(text, "/resume ") {
-		m.beginResume(id, value, agent)
-		return
-	}
-
 	m.mu.Lock()
-	pending := m.resumePending[id]
-	if pending == nil || pending.agent != agent || time.Now().After(pending.expires) {
-		if pending != nil && time.Now().After(pending.expires) {
-			delete(m.resumePending, id)
-		}
-		m.mu.Unlock()
+	watcher := m.switchWatchers[id]
+	m.mu.Unlock()
+	if watcher == nil {
 		return
 	}
-	// Keep every line submitted since the trigger. The message the provider
-	// persists is not necessarily the last single line: multi-line input and
-	// bracketed paste arrive as several submitted lines but one user message.
-	pending.lines = append(pending.lines, text)
-	if len(pending.lines) > resumeLineLimit {
-		pending.lines = pending.lines[len(pending.lines)-resumeLineLimit:]
-	}
-	// A resolver already polling picks the appended line up on its next pass.
-	// Starting another one would only duplicate transcript scans.
-	if pending.resolving {
-		m.mu.Unlock()
-		return
-	}
-	pending.resolving = true
-	m.mu.Unlock()
-	go m.tryResumeRebind(id, pending)
+	watcher.recordLine(text, time.Now())
 }
 
-// clearResumePending drops the trigger state for a session that no longer
-// exists, so a later session reusing the identity cannot inherit a stale
-// baseline.
-func (m *Manager) clearResumePending(id string) {
-	m.mu.Lock()
-	delete(m.resumePending, id)
-	m.mu.Unlock()
-}
-
-func (m *Manager) beginResume(id string, value session.Session, agent string) {
-	baseline := make(map[string]resumeBaseline)
-	if agent == "pi" {
-		values, err := adapter.NewPiHistoryCatalog(m.homeDir, m.piHistoryRoot()).List(context.Background())
-		if err != nil {
-			log.Printf("agora: %s /resume detection disabled for %s: history baseline unavailable: %v", agent, id, err)
-			return
-		}
-		for _, item := range values {
-			if item.Path != "" {
-				baseline[item.Path] = resumeBaseline{Path: item.Path, Size: item.Size}
-			}
-		}
-	} else {
-		values, err := m.history.List(context.Background())
-		if err != nil {
-			log.Printf("agora: %s /resume detection disabled for %s: history baseline unavailable: %v", agent, id, err)
-			return
-		}
-		for _, item := range values {
-			if item.Path != "" {
-				baseline[item.Path] = resumeBaseline{Path: item.Path, Size: item.Size}
-			}
-		}
-	}
-	m.mu.Lock()
-	m.resumePending[id] = &resumePending{
-		agent:     agent,
-		workspace: value.Workspace,
-		oldNative: strings.TrimPrefix(value.NativeSessionURI(), agent+"://"),
-		triggered: time.Now().UTC(),
-		baseline:  baseline,
-		expires:   time.Now().Add(resumeMatchWindow),
-	}
-	m.mu.Unlock()
-}
-
-func (m *Manager) tryResumeRebind(id string, pending *resumePending) {
-	defer func() {
-		m.mu.Lock()
-		if current := m.resumePending[id]; current == pending && current.resolving {
-			current.resolving = false
-		}
-		m.mu.Unlock()
-	}()
-
-	deadline := pending.expires
-	for time.Now().Before(deadline) {
-		if m.isClosed() {
-			return
-		}
-		m.mu.Lock()
-		active := m.resumePending[id] == pending
-		// Snapshot the submitted lines under the lock: handleAgentInput appends
-		// to them while this loop polls for the provider's delayed flush.
-		lines := append([]string(nil), pending.lines...)
-		m.mu.Unlock()
-		if !active {
-			return
-		}
-		// Provider transcripts are append-only, so a candidate can only become
-		// confirmable after its file grows past the /resume baseline. Stat the
-		// small baseline set first and only pay for parsing when something grew;
-		// otherwise the long wait window would re-scan every transcript
-		// continuously.
-		if grownResumeFiles(pending.baseline) == 0 {
-			if !waitResumePoll(deadline) {
-				return
-			}
-			continue
-		}
-		type candidate struct {
-			path, native, workspace, name string
-			baseSize                      int64
-		}
-		matches := make([]candidate, 0, 2)
-		if pending.agent == "pi" {
-			values, err := adapter.NewPiHistoryCatalog(m.homeDir, m.piHistoryRoot()).List(context.Background())
-			if err == nil {
-				for _, item := range values {
-					base, ok := pending.baseline[item.Path]
-					if ok && resumePiCandidate(item, base, pending, lines) {
-						matches = append(matches, candidate{item.Path, item.SessionID, item.Workspace, item.SessionName, base.Size})
-					}
-				}
-			}
-		} else {
-			values, err := m.history.List(context.Background())
-			if err == nil {
-				for _, item := range values {
-					base, ok := pending.baseline[item.Path]
-					if ok && resumeClaudeCandidate(item, base, pending, lines) {
-						matches = append(matches, candidate{item.Path, item.SessionID, item.Workspace, item.LatestAITitle, base.Size})
-					}
-				}
-			}
-		}
-		if len(matches) == 1 {
-			target := matches[0]
-			if err := m.rebindSession(id, pending.agent, target.native, target.path, target.workspace, target.name, target.baseSize); err == nil {
-				m.mu.Lock()
-				if m.resumePending[id] == pending {
-					delete(m.resumePending, id)
-				}
-				m.mu.Unlock()
-				return
-			}
-			return
-		}
-		// Zero matches can be caused by delayed provider flush. Multiple matches
-		// remain ambiguous and must never select the first file arbitrarily.
-		if !waitResumePoll(deadline) {
-			return
-		}
-	}
-}
-
-// grownResumeFiles counts baseline transcripts that received new bytes since
-// /resume. It is the cheap gate in front of the expensive history parsing.
-func grownResumeFiles(baseline map[string]resumeBaseline) int {
-	grown := 0
-	for path, base := range baseline {
-		info, err := os.Stat(path)
-		if err != nil || info.Size() <= base.Size {
-			continue
-		}
-		grown++
-	}
-	return grown
-}
-
-// waitResumePoll sleeps one poll interval and reports whether the caller may
-// keep waiting. It returns false once the window is exhausted.
-func waitResumePoll(deadline time.Time) bool {
-	remaining := time.Until(deadline)
-	if remaining <= 0 {
-		return false
-	}
-	interval := resumePollInterval
-	if remaining < interval {
-		interval = remaining
-	}
-	timer := time.NewTimer(interval)
-	defer timer.Stop()
-	<-timer.C
-	return time.Now().Before(deadline)
-}
-
-func resumePiCandidate(item adapter.PiHistorySummary, base resumeBaseline, pending *resumePending, lines []string) bool {
-	if item.SessionID == "" || item.SessionID == pending.oldNative || item.Path == "" || item.Size <= base.Size {
-		return false
-	}
-	if !sameRebindWorkspace(item.Workspace, pending.workspace) {
-		return false
-	}
-	records, err := adapter.ReadPiHistory(context.Background(), adapter.PiHistoryCursor{Path: item.Path, ByteOffset: base.Size}, pending.oldNative)
-	if err != nil {
-		return false
-	}
-	return hasMatchingUser(recordsToEvents(records), pending, lines)
-}
-
-func resumeClaudeCandidate(item adapter.HistorySummary, base resumeBaseline, pending *resumePending, lines []string) bool {
-	if item.SessionID == "" || item.SessionID == pending.oldNative || item.Path == "" || item.Size <= base.Size {
-		return false
-	}
-	if !sameRebindWorkspace(item.Workspace, pending.workspace) {
-		return false
-	}
-	records, err := adapter.ReadHistory(context.Background(), adapter.HistoryCursor{Path: item.Path, ByteOffset: base.Size}, pending.oldNative)
-	if err != nil {
-		return false
-	}
-	values := make([]event.Event, 0, len(records))
-	for _, record := range records {
-		values = append(values, record.Event)
-	}
-	return hasMatchingUser(values, pending, lines)
-}
-
-func recordsToEvents(records []adapter.PiHistoryRecord) []event.Event {
-	values := make([]event.Event, 0, len(records))
-	for _, record := range records {
-		values = append(values, record.Event)
-	}
-	return values
-}
-
-func hasMatchingUser(values []event.Event, pending *resumePending, lines []string) bool {
-	expected := submittedTexts(lines)
+// hasMatchingUser reports whether the provider wrote one of the submitted
+// messages into the transcript. The record must carry the same text and must
+// have been written around the moment the line was submitted, so identical text
+// from an unrelated point in time can never confirm a context switch.
+func hasMatchingUser(values []event.Event, expected map[string]time.Time) bool {
 	if len(expected) == 0 {
 		return false
 	}
-	now := time.Now()
 	for _, item := range values {
 		if item.Kind != event.KindUser {
 			continue
 		}
-		// Only records appended after the trigger are evidence. Older records in
-		// the same file must never confirm a context switch.
-		if !item.CreatedAt.IsZero() && (item.CreatedAt.Before(pending.triggered.Add(-resumeGrace)) || item.CreatedAt.After(now.Add(resumeGrace))) {
+		submittedAt, ok := expected[normalizeRebindText(item.Content)]
+		if !ok {
 			continue
 		}
-		if _, ok := expected[normalizeRebindText(item.Content)]; ok {
+		if item.CreatedAt.IsZero() {
+			return true
+		}
+		if diff := item.CreatedAt.Sub(submittedAt); diff <= switchEvidenceSkew && diff >= -switchEvidenceSkew {
 			return true
 		}
 	}
 	return false
-}
-
-// submittedTexts expands the lines submitted since /resume into every user
-// message they could represent. Single lines cover ordinary input; joins of
-// consecutive lines cover multi-line messages and bracketed paste, which the
-// provider stores as one user message but the terminal delivers as several
-// submitted lines.
-func submittedTexts(lines []string) map[string]struct{} {
-	values := make(map[string]struct{})
-	for length := 1; length <= len(lines); length++ {
-		if text := normalizeRebindText(strings.Join(lines[len(lines)-length:], "\n")); text != "" {
-			values[text] = struct{}{}
-		}
-	}
-	return values
 }
 
 func sameRebindWorkspace(left, right string) bool {
@@ -393,11 +484,7 @@ func (m *Manager) rebindSession(id, agent, nativeID, historyPath, workspace, dis
 	updated.Connection = session.ConnectionObserved
 	// The existing managed process remains alive; rebind must not make the
 	// server believe the PTY exited while only its logical context changed.
-	if agent == "pi" && m.pi != nil {
-		updated.ProcessID = old.ProcessID
-	} else if agent == "claude" && m.pty != nil {
-		updated.ProcessID = old.ProcessID
-	}
+	updated.ProcessID = old.ProcessID
 	if displayName != "" {
 		updated.DisplayName = displayName
 		updated.DisplayNameSource = session.DisplayNameSourceAITitle
@@ -419,9 +506,8 @@ func (m *Manager) rebindSession(id, agent, nativeID, historyPath, workspace, dis
 				if managerErr == nil {
 					m.hosts.Delete(id)
 					m.hosts.Put(newID, client)
-					// The health watchdog and the input subscription are keyed by the
-					// canonical id, so they must follow the rebind. Otherwise the Host
-					// stops being monitored and later /resume triggers are invisible.
+					// The health watchdog and the input subscription are keyed by
+					// the canonical id, so they must follow the rebind.
 					m.stopHostMonitor(id)
 					m.monitorHost(newID)
 				}
@@ -445,6 +531,7 @@ func (m *Manager) rebindSession(id, agent, nativeID, historyPath, workspace, dis
 		m.generation[newID] = m.generation[id]
 		delete(m.generation, id)
 		m.mu.Unlock()
+		m.stopSwitchWatcher(id)
 	} else {
 		var managerErr error
 		if m.hosts != nil {
@@ -464,6 +551,7 @@ func (m *Manager) rebindSession(id, agent, nativeID, historyPath, workspace, dis
 		if err := m.store.UpdateSessionObservation(context.Background(), updated); err != nil {
 			return err
 		}
+		m.stopSwitchWatcher(id)
 	}
 	if info, statErr := os.Stat(historyPath); statErr == nil {
 		if baseSize < 0 || baseSize > info.Size() {
