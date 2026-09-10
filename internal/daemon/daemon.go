@@ -603,6 +603,18 @@ func (d *Daemon) handle(frame protocol.Envelope) error {
 		return d.sendResync()
 	case protocol.DaemonHeartbeatAck:
 		return nil
+	case protocol.Error:
+		// The Server rejects a frame by replying with an error envelope. That is
+		// a response to one request, not a connection failure: treating it as
+		// unsupported (and therefore fatal) would cycle the Daemon connection
+		// whenever a frame is refused, for example a rebind whose target id
+		// already exists.
+		var payload protocol.ErrorPayload
+		if err := protocol.DecodePayload(frame, &payload); err != nil {
+			return err
+		}
+		log.Printf("agora daemon: server rejected %s: %s (%s)", frame.RequestID, payload.Message, payload.Code)
+		return nil
 	case protocol.Ack:
 		var payload protocol.AckPayload
 		if err := protocol.DecodePayload(frame, &payload); err != nil {

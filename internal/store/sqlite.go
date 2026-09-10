@@ -259,6 +259,17 @@ func (s *Store) RekeySession(ctx context.Context, oldID string, value session.Se
 			return err
 		}
 		defer tx.Rollback()
+		// The target id may already exist: an older Agora version, a previously
+		// discovered history row for the same canonical id, or an earlier failed
+		// attempt. The rebind target is the same logical session, so replace it
+		// instead of failing the whole rebind on a primary key conflict. The
+		// cursor has the same problem, and the old cursor is moved below.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE id=?`, value.ID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM observation_cursors WHERE session_id=?`, value.ID); err != nil {
+			return err
+		}
 		result, err := tx.ExecContext(ctx, `INSERT INTO sessions(id,coordination_id,agent,external_id,claude_session_id,workspace,display_name,display_name_source,role,state,source,connection,process_id,session_meta_path,history_path,last_discovered_at,last_observed_at,last_error,capabilities_json,created_at,updated_at) SELECT ?,coordination_id,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? FROM sessions WHERE id=?`, value.ID, value.Agent, value.ExternalID, value.ClaudeSessionID, value.Workspace, value.DisplayName, value.DisplayNameSource, value.Role, value.State, value.Source, value.Connection, value.ProcessID, value.SessionMetaPath, value.HistoryPath, formatOptionalTime(value.LastDiscoveredAt), formatOptionalTime(value.LastObservedAt), value.LastError, string(caps), value.CreatedAt.UTC().Format(timeFormat), value.UpdatedAt.UTC().Format(timeFormat), oldID)
 		if err != nil {
 			return err
