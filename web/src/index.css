@@ -98,8 +98,11 @@ button, input, textarea { font: inherit; }
 .setup-card { box-shadow: 0 12px 36px rgba(31, 41, 55, .08); }
 .setup-form { margin-top: 24px; }
 .loading-screen { min-height: 100vh; display: grid; place-items: center; color: #86909c; background: #f5f7fa; }
-.auth-signout { position: fixed; right: 12px; bottom: 10px; display: flex; align-items: center; gap: 8px; color: #86909c; font-size: 12px; background: rgba(245, 247, 250, .85); border-radius: 6px; padding: 0 4px; }
-.auth-identity { max-width: 42vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.header-auth { display: inline-flex; align-items: center; gap: 2px; min-width: 0; color: #86909c; font-size: 12px; }
+.header-auth .ant-btn { color: #86909c; }
+.auth-identity { display: inline-flex; align-items: center; gap: 4px; max-width: 20vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mobile-menu-auth { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-top: 12px; border-top: 1px solid #f0f0f0; color: #667085; font-size: 12px; }
+.mobile-menu-auth .auth-identity { max-width: 60vw; }
 .pairing-panel { margin-top: 16px; padding: 4px 0 24px; border-top: 1px solid #f0f0f0; }
 .pairing-panel .ant-divider { margin-block: 8px 12px; }
 .device-drawer .ant-drawer-body { overflow-y: auto; }

@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { Alert, Button, Cascader, Drawer, Layout, Select, Space, Switch, Tooltip } from "antd";
-import { DesktopOutlined, EyeInvisibleOutlined, EyeOutlined, HistoryOutlined, MenuOutlined, PlayCircleOutlined, PlusOutlined, PoweroffOutlined, RobotOutlined } from "@ant-design/icons";
+import { DesktopOutlined, EyeInvisibleOutlined, EyeOutlined, HistoryOutlined, LogoutOutlined, MenuOutlined, PlayCircleOutlined, PlusOutlined, PoweroffOutlined, RobotOutlined, UserOutlined } from "@ant-design/icons";
 import { EventStream } from "./components/EventStream";
 import { MessageComposer } from "./components/MessageComposer";
 import { SessionCreate } from "./components/SessionCreate";
 import { TerminalSnapshot } from "./components/TerminalSnapshot";
 import { DeviceManager } from "./components/DeviceManager";
+import { useAuthActions } from "./AuthProvider";
 import { useCoordination } from "./hooks/useCoordination";
 import { useDevices } from "./hooks/useDevices";
 import { usePTYSnapshot } from "./hooks/usePTYSnapshot";
@@ -33,6 +34,7 @@ function sessionOptionLabel(session: { display_name: string; id: string; agent?:
 export default function App() {
   const { coordination, sessions, currentSession, setSelectedSessionId, events, hasOlderEvents, loadingOlderEvents, loadOlderEvents, loading, error, setError, addSession, resume, stop, send, refresh } = useCoordination();
   const { devices, refresh: refreshDevices, deviceName } = useDevices();
+  const auth = useAuthActions();
   const activeDevices = devices.filter((device) => !device.revoked_at);
   const canReadTerminal = currentSession?.capabilities.can_read_terminal ?? false;
   const [showTUI, setShowTUI] = useState(() => {
@@ -221,6 +223,10 @@ export default function App() {
         </Tooltip>
         <span className="desktop-device-manager"><DeviceManager devices={devices} refresh={refreshDevices} onRevoked={refreshAfterRevoke} /></span>
         <Button className="desktop-new-session" type="primary" icon={<PlusOutlined />} onClick={() => setCreateOpen(true)}>New session</Button>
+        {auth && <span className="header-auth">
+          <Tooltip title={auth.identity}><span className="auth-identity"><UserOutlined /> {auth.identity}</span></Tooltip>
+          <Tooltip title="Sign out"><Button type="text" size="small" aria-label="Sign out" icon={<LogoutOutlined />} onClick={auth.signOut} /></Tooltip>
+        </span>}
       </Space>
       <Button
         className="mobile-menu-button"
@@ -305,6 +311,10 @@ export default function App() {
           <div className="mobile-menu-actions">
             <Button type="primary" block icon={<PlusOutlined />} onClick={() => { setCreateOpen(true); closeMobileMenu(); }}>新建会话</Button>
           </div>
+          {auth && <div className="mobile-menu-auth">
+            <span className="auth-identity"><UserOutlined /> {auth.identity}</span>
+            <Button type="text" size="small" icon={<LogoutOutlined />} onClick={auth.signOut}>退出登录</Button>
+          </div>}
           <DeviceManager devices={devices} refresh={refreshDevices} onRevoked={refreshAfterRevoke} onOpen={closeMobileMenu} />
         </Space>
       </Drawer>

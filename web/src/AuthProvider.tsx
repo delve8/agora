@@ -1,7 +1,18 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import { Alert, Button, Flex, Space, Spin } from "antd";
 import { LogtoProvider, useHandleSignInCallback, useLogto } from "@logto/react";
 import { loadMe, setAccessTokenProvider, type PrincipalResponse } from "./api/client";
+
+// AuthActions lets the app shell render the signed-in identity and sign-out
+// control where it belongs (the header) instead of an overlay pinned to a
+// corner of the viewport.
+type AuthActions = { identity: string; signOut: () => void };
+
+const AuthActionsContext = createContext<AuthActions | null>(null);
+
+export function useAuthActions() {
+  return useContext(AuthActionsContext);
+}
 
 type AuthConfig = {
   endpoint: string;
@@ -107,7 +118,8 @@ function LogtoGate({ children, audience }: { children: ReactNode; audience?: str
   if (!isAuthenticated) return <div className="loading-screen"><Flex vertical gap="middle" align="center"><h2>Sign in to Agora</h2>{error && <Alert type="error" message={error.message} /> }<Button type="primary" onClick={() => void signIn(authRedirectUri())}>Sign in</Button></Flex></div>;
   if (identityLoading || !principal) return <div className="loading-screen"><Flex vertical gap="middle" align="center"><Spin />{identityError ? <Alert type="error" message="Agora authentication failed" description={identityError} /> : <span>Verifying identity…</span>}<Space>{identityError && <Button onClick={() => void signIn(authRedirectUri())}>Sign in again</Button>}<Button type="link" onClick={() => void signOut(authRedirectUri())}>Sign out</Button></Space></Flex></div>;
   const identity = `${principal.display_name || principal.user_id}${principal.email ? ` (${principal.email})` : ""}`;
-  return <>{children}<div className="auth-signout"><span className="auth-identity">{identity}</span><Button type="link" onClick={() => void signOut(authRedirectUri())}>Sign out</Button></div></>;
+  const actions: AuthActions = { identity, signOut: () => void signOut(authRedirectUri()) };
+  return <AuthActionsContext.Provider value={actions}>{children}</AuthActionsContext.Provider>;
 }
 
 function LogtoContent({ children, audience }: { children: ReactNode; audience?: string }) {
