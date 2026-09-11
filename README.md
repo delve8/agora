@@ -196,6 +196,7 @@ podman run -d --name agora \
   -p 8080:8080 \
   -v agora-data:/data \
   -e AGORA_LOGTO_ISSUER=https://logto.example.com/oidc \
+  -e AGORA_LOGTO_APP_ID=<spa-application-id> \
   -e AGORA_LOGTO_AUDIENCE=https://agora.example.com/api \
   -e AGORA_LOGTO_PROVISIONING=enabled \
   ghcr.io/delve8/agora:latest
@@ -204,10 +205,10 @@ podman run -d --name agora \
 The container listens on `0.0.0.0:8080`, so it must be authenticated: local
 trust mode refuses a non-loopback address and the process exits with
 `local auth mode requires a loopback listen address`. Provide the Logto settings
-above, and build the bundle with matching `VITE_LOGTO_*` build arguments when
-your tenant differs from the published image (see
-`.github/workflows/image.yaml`; the workflow reads them from repository
-variables).
+above; they are read at run time, so one image serves any tenant. `AGORA_LOGTO_ENDPOINT`
+is only needed when the endpoint cannot be derived from the issuer (the default
+strips a trailing `/oidc`), and the Web UI picks the settings up from
+`GET /api/config`.
 
 Useful overrides:
 
@@ -216,19 +217,23 @@ Useful overrides:
 | `AGORA_SERVER_ADDR` | listen address | `0.0.0.0:8080` |
 | `AGORA_SERVER_DB` | SQLite file | `/data/server.db` |
 | `AGORA_WEB_DIR` | Web bundle | `/app/web` |
+| `AGORA_LOGTO_ISSUER` | OIDC issuer used to validate tokens | required in logto mode |
+| `AGORA_LOGTO_APP_ID` | SPA application id handed to the Web UI | required in logto mode |
+| `AGORA_LOGTO_ENDPOINT` | Logto base URL for the Web UI | issuer without `/oidc` |
 | `AGORA_PUBLIC_URL` | base URL used in notification links | unset |
 
 Build it locally with podman:
 
 ```bash
-podman build --format docker -f Containerfile -t agora:local .
+podman build -f Containerfile -t agora:local .
 ```
 
-`--format docker` (or `--oci-mediatypes=false` with buildx) matters: an OCI
-manifest cannot carry the image's `HEALTHCHECK`, which probes `/healthz`. On
-hosts that inject an HTTP proxy into containers, add `--http-proxy=false` so the
-probe and the SPA load are not sent through a proxy that cannot reach the
-container's own loopback address.
+The image does not ship a healthcheck: running a probe process on a timer is
+wasteful, and the right place for liveness is the deployment. Point the
+orchestrator at `GET /healthz` (it returns `{"status":"ok"}` and needs no
+authentication). On hosts that inject an HTTP proxy into containers, add
+`--http-proxy=false` when running it, otherwise requests to the container's own
+loopback address are sent through a proxy that cannot reach it.
 
 ## Environment isolation
 

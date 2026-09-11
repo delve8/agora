@@ -20,11 +20,56 @@ type AuthConfig = {
   audience?: string;
 };
 
-function readConfig(): AuthConfig | undefined {
+type ConfigState =
+  | { status: "loading" }
+  | { status: "none" }
+  | { status: "incomplete"; reason: string }
+  | { status: "ready"; config: AuthConfig };
+
+// Build-time settings remain supported for `vite dev` and for bundles built by
+// hand. A published image carries none: Vite would have inlined them into the
+// JavaScript, which is exactly why the Server serves them from /api/config
+// instead, so one image can serve any tenant.
+function configFromEnv(): AuthConfig | undefined {
   const endpoint = import.meta.env.VITE_LOGTO_ENDPOINT?.trim();
   const appId = import.meta.env.VITE_LOGTO_APP_ID?.trim();
   if (!endpoint || !appId) return undefined;
   return { endpoint, appId, audience: import.meta.env.VITE_LOGTO_AUDIENCE?.trim() || undefined };
+}
+
+function stringField(source: Record<string, unknown>, key: string): string {
+  const value = source[key];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+async function loadConfig(): Promise<ConfigState> {
+  const fromEnv = configFromEnv();
+  if (fromEnv) return { status: "ready", config: fromEnv };
+  let body: Record<string, unknown>;
+  try {
+    const response = await fetch("/api/config", { headers: { accept: "application/json" } });
+    if (!response.ok) return { status: "none" };
+    body = (await response.json()) as Record<string, unknown>;
+  } catch {
+    // The Server is unreachable. Render the app anyway: /api/me reports the
+    // failure and the sign-in screen explains it.
+    return { status: "none" };
+  }
+  const mode = stringField(body, "auth_mode");
+  if (mode && mode !== "logto") return { status: "none" };
+  const endpoint = stringField(body, "logto_endpoint");
+  const appId = stringField(body, "logto_app_id");
+  const audience = stringField(body, "logto_audience");
+  if (!endpoint || !appId) {
+    if (mode === "logto") {
+      return {
+        status: "incomplete",
+        reason: "Set AGORA_LOGTO_APP_ID, and AGORA_LOGTO_ENDPOINT unless the issuer already ends in /oidc.",
+      };
+    }
+    return { status: "none" };
+  }
+  return { status: "ready", config: { endpoint, appId, audience: audience || undefined } };
 }
 
 function SignInCallback({ onComplete }: { onComplete: () => void }) {
@@ -167,7 +212,17 @@ function LogtoContent({ children, audience }: { children: ReactNode; audience?: 
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const config = readConfig();
-  if (!config) return <>{children}</>;
+  const [state, setState] = useState<ConfigState>({ status: "loading" });
+  useEffect(() => {
+    let cancelled = false;
+    void loadConfig().then((value) => { if (!cancelled) setState(value); });
+    return () => { cancelled = true; };
+  }, []);
+  if (state.status === "loading") return <div className="loading-screen"><Spin /> Loading configuration…</div>;
+  if (state.status === "incomplete") {
+    return <div className="loading-screen"><Alert type="error" showIcon message="Agora requires sign-in, but the Web UI has no Logto application id" description={state.reason} /></div>;
+  }
+  if (state.status === "none") return <>{children}</>;
+  const config = state.config;
   return <LogtoProvider config={{ endpoint: config.endpoint, appId: config.appId, resources: config.audience ? [config.audience] : undefined }}><LogtoContent audience={config.audience}>{children}</LogtoContent></LogtoProvider>;
 }

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/delve8/agora/internal/adapter"
+	"github.com/delve8/agora/internal/config"
 	"github.com/delve8/agora/internal/coordination"
 	"github.com/delve8/agora/internal/protocol"
 	"github.com/delve8/agora/internal/runtime"
@@ -760,5 +761,58 @@ func TestStateEnrichesOnlyPlaceholderSessionNames(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The Web UI gets its Logto settings from the Server, so the endpoint has to be
+// reachable without a token and has to report the mode truthfully: a client
+// cannot log in before it knows how.
+func TestPublicConfigDescribesTheAuthMode(t *testing.T) {
+	newServer := func(mode string, issuer, audience string) *Server {
+		db, err := store.Open(filepath.Join(t.TempDir(), "agora.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { db.Close() })
+		return NewWithWebDirAndAuth(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), nil), t.TempDir(), config.ServerAuthConfig{Mode: mode, Issuer: issuer, Audience: audience})
+	}
+	read := func(srv *Server) map[string]any {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/api/config", nil)
+		resp := httptest.NewRecorder()
+		srv.HTTP.Handler.ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", resp.Code, resp.Body.String())
+		}
+		var value map[string]any
+		if err := json.Unmarshal(resp.Body.Bytes(), &value); err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+
+	t.Setenv("AGORA_LOGTO_ENDPOINT", "")
+	t.Setenv("AGORA_LOGTO_APP_ID", "spa-app")
+	logto := read(newServer(config.AuthModeLogto, "https://logto.example.com/oidc", "https://agora.example.com/api"))
+	if logto["auth_mode"] != config.AuthModeLogto {
+		t.Fatalf("auth_mode = %v", logto["auth_mode"])
+	}
+	if logto["logto_endpoint"] != "https://logto.example.com" {
+		t.Fatalf("endpoint was not derived from the issuer: %v", logto["logto_endpoint"])
+	}
+	if logto["logto_app_id"] != "spa-app" || logto["logto_audience"] != "https://agora.example.com/api" {
+		t.Fatalf("client settings missing: %+v", logto)
+	}
+
+	local := read(newServer(config.AuthModeLocal, "", ""))
+	if local["auth_mode"] != config.AuthModeLocal {
+		t.Fatalf("local mode reported %v", local["auth_mode"])
+	}
+	// A server without an application id must not hand the UI a half
+	// configuration it would silently ignore.
+	t.Setenv("AGORA_LOGTO_APP_ID", "")
+	incomplete := read(newServer(config.AuthModeLogto, "https://logto.example.com/oidc", ""))
+	if incomplete["logto_app_id"] != "" {
+		t.Fatalf("expected no app id, got %+v", incomplete)
 	}
 }

@@ -3,16 +3,15 @@ name: image
 # Builds the server image and pushes it to the GitHub Container Registry, so a
 # merge to main yields ghcr.io/<owner>/agora:latest plus an immutable :sha-* tag.
 #
-# The Web bundle inlines its Logto settings at build time. Set the repository
-# variables below (Settings -> Secrets and variables -> Actions -> Variables) to
-# publish an image whose UI points at your Logto tenant:
+# The image is tenant agnostic: the Web UI reads its Logto settings from
+# GET /api/config, which the Server derives from its own environment. A Logto
+# deployment therefore only sets container environment variables at run time:
 #
-#   VITE_LOGTO_ENDPOINT  e.g. https://logto.example.com
-#   VITE_LOGTO_APP_ID    the SPA application id
-#   VITE_LOGTO_AUDIENCE  the API resource indicator, when one is configured
+#   AGORA_LOGTO_ISSUER   e.g. https://logto.example.com/oidc
+#   AGORA_LOGTO_APP_ID   the SPA application id
+#   AGORA_LOGTO_AUDIENCE the API resource indicator, when one is configured
 #
-# The matching runtime settings (AGORA_LOGTO_ISSUER, AGORA_LOGTO_AUDIENCE) are
-# ordinary container environment variables.
+# (AGORA_LOGTO_ENDPOINT overrides the endpoint derived from the issuer.)
 
 on:
   push:
@@ -99,16 +98,9 @@ jobs:
           # arm64 matters for workstations and Apple silicon clusters; drop it if
           # build minutes are tight.
           platforms: linux/amd64,linux/arm64
-          # oci-mediatypes=false keeps the Docker image format, which is what
-          # carries the Containerfile's HEALTHCHECK; the registry rejects a
-          # healthcheck on an OCI manifest. Pull requests build without pushing,
-          # so the image is validated but never published.
-          outputs: type=image,oci-mediatypes=false,push=${{ github.event_name != 'pull_request' }}
+          # Pull requests validate that the image builds without publishing it.
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            VITE_LOGTO_ENDPOINT=${{ vars.VITE_LOGTO_ENDPOINT }}
-            VITE_LOGTO_APP_ID=${{ vars.VITE_LOGTO_APP_ID }}
-            VITE_LOGTO_AUDIENCE=${{ vars.VITE_LOGTO_AUDIENCE }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

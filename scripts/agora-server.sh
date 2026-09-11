@@ -71,9 +71,14 @@ if [ ! -d "$WEB_DIR/node_modules" ]; then
 fi
 "$NPM" --prefix "$WEB_DIR" run build
 
+# The Web UI reads its Logto settings from the Server (/api/config), so pass the
+# client settings through as well; the bundle still gets VITE_LOGTO_* at build
+# time for the dev server and for hand-built bundles.
 exec env AGORA_AUTH_MODE=logto \
   AGORA_LOGTO_ISSUER="${AGORA_LOGTO_ISSUER:-}" \
   AGORA_LOGTO_AUDIENCE="${AGORA_LOGTO_AUDIENCE:-}" \
+  AGORA_LOGTO_ENDPOINT="${AGORA_LOGTO_ENDPOINT:-${VITE_LOGTO_ENDPOINT:-}}" \
+  AGORA_LOGTO_APP_ID="${AGORA_LOGTO_APP_ID:-${VITE_LOGTO_APP_ID:-}}" \
   AGORA_LOGTO_PROVISIONING="${AGORA_LOGTO_PROVISIONING:-enabled}" \
   AGORA_SERVER_ADDR="$SERVER_ADDR" \
   AGORA_SERVER_DB="$SERVER_DB" \

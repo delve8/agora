@@ -18,6 +18,38 @@ type ServerAuthConfig struct {
 	Provisioning bool
 }
 
+// LogtoClientConfig is the part of a Logto deployment the Web UI needs. The
+// Server serves it from /api/config, so one built bundle can serve any tenant
+// instead of inlining the settings at build time.
+type LogtoClientConfig struct {
+	Endpoint string
+	AppID    string
+	Audience string
+}
+
+// ResolveLogtoClientConfig derives the client settings from the server side
+// environment. The SPA endpoint defaults to the issuer without its /oidc suffix,
+// which is Logto's convention, so most deployments only need to provide the
+// issuer, the API audience and the SPA application id.
+func ResolveLogtoClientConfig(issuer, endpoint, appID, audience string) LogtoClientConfig {
+	endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
+	if endpoint == "" {
+		issuer = strings.TrimRight(strings.TrimSpace(issuer), "/")
+		endpoint = strings.TrimSuffix(issuer, "/oidc")
+	}
+	return LogtoClientConfig{
+		Endpoint: endpoint,
+		AppID:    strings.TrimSpace(appID),
+		Audience: strings.TrimSpace(audience),
+	}
+}
+
+// Complete reports whether the Web UI has everything it needs to start a Logto
+// sign-in. Without an application id there is no client to authenticate with.
+func (c LogtoClientConfig) Complete() bool {
+	return c.Endpoint != "" && c.AppID != ""
+}
+
 func ResolveServerAuthConfig(mode, issuer, audience, provisioning string) (ServerAuthConfig, error) {
 	mode = strings.ToLower(strings.TrimSpace(mode))
 	if mode == "" {

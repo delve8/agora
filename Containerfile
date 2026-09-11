@@ -10,14 +10,9 @@
 # ---------------------------------------------------------------- Web bundle
 FROM node:24-alpine AS web
 WORKDIR /src/web
-# Vite inlines these at build time, so a Logto deployment must pass them here.
-# Left empty, the bundle falls back to whatever /api/me reports.
-ARG VITE_LOGTO_ENDPOINT=""
-ARG VITE_LOGTO_APP_ID=""
-ARG VITE_LOGTO_AUDIENCE=""
-ENV VITE_LOGTO_ENDPOINT=${VITE_LOGTO_ENDPOINT} \
-    VITE_LOGTO_APP_ID=${VITE_LOGTO_APP_ID} \
-    VITE_LOGTO_AUDIENCE=${VITE_LOGTO_AUDIENCE}
+# No VITE_LOGTO_* build arguments: Vite would inline them into the JavaScript and
+# tie the image to one tenant. The Server serves those settings at /api/config
+# instead, so this bundle runs against any Logto deployment.
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
 COPY web/ ./
@@ -40,7 +35,6 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 FROM alpine:3
 # ca-certificates: the Server talks to Logto over HTTPS and to webhooks.
 # tzdata: event and session timestamps are rendered in the local zone.
-# busybox already provides the wget used by the healthcheck.
 RUN apk add --no-cache ca-certificates tzdata \
     && adduser -D -u 10001 agora
 
@@ -54,15 +48,13 @@ ENV AGORA_WEB_DIR=/app/web \
 
 # AGORA_SERVER_ADDR is a non-loopback address, so local trust mode refuses to
 # start (see config.ValidateServerAddress): a published container must be
-# authenticated. Provide AGORA_LOGTO_ISSUER and AGORA_LOGTO_AUDIENCE, and build
-# the bundle with the matching VITE_LOGTO_* build arguments.
+# authenticated. Provide AGORA_LOGTO_ISSUER, AGORA_LOGTO_AUDIENCE and
+# AGORA_LOGTO_APP_ID at run time; /api/config hands the client settings to the
+# Web UI, so no rebuild is needed for another tenant.
 RUN mkdir -p /data && chown -R agora:agora /app /data
 USER agora
 VOLUME ["/data"]
 EXPOSE 8080
-
-HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-    CMD wget -qO- http://127.0.0.1:8080/healthz >/dev/null 2>&1 || exit 1
 
 ENTRYPOINT ["/app/agora"]
 CMD ["server"]

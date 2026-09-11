@@ -97,6 +97,10 @@ Agora user_id（由 subject 映射）
 ```
 
 - 稳定身份是 `(provider="logto", subject=claims.sub)`，**不是 email 或昵称**。
+- Web UI 的 Logto 设置由 Server 通过 `GET /api/config`（无需认证，只含公开值：
+  endpoint / SPA app id / audience）提供，因此一个构建好的 bundle 可以服务任意租户；
+  `VITE_LOGTO_*` 只在 `vite dev` 和手工构建的 bundle 中作为首选来源保留。
+  Logto 模式下缺少 `AGORA_LOGTO_APP_ID` 时 UI 会明确报错，而不是静默降级成本地信任。
 - 展示用的标签（UI 右上角身份）优先取**登录名**：Logto 放在 `username`，OIDC 标准是
   `preferred_username`，最后才用可选的 `name`。Logto 的 bootstrap 用户没有 `name`，
   旧版本因此退化成显示不透明的 `sub`（例如 `zlvnpa0cplyk`）。

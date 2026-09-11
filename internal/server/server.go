@@ -37,6 +37,10 @@ type Server struct {
 	manager *runtime.Manager
 	daemons *daemonHub
 	auth    *auth.Authenticator
+	// logtoClient is what the Web UI needs to start a sign-in. It is served
+	// unauthenticated from /api/config so the bundle does not have to be built
+	// per tenant.
+	logtoClient config.LogtoClientConfig
 
 	notifyMu       sync.Mutex
 	notifyPolicies map[string]*notification.Policy
@@ -67,7 +71,12 @@ func NewWithWebDirAndAuth(addr string, db *store.Store, manager *runtime.Manager
 			local = principal
 		}
 	}
-	s := &Server{store: db, manager: manager, daemons: newDaemonHub(db, authConfig.Mode), auth: auth.NewAuthenticatorWithProvisioning(authConfig.Mode, validator, db, local, authConfig.Provisioning), notifyPolicies: make(map[string]*notification.Policy)}
+	s := &Server{
+		store: db, manager: manager, daemons: newDaemonHub(db, authConfig.Mode),
+		auth:           auth.NewAuthenticatorWithProvisioning(authConfig.Mode, validator, db, local, authConfig.Provisioning),
+		logtoClient:    config.ResolveLogtoClientConfig(authConfig.Issuer, os.Getenv("AGORA_LOGTO_ENDPOINT"), os.Getenv("AGORA_LOGTO_APP_ID"), authConfig.Audience),
+		notifyPolicies: make(map[string]*notification.Policy),
+	}
 	s.daemons.onEvents = s.notifyObservedEvents
 	s.daemons.onSessionAttention = s.notifySessionAttention
 	s.daemons.onSessionExit = func(id string, code int, lastError string, _ bool) {
@@ -84,6 +93,8 @@ func NewWithWebDirAndAuth(addr string, db *store.Store, manager *runtime.Manager
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
+	// Public client configuration: the browser needs it before it can log in.
+	mux.HandleFunc("GET /api/config", s.publicConfig)
 	mux.HandleFunc("GET /api/daemon/ws", s.daemons.serveHTTP)
 	mux.HandleFunc("POST /api/daemon/pair", s.pairDaemon)
 	mux.HandleFunc("POST /api/daemon/wrap", s.daemonWrap)
@@ -385,6 +396,20 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// publicConfig tells the Web UI how to authenticate. It is intentionally
+// unauthenticated (a client needs it before it can sign in) and exposes only
+// public values: the Logto endpoint, the SPA application id and the API
+// audience. Serving them from the Server is what lets one built bundle run
+// against any tenant.
+func (s *Server) publicConfig(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"auth_mode":      s.auth.Mode(),
+		"logto_endpoint": s.logtoClient.Endpoint,
+		"logto_app_id":   s.logtoClient.AppID,
+		"logto_audience": s.logtoClient.Audience,
+	})
+}
+
 // daemonWrap is the local terminal wrapper API. It authenticates with the
 // Daemon's device credential, not a Web user's Logto token. This keeps the
 // wrapper independent from browser login while preserving device ownership.
@@ -599,7 +624,7 @@ func (s *Server) authorizeSession(ctx context.Context, value session.Session) er
 
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/healthz" || r.URL.Path == "/api/daemon/ws" || r.URL.Path == "/api/daemon/pair" || r.URL.Path == "/api/daemon/wrap" || !strings.HasPrefix(r.URL.Path, "/api/") {
+		if r.URL.Path == "/healthz" || r.URL.Path == "/api/config" || r.URL.Path == "/api/daemon/ws" || r.URL.Path == "/api/daemon/pair" || r.URL.Path == "/api/daemon/wrap" || !strings.HasPrefix(r.URL.Path, "/api/") {
 			next.ServeHTTP(w, r)
 			return
 		}
