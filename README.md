@@ -145,6 +145,13 @@ Agent with `/resume`. Rows are ordered attachable-first, then by recency, and th
 numbering is what `agora attach <#>` uses. Listing asks the local Daemon, so it
 needs neither the Server nor a Logto login, and it never creates a session.
 
+Attaching prints a one-line notice on stderr — which session, provider and state
+— and then paints the screen the session is already showing, so a terminal does
+not open on an empty screen while the Agent sits idle. That screen comes from the
+Daemon (`session.snapshot`), which reads it through the session host's control
+socket; a host started by an older build still answers, so only the Daemon has to
+be current. If nothing has been drawn yet the notice says so.
+
 Wrappers never read browser tokens and never call the user-authenticated API.
 They connect to the local Daemon socket at `~/.agora/daemon.sock` (override with
 `AGORA_DAEMON_SOCKET`). The Daemon uses its own device credential for a Logto-

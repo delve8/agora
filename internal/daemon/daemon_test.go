@@ -291,3 +291,80 @@ func TestSessionListIsScopedAndMarksHistory(t *testing.T) {
 		t.Fatalf("sessions on the machine = %+v, want every workspace", all.Sessions)
 	}
 }
+
+// Attaching has to be able to paint the screen first, otherwise it starts with an
+// empty terminal. The Daemon answers that question locally, and must answer it
+// calmly when there is no live screen to read.
+func TestSessionSnapshotReportsWhyThereIsNoScreen(t *testing.T) {
+	socketPath := filepath.Join("/tmp", fmt.Sprintf("agora-snapshot-test-%d.sock", time.Now().UnixNano()))
+	t.Setenv("AGORA_DAEMON_SOCKET", socketPath)
+	t.Cleanup(func() { _ = os.Remove(socketPath) })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store := runtime.NewMemoryStore()
+	_ = store.CreateSession(ctx, session.Session{ID: "daemon-test/pi://history-1", Agent: "pi", Workspace: t.TempDir(), Source: session.SourceHistory, State: session.StateStopped})
+	d := &Daemon{config: Config{ID: "daemon-test"}, manager: runtime.NewManager(store, nil, nil)}
+	if err := d.startLocalWrapperServer(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
+
+	ask := func(body string) protocol.SessionSnapshotResponse {
+		t.Helper()
+		conn, err := net.Dial("unix", socketPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		if _, err := io.WriteString(conn, body); err != nil {
+			t.Fatal(err)
+		}
+		var reply protocol.SessionSnapshotResponse
+		if err := json.NewDecoder(conn).Decode(&reply); err != nil {
+			t.Fatalf("decode reply: %v", err)
+		}
+		return reply
+	}
+
+	if reply := ask(`{"type":"session.snapshot"}`); reply.Error != "session_id is required" {
+		t.Fatalf("missing session id reply = %+v", reply)
+	}
+	reply := ask(`{"type":"session.snapshot","session_id":"daemon-test/pi://history-1"}`)
+	if reply.Error == "" {
+		t.Fatalf("a session without a live screen answered with a snapshot: %+v", reply)
+	}
+	if len(reply.Snapshot) != 0 {
+		t.Fatalf("snapshot = %s, want none for a stopped session", reply.Snapshot)
+	}
+}
+
+// A Daemon without a session manager must answer instead of crashing.
+func TestSessionSnapshotWithoutAManager(t *testing.T) {
+	socketPath := filepath.Join("/tmp", fmt.Sprintf("agora-snapshot-nomanager-%d.sock", time.Now().UnixNano()))
+	t.Setenv("AGORA_DAEMON_SOCKET", socketPath)
+	t.Cleanup(func() { _ = os.Remove(socketPath) })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d := &Daemon{config: Config{ID: "daemon-test"}}
+	if err := d.startLocalWrapperServer(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
+
+	conn, err := net.Dial("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := io.WriteString(conn, `{"type":"session.snapshot","session_id":"daemon-test/pi://x"}`); err != nil {
+		t.Fatal(err)
+	}
+	var reply protocol.SessionSnapshotResponse
+	if err := json.NewDecoder(conn).Decode(&reply); err != nil {
+		t.Fatal(err)
+	}
+	if reply.Error != "session manager is unavailable" {
+		t.Fatalf("reply = %+v", reply)
+	}
+}

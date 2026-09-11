@@ -14,6 +14,7 @@ import (
 
 	"github.com/delve8/agora/internal/protocol"
 	"github.com/delve8/agora/internal/session"
+	"github.com/delve8/agora/internal/terminal"
 )
 
 // runAttachCommand is the terminal-facing entry point for reaching a managed
@@ -50,7 +51,7 @@ func runAttachCommand(args []string) error {
 		// it can still attach to an id it is given, which is the old behaviour.
 		if _, ok := err.(sessionListingUnsupportedError); ok {
 			if _, parseErr := session.ParseSessionID(reference); parseErr == nil {
-				return runAttach(reference)
+				return attachToSession(reference, reference)
 			}
 		}
 		return err
@@ -60,7 +61,63 @@ func runAttachCommand(args []string) error {
 			"History sessions are continued from inside the Agent: run `agora wrap %s` and pick it with /resume",
 			shortSessionReference(entry), entry.Agent)
 	}
-	return runAttach(entry.SessionID)
+	return attachToSession(entry.SessionID, describeEntry(entry))
+}
+
+// describeEntry names a session the way the listing does, so the notice under an
+// attach matches the row the user picked.
+func describeEntry(entry protocol.SessionListEntry) string {
+	name := strings.TrimSpace(entry.DisplayName)
+	if name == "" {
+		name = shortSessionReference(entry)
+	}
+	return fmt.Sprintf("%s (%s, %s)", name, entry.Agent, entry.State)
+}
+
+// attachToSession paints what the session is already showing and then streams it.
+// Without that, attaching to a session whose Agent has been running for a while
+// begins with an empty screen, which reads as if the attach failed.
+func attachToSession(sessionID, label string) error {
+	attached, err := attachDaemonWrapperSession(sessionID)
+	if err != nil {
+		return err
+	}
+	screen := sessionScreen(sessionID)
+	notice := fmt.Sprintf("[agora] attached to %s", label)
+	if screen == "" {
+		notice += " — nothing has been drawn yet"
+	}
+	fmt.Fprintln(os.Stderr, notice)
+	if screen != "" {
+		fmt.Fprint(os.Stdout, screen)
+	}
+	return runAttachSocket(attached.Socket)
+}
+
+// sessionScreen asks the Daemon for the current screen. Anything unexpected
+// (a Daemon that predates the request, a session without a live screen) leaves it
+// empty, because attaching must still work without it.
+func sessionScreen(sessionID string) string {
+	conn, err := dialDaemon()
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+	if err := json.NewEncoder(conn).Encode(protocol.SessionSnapshotRequest{
+		Type: protocol.SessionSnapshot, SessionID: sessionID, Agent: unsupportedListAgent,
+	}); err != nil {
+		return ""
+	}
+	var response protocol.SessionSnapshotResponse
+	if err := json.NewDecoder(conn).Decode(&response); err != nil || response.Error != "" || len(response.Snapshot) == 0 {
+		return ""
+	}
+	var snapshot terminal.Snapshot
+	if err := json.Unmarshal(response.Snapshot, &snapshot); err != nil {
+		return ""
+	}
+	return snapshot.Render()
 }
 
 // printSessionList shows the sessions of the working directory, or of the whole

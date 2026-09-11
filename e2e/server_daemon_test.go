@@ -21,6 +21,7 @@ import (
 	"github.com/delve8/agora/internal/server"
 	"github.com/delve8/agora/internal/session"
 	"github.com/delve8/agora/internal/store"
+	"github.com/delve8/agora/internal/terminal"
 )
 
 func TestDaemonLocalWrapperFlow(t *testing.T) {
@@ -109,6 +110,45 @@ func TestDaemonLocalWrapperFlow(t *testing.T) {
 	if output := attachScreen(t, response.Socket, 5*time.Second); !strings.Contains(output, "READY") {
 		t.Fatalf("wrapper attach output = %q", output)
 	}
+
+	// A terminal that attaches paints the screen first, and it asks the Daemon
+	// for it over the local socket rather than relying on the session host to
+	// replay. That is what makes a host built before attach-time replay still
+	// show its screen.
+	screen := localSnapshot(t, socketPath, response.SessionID)
+	if !strings.Contains(strings.Join(screen.Lines, "\n"), "READY") {
+		t.Fatalf("local snapshot lines = %q, want the READY the fake Agent printed", screen.Lines)
+	}
+	if screen.Rows == 0 || screen.Cols == 0 {
+		t.Fatalf("local snapshot has no size: %+v", screen)
+	}
+}
+
+// localSnapshot asks a running Daemon for a session's screen over its local
+// socket, exactly as `agora attach` does before it starts streaming.
+func localSnapshot(t *testing.T, socketPath, sessionID string) terminal.Snapshot {
+	t.Helper()
+	conn, err := net.DialTimeout("unix", socketPath, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := json.NewEncoder(conn).Encode(protocol.SessionSnapshotRequest{Type: protocol.SessionSnapshot, SessionID: sessionID}); err != nil {
+		t.Fatal(err)
+	}
+	var response protocol.SessionSnapshotResponse
+	if err := json.NewDecoder(conn).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Error != "" {
+		t.Fatalf("snapshot error: %s", response.Error)
+	}
+	var snapshot terminal.Snapshot
+	if err := json.Unmarshal(response.Snapshot, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
 }
 
 // attachScreen dials a session's attach socket and returns what the screen shows.

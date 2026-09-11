@@ -37,7 +37,7 @@ func runWrapper(args []string) error {
 	} else if len(args) > 0 {
 		return errors.New("a session id cannot be combined with an initial prompt")
 	} else {
-		attached, err = attachDaemonWrapperSession(sessionID)
+		return attachToSession(sessionID, sessionID)
 	}
 	if err != nil {
 		return err

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/delve8/agora/internal/protocol"
+	"github.com/delve8/agora/internal/terminal"
 )
 
 func listingEntries() []protocol.SessionListEntry {
@@ -187,4 +188,67 @@ func TestSessionListingsExplainsAnOldDaemon(t *testing.T) {
 	if !strings.Contains(err.Error(), "restart it") {
 		t.Fatalf("error = %v, want it to tell the user to restart the daemon", err)
 	}
+}
+
+// Attaching must paint the screen the Daemon reports, so the client does not
+// start with an empty terminal.
+func TestSessionScreenRendersWhatTheDaemonReports(t *testing.T) {
+	snapshot := terminal.Snapshot{
+		Sequence: 7, Cols: 40, Rows: 3,
+		Lines:         []string{"PAINTED BY THE AGENT", "", ""},
+		CursorCol:     0,
+		CursorRow:     1,
+		CursorVisible: true,
+	}
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	standInSnapshotDaemon(t, protocol.SessionSnapshotResponse{Snapshot: encoded})
+	screen := sessionScreen("daemon-1/pi://running-1")
+	if !strings.Contains(screen, "PAINTED BY THE AGENT") {
+		t.Fatalf("screen = %q, want the Daemon's screen", screen)
+	}
+	if !strings.Contains(screen, "\x1b[2J") || !strings.Contains(screen, "\x1b[?25h") {
+		t.Fatalf("screen = %q, want a full repaint ending with a visible cursor", screen)
+	}
+}
+
+// Anything unexpected leaves the screen empty: attaching must work even when the
+// Daemon cannot answer, for instance because it predates the request.
+func TestSessionScreenStaysEmptyWhenTheDaemonCannotAnswer(t *testing.T) {
+	standInSnapshotDaemon(t, protocol.SessionSnapshotResponse{Error: "session is not running"})
+	if screen := sessionScreen("daemon-1/pi://gone"); screen != "" {
+		t.Fatalf("screen = %q, want nothing", screen)
+	}
+}
+
+func standInSnapshotDaemon(t *testing.T, reply protocol.SessionSnapshotResponse) {
+	t.Helper()
+	socket := filepath.Join("/tmp", fmt.Sprintf("agora-cli-screen-%d.sock", time.Now().UnixNano()))
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = listener.Close()
+		_ = os.Remove(socket)
+	})
+	t.Setenv("AGORA_DAEMON_SOCKET", socket)
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			var request protocol.SessionSnapshotRequest
+			_ = json.NewDecoder(conn).Decode(&request)
+			if request.Type != protocol.SessionSnapshot {
+				_ = json.NewEncoder(conn).Encode(protocol.SessionSnapshotResponse{Error: "unexpected request"})
+			} else {
+				_ = json.NewEncoder(conn).Encode(reply)
+			}
+			_ = conn.Close()
+		}
+	}()
 }

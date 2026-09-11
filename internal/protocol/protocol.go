@@ -131,6 +131,24 @@ type SessionListEntry struct {
 	UpdatedAt  time.Time `json:"updated_at,omitempty"`
 }
 
+// SessionSnapshot asks the local Daemon for the screen a running session is
+// showing. A terminal paints it before the live stream starts, so attaching does
+// not begin with an empty screen.
+const SessionSnapshot = "session.snapshot"
+
+type SessionSnapshotRequest struct {
+	Type      string `json:"type"`
+	SessionID string `json:"session_id"`
+	// Agent carries the same guard as SessionListRequest: a Daemon that predates
+	// this request must not mistake it for a wrapper request.
+	Agent string `json:"agent,omitempty"`
+}
+
+type SessionSnapshotResponse struct {
+	Snapshot json.RawMessage `json:"snapshot,omitempty"`
+	Error    string          `json:"error,omitempty"`
+}
+
 type SessionListResponse struct {
 	Sessions []SessionListEntry `json:"sessions"`
 	Error    string             `json:"error,omitempty"`

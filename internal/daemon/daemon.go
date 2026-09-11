@@ -203,6 +203,9 @@ func (d *Daemon) handleLocalWrapper(conn net.Conn) {
 	case protocol.SessionList:
 		d.handleSessionList(conn, body)
 		return
+	case protocol.SessionSnapshot:
+		d.handleSessionSnapshot(conn, body)
+		return
 	}
 	var payload protocol.WrapperRequest
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -960,6 +963,37 @@ func (d *Daemon) handleSessionList(conn net.Conn, body []byte) {
 		})
 	}
 	_ = json.NewEncoder(conn).Encode(protocol.SessionListResponse{Sessions: entries})
+}
+
+// handleSessionSnapshot answers a local terminal asking what a session is
+// showing. The screen is read through the session host's control socket, which
+// has served snapshots since the first host release, so a host built before
+// attach-time replay still hands its screen over on request.
+func (d *Daemon) handleSessionSnapshot(conn net.Conn, body []byte) {
+	var payload protocol.SessionSnapshotRequest
+	if err := json.Unmarshal(body, &payload); err != nil {
+		_ = json.NewEncoder(conn).Encode(protocol.SessionSnapshotResponse{Error: "invalid session snapshot request: " + err.Error()})
+		return
+	}
+	if strings.TrimSpace(payload.SessionID) == "" {
+		_ = json.NewEncoder(conn).Encode(protocol.SessionSnapshotResponse{Error: "session_id is required"})
+		return
+	}
+	if d.manager == nil {
+		_ = json.NewEncoder(conn).Encode(protocol.SessionSnapshotResponse{Error: "session manager is unavailable"})
+		return
+	}
+	snapshot, err := d.manager.Snapshot(payload.SessionID)
+	if err != nil {
+		_ = json.NewEncoder(conn).Encode(protocol.SessionSnapshotResponse{Error: err.Error()})
+		return
+	}
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		_ = json.NewEncoder(conn).Encode(protocol.SessionSnapshotResponse{Error: err.Error()})
+		return
+	}
+	_ = json.NewEncoder(conn).Encode(protocol.SessionSnapshotResponse{Snapshot: encoded})
 }
 
 // normaliseWorkspace compares directories the way the rest of Agora does, and
