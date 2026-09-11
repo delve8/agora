@@ -71,14 +71,23 @@ func attachDaemonWrapperSession(sessionID string) (protocol.WrapperResponse, err
 	return callLocalDaemon(protocol.WrapperRequest{SessionID: sessionID})
 }
 
+// daemonSocketPath is where the local Daemon listens. AGORA_DAEMON_SOCKET
+// overrides it, which is how tests and non-default homes reach their daemon.
+func daemonSocketPath() (string, error) {
+	if path := strings.TrimSpace(os.Getenv("AGORA_DAEMON_SOCKET")); path != "" {
+		return path, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve home directory for Agora daemon socket: %w", err)
+	}
+	return filepath.Join(home, ".agora", "daemon.sock"), nil
+}
+
 func callLocalDaemon(payload protocol.WrapperRequest) (protocol.WrapperResponse, error) {
-	path := strings.TrimSpace(os.Getenv("AGORA_DAEMON_SOCKET"))
-	if path == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return protocol.WrapperResponse{}, fmt.Errorf("resolve home directory for Agora daemon socket: %w", err)
-		}
-		path = filepath.Join(home, ".agora", "daemon.sock")
+	path, err := daemonSocketPath()
+	if err != nil {
+		return protocol.WrapperResponse{}, err
 	}
 	conn, err := net.DialTimeout("unix", path, 5*time.Second)
 	if err != nil {

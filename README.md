@@ -125,6 +125,26 @@ therefore options such as `--print` or `--mode rpc` intentionally produce their
 native non-TUI behavior. Agora only interprets a leading canonical Agora Session
 ID for direct attach.
 
+### Finding a session to attach to
+
+A canonical Session ID (`daemon/<daemon-id>/<agent>://<native-id>`) is not
+something anyone remembers, so `agora attach` answers the question instead of
+demanding an argument:
+
+```bash
+agora attach                    # what exists in this directory, and how to use it
+agora attach list               # the same list explicitly
+agora attach list --all         # every workspace on this machine
+agora attach 2                  # attach to row 2 of that list
+agora attach pi://01a0346c      # any unique prefix of the provider id or the canonical id
+```
+
+The list separates sessions that are running (attach works) from provider history
+(`history` in the STATE column), which can only be continued from inside the
+Agent with `/resume`. Rows are ordered attachable-first, then by recency, and the
+numbering is what `agora attach <#>` uses. Listing asks the local Daemon, so it
+needs neither the Server nor a Logto login, and it never creates a session.
+
 Wrappers never read browser tokens and never call the user-authenticated API.
 They connect to the local Daemon socket at `~/.agora/daemon.sock` (override with
 `AGORA_DAEMON_SOCKET`). The Daemon uses its own device credential for a Logto-

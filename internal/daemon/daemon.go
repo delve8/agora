@@ -196,8 +196,12 @@ func (d *Daemon) handleLocalWrapper(conn net.Conn) {
 		Type string `json:"type"`
 	}
 	_ = json.Unmarshal(body, &envelope)
-	if envelope.Type == protocol.SessionReport {
+	switch envelope.Type {
+	case protocol.SessionReport:
 		d.handleSessionReport(conn, body)
+		return
+	case protocol.SessionList:
+		d.handleSessionList(conn, body)
 		return
 	}
 	var payload protocol.WrapperRequest
@@ -867,15 +871,15 @@ func (d *Daemon) resolveWorkspace(sessionID string) string {
 	return ""
 }
 
-func (d *Daemon) sendResync() error {
-	d.resyncMu.Lock()
-	defer d.resyncMu.Unlock()
-
-	values, err := d.manager.ListSessions(context.Background(), "")
+// localSessions returns what this Daemon owns and what it has discovered, with
+// every history entry that a live session already covers removed. Resync and the
+// terminal-facing session list share it so both describe the same set.
+func (d *Daemon) localSessions(ctx context.Context) ([]session.Session, []session.Session, error) {
+	values, err := d.manager.ListSessions(ctx, "")
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-	payload := protocol.ResyncPayload{DaemonID: d.config.ID, Gap: d.outbox.Gap()}
+	managed := make([]session.Session, 0, len(values))
 	managedAgentSessionIDs := make(map[string]struct{})
 	managedHistoryPaths := make(map[string]struct{})
 	for _, value := range values {
@@ -897,19 +901,13 @@ func (d *Daemon) sendResync() error {
 		if value.HistoryPath != "" {
 			managedHistoryPaths[value.Agent+"\x00"+filepath.Clean(value.HistoryPath)] = struct{}{}
 		}
-		payload.Sessions = append(payload.Sessions, protocol.SessionSummary{
-			SessionID: value.ID, DaemonID: d.config.ID, Agent: value.Agent,
-			AgentSessionID: value.AgentSessionID, HistoryPath: value.HistoryPath, ClaudeSessionID: value.ClaudeSessionID,
-			Workspace: value.Workspace, DisplayName: value.DisplayName, DisplayNameSource: value.DisplayNameSource,
-			Role:  value.Role,
-			State: value.State, Connection: value.Connection, PID: value.ProcessID,
-			CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
-		})
+		managed = append(managed, value)
 	}
 	d.historyMu.RLock()
-	historySessions := append([]session.Session(nil), d.historySessions...)
+	discovered := append([]session.Session(nil), d.historySessions...)
 	d.historyMu.RUnlock()
-	for _, value := range historySessions {
+	history := make([]session.Session, 0, len(discovered))
+	for _, value := range discovered {
 		uri := value.NativeSessionURI()
 		if _, exists := managedAgentSessionIDs[uri]; exists {
 			continue
@@ -919,7 +917,89 @@ func (d *Daemon) sendResync() error {
 				continue
 			}
 		}
-		payload.History = append(payload.History, protocol.HistorySessionSummary{SessionID: value.ID, DaemonID: d.config.ID, Agent: value.Agent, AgentSessionID: uri, HistoryPath: value.HistoryPath, ClaudeSessionID: value.ClaudeSessionID, Workspace: value.Workspace, DisplayName: value.DisplayName, DisplayNameSource: value.DisplayNameSource, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt})
+		history = append(history, value)
+	}
+	return managed, history, nil
+}
+
+// handleSessionList answers a local terminal asking which sessions exist, so the
+// wrapper does not have to be handed a canonical id. It never contacts the
+// Server: this is a local question about the machine the terminal is on.
+func (d *Daemon) handleSessionList(conn net.Conn, body []byte) {
+	var payload protocol.SessionListRequest
+	if err := json.Unmarshal(body, &payload); err != nil {
+		_ = json.NewEncoder(conn).Encode(protocol.SessionListResponse{Error: "invalid session list request: " + err.Error()})
+		return
+	}
+	managed, history, err := d.localSessions(context.Background())
+	if err != nil {
+		_ = json.NewEncoder(conn).Encode(protocol.SessionListResponse{Error: err.Error()})
+		return
+	}
+	want := normaliseWorkspace(payload.Workspace)
+	entries := make([]protocol.SessionListEntry, 0, len(managed)+len(history))
+	for _, value := range managed {
+		if want != "" && normaliseWorkspace(value.Workspace) != want {
+			continue
+		}
+		entries = append(entries, protocol.SessionListEntry{
+			SessionID: value.ID, AgentSessionID: value.NativeSessionURI(), Agent: value.Agent,
+			DisplayName: value.DisplayName, Workspace: value.Workspace, State: value.State, Source: session.SourceManaged,
+			Attachable: value.State == session.StateRunning || value.State == session.StateStarting || value.State == session.StateWaiting,
+			UpdatedAt:  value.UpdatedAt,
+		})
+	}
+	for _, value := range history {
+		if want != "" && normaliseWorkspace(value.Workspace) != want {
+			continue
+		}
+		entries = append(entries, protocol.SessionListEntry{
+			SessionID: value.ID, AgentSessionID: value.NativeSessionURI(), Agent: value.Agent,
+			DisplayName: value.DisplayName, Workspace: value.Workspace, State: value.State, Source: session.SourceHistory,
+			UpdatedAt: value.UpdatedAt,
+		})
+	}
+	_ = json.NewEncoder(conn).Encode(protocol.SessionListResponse{Sessions: entries})
+}
+
+// normaliseWorkspace compares directories the way the rest of Agora does, and
+// resolves symlinks so a session started through /var and a terminal in
+// /private/var (macOS) still match.
+func normaliseWorkspace(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
+	if absolute, err := filepath.Abs(path); err == nil {
+		path = absolute
+	}
+	return filepath.Clean(path)
+}
+
+func (d *Daemon) sendResync() error {
+	d.resyncMu.Lock()
+	defer d.resyncMu.Unlock()
+
+	managed, historySessions, err := d.localSessions(context.Background())
+	if err != nil {
+		return err
+	}
+	payload := protocol.ResyncPayload{DaemonID: d.config.ID, Gap: d.outbox.Gap()}
+	for _, value := range managed {
+		payload.Sessions = append(payload.Sessions, protocol.SessionSummary{
+			SessionID: value.ID, DaemonID: d.config.ID, Agent: value.Agent,
+			AgentSessionID: value.AgentSessionID, HistoryPath: value.HistoryPath, ClaudeSessionID: value.ClaudeSessionID,
+			Workspace: value.Workspace, DisplayName: value.DisplayName, DisplayNameSource: value.DisplayNameSource,
+			Role:  value.Role,
+			State: value.State, Connection: value.Connection, PID: value.ProcessID,
+			CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
+		})
+	}
+	for _, value := range historySessions {
+		payload.History = append(payload.History, protocol.HistorySessionSummary{SessionID: value.ID, DaemonID: d.config.ID, Agent: value.Agent, AgentSessionID: value.NativeSessionURI(), HistoryPath: value.HistoryPath, ClaudeSessionID: value.ClaudeSessionID, Workspace: value.Workspace, DisplayName: value.DisplayName, DisplayNameSource: value.DisplayNameSource, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt})
 	}
 	parts := splitResync(payload)
 	for index := range parts {

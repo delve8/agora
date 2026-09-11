@@ -97,6 +97,45 @@ type HeartbeatPayload struct {
 	At       time.Time `json:"at"`
 }
 
+// SessionList asks the local Daemon which sessions it owns or has discovered,
+// so a terminal can pick one without knowing a canonical session id.
+const SessionList = "session.list"
+
+type SessionListRequest struct {
+	Type string `json:"type"`
+	// Workspace limits the answer to one directory. Empty lists every workspace
+	// this Daemon knows about.
+	Workspace string `json:"workspace,omitempty"`
+	// Agent names a provider no Server accepts, and it is here on purpose: a
+	// Daemon that predates session listing decodes this request as a wrapper
+	// request and forwards it to the Server, where the unknown provider makes it
+	// fail instead of quietly creating a session. Listing must never have side
+	// effects, and a Daemon can only be upgraded while it is running.
+	Agent string `json:"agent,omitempty"`
+}
+
+type SessionListEntry struct {
+	SessionID string `json:"session_id"`
+	// AgentSessionID is the provider's own identifier (pi://..., claude://...).
+	// A terminal can pass either this or the canonical id back to the Daemon.
+	AgentSessionID string `json:"agent_session_id,omitempty"`
+	Agent          string `json:"agent,omitempty"`
+	DisplayName    string `json:"display_name,omitempty"`
+	Workspace      string `json:"workspace,omitempty"`
+	State          string `json:"state"`
+	// Attachable reports whether the session is running with a PTY this Daemon
+	// can hand to a terminal. A history session can only be picked from inside
+	// the Agent (Pi and Claude both offer /resume).
+	Attachable bool      `json:"attachable"`
+	Source     string    `json:"source,omitempty"`
+	UpdatedAt  time.Time `json:"updated_at,omitempty"`
+}
+
+type SessionListResponse struct {
+	Sessions []SessionListEntry `json:"sessions"`
+	Error    string             `json:"error,omitempty"`
+}
+
 type SessionSummary struct {
 	SessionID      string `json:"session_id"`
 	DaemonID       string `json:"daemon_id,omitempty"`

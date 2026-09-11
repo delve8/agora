@@ -210,3 +210,84 @@ func TestShouldResyncHistoryRetriesAfterAFailedSend(t *testing.T) {
 		}
 	}
 }
+
+// A terminal asks the Daemon what exists instead of being handed a canonical id.
+// The answer has to be scoped to the working directory, has to tell running
+// sessions from history ones (only the former can be attached to), and must not
+// list a history entry that a live session already covers.
+func TestSessionListIsScopedAndMarksHistory(t *testing.T) {
+	socketPath := filepath.Join("/tmp", fmt.Sprintf("agora-list-test-%d.sock", time.Now().UnixNano()))
+	t.Setenv("AGORA_DAEMON_SOCKET", socketPath)
+	t.Cleanup(func() { _ = os.Remove(socketPath) })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	workspace := t.TempDir()
+	other := t.TempDir()
+	updated := time.Now().UTC().Add(-2 * time.Hour)
+	store := runtime.NewMemoryStore()
+	_ = store.CreateSession(ctx, session.Session{
+		ID: "daemon-test/pi://running-1", Agent: "pi", AgentSessionID: "pi://running-1",
+		Workspace: workspace, DisplayName: "live one", State: session.StateRunning, Source: session.SourceManaged, UpdatedAt: time.Now().UTC(),
+	})
+	_ = store.CreateSession(ctx, session.Session{
+		ID: "daemon-test/pi://elsewhere", Agent: "pi", AgentSessionID: "pi://elsewhere",
+		Workspace: other, State: session.StateRunning, Source: session.SourceManaged, UpdatedAt: time.Now().UTC(),
+	})
+	d := &Daemon{
+		config:  Config{ID: "daemon-test"},
+		manager: runtime.NewManager(store, nil, nil),
+		historySessions: []session.Session{
+			// Same native session as the live one: the history copy is redundant.
+			{ID: "daemon-test/pi://running-1", Agent: "pi", AgentSessionID: "pi://running-1", Workspace: workspace, HistoryPath: "/tmp/running-1.jsonl", UpdatedAt: updated},
+			{ID: "daemon-test/pi://history-1", Agent: "pi", AgentSessionID: "pi://history-1", Workspace: workspace, DisplayName: "old one", HistoryPath: "/tmp/history-1.jsonl", UpdatedAt: updated},
+		},
+	}
+	if err := d.startLocalWrapperServer(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
+
+	ask := func(workspace string) protocol.SessionListResponse {
+		t.Helper()
+		conn, err := net.Dial("unix", socketPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		if err := json.NewEncoder(conn).Encode(protocol.SessionListRequest{Type: protocol.SessionList, Workspace: workspace}); err != nil {
+			t.Fatal(err)
+		}
+		var reply protocol.SessionListResponse
+		if err := json.NewDecoder(conn).Decode(&reply); err != nil {
+			t.Fatalf("decode reply: %v", err)
+		}
+		if reply.Error != "" {
+			t.Fatalf("session list error: %s", reply.Error)
+		}
+		return reply
+	}
+
+	local := ask(workspace)
+	if len(local.Sessions) != 2 {
+		t.Fatalf("sessions in the workspace = %+v, want the live one and one history entry", local.Sessions)
+	}
+	byID := map[string]protocol.SessionListEntry{}
+	for _, entry := range local.Sessions {
+		byID[entry.SessionID] = entry
+	}
+	if entry := byID["daemon-test/pi://running-1"]; !entry.Attachable || entry.State != session.StateRunning {
+		t.Fatalf("live session = %+v, want it attachable", entry)
+	}
+	if entry := byID["daemon-test/pi://history-1"]; entry.Attachable || entry.Source != session.SourceHistory {
+		t.Fatalf("history session = %+v, want it marked as history", entry)
+	}
+	if _, exists := byID["daemon-test/pi://elsewhere"]; exists {
+		t.Fatal("a session from another workspace was listed")
+	}
+
+	// An empty workspace lists the machine, which is what `--all` means.
+	if all := ask(""); len(all.Sessions) != 3 {
+		t.Fatalf("sessions on the machine = %+v, want every workspace", all.Sessions)
+	}
+}
