@@ -4,9 +4,10 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/delve8/agora/internal/adapter"
 	"github.com/delve8/agora/internal/session"
@@ -24,7 +25,10 @@ func TestSpawnedHostSurvivesTerminalSignals(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ctx := context.Background()
+	// Every RPC gets a deadline: a Host that never answers must fail the test
+	// instead of blocking it until the go test timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	registry := NewSessionHostRegistryWithHome(os.Args[0], home)
 	value := session.Session{
 		ID: "pending/session-signal-test", CoordinationID: "coord-1", DaemonID: "daemon-1",
@@ -47,23 +51,23 @@ func TestSpawnedHostSurvivesTerminalSignals(t *testing.T) {
 	}
 	// The Host must live in its own session, otherwise the Daemon's terminal
 	// signals reach it through the shared foreground process group.
-	if pgid, err := syscall.Getpgid(metadata.HostPID); err != nil {
+	if pgid, err := unix.Getpgid(metadata.HostPID); err != nil {
 		t.Fatalf("host process group: %v", err)
-	} else if pgid == syscall.Getpgrp() {
+	} else if pgid == unix.Getpgrp() {
 		t.Fatalf("host %d shares the daemon process group %d", metadata.HostPID, pgid)
 	}
-	ownSession, err := syscall.Getsid(0)
+	ownSession, err := unix.Getsid(0)
 	if err != nil {
 		t.Fatalf("daemon session: %v", err)
 	}
-	if sid, err := syscall.Getsid(metadata.HostPID); err != nil {
+	if sid, err := unix.Getsid(metadata.HostPID); err != nil {
 		t.Fatalf("host session: %v", err)
 	} else if sid == ownSession {
 		t.Fatalf("host %d shares the daemon session %d", metadata.HostPID, sid)
 	}
 
-	for _, sig := range []syscall.Signal{syscall.SIGINT, syscall.SIGHUP} {
-		if err := syscall.Kill(metadata.HostPID, sig); err != nil {
+	for _, sig := range []unix.Signal{unix.SIGINT, unix.SIGHUP} {
+		if err := unix.Kill(metadata.HostPID, sig); err != nil {
 			t.Fatalf("signal %v: %v", sig, err)
 		}
 	}

@@ -42,8 +42,14 @@ jobs:
           node-version: "24"
           cache: npm
           cache-dependency-path: web/package-lock.json
+      # Vet for both supported platforms. A symbol that only exists on one of
+      # them (syscall.Getsid exists on darwin but not linux, for example) must
+      # fail here rather than on a developer's machine or in the image build.
       - name: Go vet
-        run: go vet ./...
+        run: |
+          go vet ./...
+          GOOS=darwin go vet ./...
+          GOOS=linux go vet ./...
       # -p 1 keeps the end-to-end suite from competing with itself for PTYs and
       # loopback ports, which makes it flaky under a parallel package run.
       - name: Go tests
