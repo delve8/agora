@@ -243,7 +243,17 @@ func TestHostedPiResumeRebindFollowsPickedSession(t *testing.T) {
 	if value.HistoryPath != transcript {
 		t.Fatalf("rebound history path = %q, want %q", value.HistoryPath, transcript)
 	}
-	metadata, err := client.State(ctx)
+	// The store is updated before the Host metadata, so the Host is waited for
+	// rather than asserted on immediately: on a loaded machine the metadata
+	// write lands well after the session row.
+	var metadata sessionhost.Metadata
+	for time.Now().Before(deadline) {
+		metadata, err = client.State(ctx)
+		if err == nil && metadata.SessionID == rebound && metadata.HistoryPath == transcript {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	if err != nil {
 		t.Fatalf("host state after rebind: %v", err)
 	}

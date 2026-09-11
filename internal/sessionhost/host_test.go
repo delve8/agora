@@ -3,8 +3,11 @@ package sessionhost
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -113,4 +116,95 @@ func TestHostRejectsInvalidToken(t *testing.T) {
 	}
 	_ = client.Stop(context.Background())
 	<-done
+}
+
+// Attaching to a session that has already painted must show the screen. Without
+// a replay the client sees an empty terminal until the Agent happens to write
+// again, which is exactly what a wrapper that attaches after the Agent started
+// used to experience.
+func TestAttachReplaysTheCurrentScreen(t *testing.T) {
+	runtimeDir := t.TempDir()
+	// The Agent paints immediately and then stays quiet: only a replay can tell
+	// the attaching client what is on the screen.
+	host, err := New(Config{
+		HostID:     "host-replay",
+		SessionID:  "daemon/test/claude://native-replay",
+		DaemonID:   "test",
+		Agent:      "claude",
+		Workspace:  t.TempDir(),
+		Command:    []string{"/bin/sh", "-c", "printf 'PAINTED\r\\n'; sleep 30"},
+		RuntimeDir: runtimeDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- host.Run() }()
+	var client *Client
+	t.Cleanup(func() {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		if client != nil {
+			stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = client.Stop(stopCtx)
+		}
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("host did not exit after stopping its Agent")
+		}
+	})
+
+	metadataPath := filepath.Join(runtimeDir, "metadata.json")
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, statErr := os.Stat(metadataPath); statErr == nil {
+			if client, err = NewClient(metadataPath); err == nil {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if client == nil {
+		t.Fatalf("host did not become controllable: %v", err)
+	}
+
+	// Wait for the Agent to have painted, so the attach cannot race it.
+	painted := time.Now().Add(5 * time.Second)
+	for time.Now().Before(painted) {
+		conn := dialAttach(t, client.AttachSocket())
+		data := readAttach(t, conn)
+		if strings.Contains(data, "PAINTED") {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("an attaching client never saw the screen the Agent painted")
+}
+
+func dialAttach(t *testing.T, socket string) net.Conn {
+	t.Helper()
+	if socket == "" {
+		t.Fatal("host reported no attach socket")
+	}
+	conn, err := net.DialTimeout("unix", socket, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial attach socket: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
+}
+
+func readAttach(t *testing.T, conn net.Conn) string {
+	t.Helper()
+	_ = conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	data, err := io.ReadAll(conn)
+	if err != nil && !os.IsTimeout(err) {
+		t.Fatalf("read attach socket: %v", err)
+	}
+	return string(data)
 }

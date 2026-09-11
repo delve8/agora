@@ -457,15 +457,16 @@ func (m *PTYManager) serveAttach(session *PTYSession) {
 	}
 	var clientsMu sync.Mutex
 	clients := make(map[*client]bool)
-	broadcast := func(data []byte) {
-		clientsMu.Lock()
+	// broadcastLocked requires clientsMu; the caller holds it so that recording
+	// output and handing it to clients cannot be reordered against a client
+	// attaching and reading the snapshot.
+	broadcastLocked := func(data []byte) {
 		for c := range clients {
 			select {
 			case c.send <- data:
 			default: // slow client: drop this frame rather than block the hub
 			}
 		}
-		clientsMu.Unlock()
 	}
 	unregister := func(c *client) {
 		clientsMu.Lock()
@@ -483,7 +484,11 @@ func (m *PTYManager) serveAttach(session *PTYSession) {
 			n, err := master.Read(buf)
 			if n > 0 {
 				data := append([]byte(nil), buf[:n]...)
-				if session.observation != nil && session.observation.record(data) {
+				clientsMu.Lock()
+				attention := session.observation != nil && session.observation.record(data)
+				broadcastLocked(data)
+				clientsMu.Unlock()
+				if attention {
 					m.mu.Lock()
 					handler := m.onAttention
 					m.mu.Unlock()
@@ -491,7 +496,6 @@ func (m *PTYManager) serveAttach(session *PTYSession) {
 						handler(session.AgoraID, "approval_required")
 					}
 				}
-				broadcast(data)
 			}
 			if err != nil {
 				return
@@ -506,6 +510,14 @@ func (m *PTYManager) serveAttach(session *PTYSession) {
 		}
 		c := &client{conn: conn, send: make(chan []byte, 256)}
 		clientsMu.Lock()
+		// Register and replay under one lock. Everything the Agent wrote before
+		// this point is in the snapshot, everything after it is queued for this
+		// client, and the queue is empty, so the replay reaches the writer first.
+		if session.observation != nil {
+			if screen := session.observation.snapshot().Render(); screen != "" {
+				c.send <- []byte(screen)
+			}
+		}
 		clients[c] = true
 		clientsMu.Unlock()
 

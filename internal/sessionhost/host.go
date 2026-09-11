@@ -296,6 +296,15 @@ func (h *Host) serveAttach() {
 			return
 		}
 		h.clients[conn] = struct{}{}
+		// Replay the current screen before releasing the lock: readOutput takes
+		// the same lock to hand bytes to the clients, so a client that attaches
+		// to a session which already painted sees the screen first and live
+		// output after it, with nothing lost in between.
+		if h.observation != nil {
+			if screen := h.observation.Snapshot().Render(); screen != "" {
+				_, _ = conn.Write([]byte(screen))
+			}
+		}
 		h.mu.Unlock()
 		go func() {
 			defer func() {

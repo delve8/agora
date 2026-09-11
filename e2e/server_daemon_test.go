@@ -106,18 +106,35 @@ func TestDaemonLocalWrapperFlow(t *testing.T) {
 		t.Fatalf("wrapper returned non-canonical session id %q: %v", response.SessionID, err)
 	}
 
-	attach, err := net.DialTimeout("unix", response.Socket, time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer attach.Close()
-	_ = attach.SetReadDeadline(time.Now().Add(2 * time.Second))
-	output, err := io.ReadAll(attach)
-	if err != nil && !os.IsTimeout(err) {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(output), "READY") {
+	if output := attachScreen(t, response.Socket, 5*time.Second); !strings.Contains(output, "READY") {
 		t.Fatalf("wrapper attach output = %q", output)
+	}
+}
+
+// attachScreen dials a session's attach socket and returns what the screen shows.
+// Each connection replays the current screen, so an attach that lands before the
+// Agent has painted anything legitimately sees nothing yet and is retried: the
+// wrapper can win that race, it just must not lose the screen because of it.
+func attachScreen(t *testing.T, socket string, within time.Duration) string {
+	t.Helper()
+	var output string
+	deadline := time.Now().Add(within)
+	for {
+		conn, err := net.DialTimeout("unix", socket, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		data, readErr := io.ReadAll(conn)
+		_ = conn.Close()
+		if readErr != nil && !os.IsTimeout(readErr) {
+			t.Fatal(readErr)
+		}
+		output = string(data)
+		if strings.Contains(output, "READY") || time.Now().After(deadline) {
+			return output
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
