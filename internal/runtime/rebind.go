@@ -670,11 +670,9 @@ func (m *Manager) rebindSession(id, agent, nativeID, historyPath, workspace, dis
 		}
 		newID = candidate
 	}
-	if newID != id {
-		if _, getErr := m.store.GetSession(context.Background(), newID); getErr == nil {
-			return session.Session{}, fmt.Errorf("session %s already exists", newID)
-		}
-	}
+	// /resume often targets a previously discovered history row that already
+	// uses this canonical id. Replace that row instead of failing: the live
+	// process is moving onto the same logical session.
 
 	updated := old
 	updated.ID = newID
@@ -695,7 +693,16 @@ func (m *Manager) rebindSession(id, agent, nativeID, historyPath, workspace, dis
 	// The existing managed process remains alive; rebind must not make the
 	// server believe the PTY exited while only its logical context changed.
 	updated.ProcessID = old.ProcessID
-	if displayName != "" {
+	if existing, getErr := m.store.GetSession(context.Background(), newID); getErr == nil && existing.ID == newID {
+		// Keep the target session's own name when it already has one. A
+		// /resume onto a discovered history row would otherwise overwrite
+		// "older conversation" with the live wrapper's "New session".
+		if !session.IsGeneratedDisplayName(existing.DisplayName) {
+			updated.DisplayName = existing.DisplayName
+			updated.DisplayNameSource = existing.DisplayNameSource
+		}
+	}
+	if displayName != "" && (session.IsGeneratedDisplayName(updated.DisplayName) || updated.DisplayNameSource == session.DisplayNameSourceAITitle) {
 		updated.DisplayName = displayName
 		updated.DisplayNameSource = session.DisplayNameSourceAITitle
 	}
@@ -839,6 +846,14 @@ func (m *Manager) ReportAgentSession(ctx context.Context, report AgentSessionRep
 		return value, nil
 	}
 	switchDebugf("report id=%s reason=%s native=%s file=%s", id, report.Reason, native, file)
+	// /new names the future JSONL before it exists. Bind the native id now, but
+	// leave HistoryPath empty until the file appears so the UI does not request
+	// a transcript that is not there yet.
+	if file != "" {
+		if _, statErr := os.Stat(file); os.IsNotExist(statErr) {
+			file = ""
+		}
+	}
 	// Start the observer at the end of an existing transcript: the user already
 	// has that history, and replaying it would emit it as live events.
 	updated, err := m.rebindSession(id, agent, native, file, value.Workspace, report.SessionName, -1)

@@ -162,6 +162,65 @@ func TestReportAgentSessionRebindsToReportedTranscript(t *testing.T) {
 	}
 }
 
+// /resume commonly targets a session Agora already listed as history. The
+// canonical id therefore already exists, and rebind must replace that row
+// instead of leaving the live process on the pre-resume identity.
+func TestReportAgentSessionRebindsOntoExistingHistoryRow(t *testing.T) {
+	manager, client, workspace, sessionDir := newReporterTestManager(t)
+	ctx := context.Background()
+
+	const picked = "c2bb1f83-f285-5bda-b1d6-6eb8fd64c089"
+	transcript := filepath.Join(sessionDir, "2026-01-02T00-00-00-000Z_"+picked+".jsonl")
+	header := `{"type":"session","id":"` + picked + `","cwd":` + quoteJSON(workspace) + `}` + "\n"
+	if err := os.WriteFile(transcript, []byte(header), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	want, err := session.NewSessionID("daemon-1", "pi", "pi://"+picked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	history := session.Session{
+		ID: want, CoordinationID: "coord-1", DaemonID: "daemon-1", Agent: "pi",
+		AgentSessionID: "pi://" + picked, Workspace: workspace, DisplayName: "older conversation",
+		Role: "history", State: session.StateStopped, Source: session.SourceHistory,
+		HistoryPath: transcript, CreatedAt: time.Now().UTC().Add(-time.Hour), UpdatedAt: time.Now().UTC(),
+	}
+	if err := manager.store.CreateSession(ctx, history); err != nil {
+		t.Fatal(err)
+	}
+
+	metadata, err := client.State(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := metadata.SessionID
+	value, err := manager.ReportAgentSession(ctx, AgentSessionReport{
+		HostID:          metadata.HostID,
+		Reason:          "resume",
+		SessionFile:     transcript,
+		NativeSessionID: picked,
+		SessionName:     "older conversation",
+	})
+	if err != nil {
+		t.Fatalf("ReportAgentSession onto an existing history row: %v", err)
+	}
+	if value.ID != want {
+		t.Fatalf("rebound session id = %q, want %q", value.ID, want)
+	}
+	if value.State != session.StateRunning || !value.Capabilities.CanSendInput {
+		t.Fatalf("rebound session is not live: %+v", value)
+	}
+	if value.DisplayName != "older conversation" {
+		t.Fatalf("display name = %q, want the history row's name", value.DisplayName)
+	}
+	if _, err := manager.store.GetSession(ctx, before); err == nil {
+		t.Fatalf("old session %s still exists after rebinding onto history", before)
+	}
+	if _, ok := manager.hosts.Get(want); !ok {
+		t.Fatalf("host was not moved onto %s", want)
+	}
+}
+
 // A provider can move to a session whose transcript does not exist yet (/new).
 // The report still carries the exact session id, so Agora binds it immediately
 // and lets the observer fill in the transcript when it appears.
@@ -195,6 +254,43 @@ func TestReportAgentSessionBindsFreshSessionWithoutTranscript(t *testing.T) {
 	}
 	if updated.SessionID != want || updated.HistoryPath != "" {
 		t.Fatalf("host metadata not updated: session=%q history=%q", updated.SessionID, updated.HistoryPath)
+	}
+}
+
+// /new reports the future JSONL path before Pi creates the file. Agora must
+// bind the native id immediately, but must not advertise a transcript that
+// cannot be opened yet.
+func TestReportAgentSessionIgnoresMissingTranscriptPath(t *testing.T) {
+	manager, client, _, sessionDir := newReporterTestManager(t)
+	ctx := context.Background()
+	metadata, err := client.State(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const fresh = "81fe4903-f2e1-41e9-970f-75d63d17053a"
+	missing := filepath.Join(sessionDir, "2026-09-12T09-31-51-937Z_"+fresh+".jsonl")
+
+	value, err := manager.ReportAgentSession(ctx, AgentSessionReport{
+		HostID:          metadata.HostID,
+		Reason:          "new",
+		SessionFile:     missing,
+		NativeSessionID: fresh,
+	})
+	if err != nil {
+		t.Fatalf("ReportAgentSession: %v", err)
+	}
+	if value.HistoryPath != "" {
+		t.Fatalf("missing transcript was bound as history: %q", value.HistoryPath)
+	}
+	if value.Capabilities.CanReadHistory {
+		t.Fatalf("a missing transcript advertised history: %+v", value.Capabilities)
+	}
+	events, err := manager.PiHistoryForSession(ctx, value, 0)
+	if err != nil {
+		t.Fatalf("history request for a missing transcript: %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("missing transcript returned %d events", len(events))
 	}
 }
 

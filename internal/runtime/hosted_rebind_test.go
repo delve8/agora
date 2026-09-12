@@ -14,6 +14,7 @@ import (
 	"github.com/delve8/agora/internal/adapter"
 	"github.com/delve8/agora/internal/session"
 	"github.com/delve8/agora/internal/sessionhost"
+	"github.com/delve8/agora/internal/terminal"
 )
 
 // TestMain lets the test binary act as `agora session-host`, so hosted sessions
@@ -204,7 +205,7 @@ func TestHostedPiResumeRebindFollowsPickedSession(t *testing.T) {
 		t.Fatalf("dial attach socket: %v", err)
 	}
 	defer attach.Close()
-	if _, err := attach.Write([]byte(message + "\r")); err != nil {
+	if err := terminal.WriteData(attach, []byte(message+"\r")); err != nil {
 		t.Fatalf("type into attach socket: %v", err)
 	}
 	for {

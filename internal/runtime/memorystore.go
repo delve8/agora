@@ -75,7 +75,9 @@ func (s *memoryStore) RekeySession(_ context.Context, oldID string, value sessio
 		}
 	}
 	delete(s.sessions, oldID)
+	delete(s.sessions, value.ID)
 	s.sessions[value.ID] = value
+	delete(s.cursors, value.ID)
 	if cursor, ok := s.cursors[oldID]; ok {
 		delete(s.cursors, oldID)
 		cursor.SessionID = value.ID

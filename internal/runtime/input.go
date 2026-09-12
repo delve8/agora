@@ -5,19 +5,23 @@ import (
 	"net"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/delve8/agora/internal/terminal"
 )
 
 // copyTerminalInput forwards terminal bytes unchanged while maintaining a
 // small line buffer solely for detecting submitted provider commands. Escape
 // sequences and editing keys affect detection only; they are never removed
-// from the bytes written to the PTY.
-func copyTerminalInput(master io.Writer, conn net.Conn, sessionID func() string, handler func(string, string)) {
+// from the bytes written to the PTY. Resize frames are applied through
+// onResize and never appear as keystrokes.
+func copyTerminalInput(master io.Writer, conn net.Conn, sessionID func() string, handler func(string, string), onResize func(int, int)) {
+	stream := terminal.NewAttachStream(conn, onResize)
 	buf := make([]byte, 4096)
 	line := make([]byte, 0, 256)
 	escape := false
 	csi := false
 	for {
-		n, err := conn.Read(buf)
+		n, err := stream.Read(buf)
 		if n > 0 {
 			if _, writeErr := master.Write(buf[:n]); writeErr != nil {
 				return

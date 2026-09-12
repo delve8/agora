@@ -46,7 +46,7 @@ Agora 负责启动、持有和观察 Claude；用户仍然看到并操作原生 
 
 - `POST /api/coordinations/{id}/sessions` 创建一个 managed 会话并在 Daemon 持有的 PTY 中启动 Claude；
 - `~/.agora/daemon.sock` 接收 wrapper 的 create/attach 请求；Daemon 使用设备 credential 与 Server 通信；
-- `claude-wrapper [session-id]` / `agora attach [session-id]` 连接返回的 PTY socket，raw mode 双向转发键盘和屏幕；
+- `claude-wrapper [session-id]` / `agora attach [session-id]` 连接返回的 PTY socket，raw mode 转发键盘和屏幕，并把本地终端尺寸/`SIGWINCH` 同步到 PTY；
 - JSONL observer 轮询会话文件，解析 user/assistant/tool/result 内容，入库并通过 SSE 推送到 Web；
 - PTY reader 维护当前 VT screen snapshot，Web 通过只读接口观察 native TUI；
 - 归一化的 Session 状态/attention 可以进入独立通知策略，向 IM 发送摘要和 Session deep link；

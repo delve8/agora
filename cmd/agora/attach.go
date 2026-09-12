@@ -7,13 +7,17 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/term"
 
 	"github.com/delve8/agora/internal/protocol"
+	"github.com/delve8/agora/internal/terminal"
 )
 
 // runWrapper is the generic native Agent wrapper entry point. It talks only to
@@ -149,9 +153,51 @@ func runAttachSocket(addr string) error {
 	}
 	defer func() { _ = term.Restore(int(os.Stdin.Fd()), oldState) }()
 
+	// The Agent PTY starts at a fixed default so Pi does not exit on 0x0.
+	// The wrapper then sends the real window size, including later SIGWINCH
+	// updates, as framed attach messages rather than keystrokes.
+	var writeMu sync.Mutex
+	write := func(fn func() error) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return fn()
+	}
+	sendSize := func() {
+		cols, rows, sizeErr := term.GetSize(int(os.Stdin.Fd()))
+		if sizeErr != nil {
+			return
+		}
+		_ = write(func() error { return terminal.WriteResize(conn, cols, rows) })
+	}
+	sendSize()
+	winch := make(chan os.Signal, 1)
+	signal.Notify(winch, syscall.SIGWINCH)
+	defer signal.Stop(winch)
+	go func() {
+		for range winch {
+			sendSize()
+		}
+	}()
+
 	done := make(chan error, 2)
 	go func() { _, err := io.Copy(os.Stdout, conn); done <- err }()
-	go func() { _, err := io.Copy(conn, os.Stdin); done <- err }()
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, readErr := os.Stdin.Read(buf)
+			if n > 0 {
+				data := append([]byte(nil), buf[:n]...)
+				if writeErr := write(func() error { return terminal.WriteData(conn, data) }); writeErr != nil {
+					done <- writeErr
+					return
+				}
+			}
+			if readErr != nil {
+				done <- readErr
+				return
+			}
+		}
+	}()
 	<-done
 	return nil
 }

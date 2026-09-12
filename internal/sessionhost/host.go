@@ -166,7 +166,7 @@ func (h *Host) Run() error {
 	// The injected Agent extension identifies its Host through this variable.
 	// The Host ID is stable across rebinds, unlike the canonical Session ID.
 	cmd.Env = withEnv(env, "AGORA_HOST_ID", h.config.HostID)
-	master, err := pty.Start(cmd)
+	master, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: terminal.DefaultCols, Rows: terminal.DefaultRows})
 	if err != nil {
 		h.cleanupFiles()
 		return fmt.Errorf("start agent: %w", err)
@@ -250,7 +250,7 @@ func (h *Host) prepareSockets() error {
 	now := time.Now().UTC()
 	h.mu.Lock()
 	h.control, h.attach, h.controlPath, h.attachPath, h.token = control, attach, controlPath, attachPath, token
-	h.observation = terminal.NewVT10x(120, 40)
+	h.observation = terminal.NewVT10x(terminal.DefaultCols, terminal.DefaultRows)
 	h.input = &inputObserver{onLine: h.broadcastInput}
 	h.meta = Metadata{SchemaVersion: MetadataVersion, HostID: h.config.HostID, SessionID: h.config.SessionID, CoordinationID: h.config.CoordinationID, DaemonID: h.config.DaemonID, Agent: h.config.Agent, AgentSessionID: h.config.AgentSessionID, Workspace: h.config.Workspace, DisplayName: h.config.DisplayName, DisplayNameSource: h.config.DisplayNameSource, HistoryPath: h.config.HistoryPath, HostPID: os.Getpid(), HostStartedAt: now, ControlSocket: controlPath, AttachSocket: attachPath, State: "starting", CreatedAt: now, UpdatedAt: now, TokenFile: tokenPath}
 	meta := h.meta
@@ -313,7 +313,7 @@ func (h *Host) serveAttach() {
 				h.mu.Unlock()
 				_ = conn.Close()
 			}()
-			_, _ = io.Copy(inputWriter{host: h}, conn)
+			_, _ = io.Copy(inputWriter{host: h}, terminal.NewAttachStream(conn, h.resize))
 		}()
 	}
 }
@@ -444,6 +444,22 @@ func withEnv(env []string, key, value string) []string {
 		result = append(result, entry)
 	}
 	return append(result, prefix+value)
+}
+
+func (h *Host) resize(cols, rows int) {
+	cols, rows, ok := terminal.ClampSize(cols, rows)
+	if !ok {
+		return
+	}
+	h.mu.Lock()
+	master, observation := h.pty, h.observation
+	h.mu.Unlock()
+	if master != nil {
+		_ = pty.Setsize(master, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
+	}
+	if observation != nil {
+		observation.Resize(cols, rows)
+	}
 }
 
 func (h *Host) processInput(data []byte) {

@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/delve8/agora/internal/terminal"
 )
 
 func TestPiManagerInteractivePTY(t *testing.T) {
@@ -81,6 +83,64 @@ done
 	joined := strings.Join(snapshot.Lines, "\n")
 	if !strings.Contains(joined, "PI TUI READY") || !strings.Contains(joined, "received: hello") {
 		t.Fatalf("PTY snapshot = %q", joined)
+	}
+}
+
+func TestPiManagerResizesPTYFromAttach(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "pi")
+	script := `#!/bin/sh
+trap 'printf "SIZE %s\r\n" "$(stty size)"' WINCH
+printf 'SIZE %s\r\n' "$(stty size)"
+while IFS= read -r line; do
+  printf 'received: %s\r\n' "$line"
+done
+`
+	if err := os.WriteFile(binary, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewPiManager(PiConfig{Binary: binary})
+	process, err := manager.Start("agora-resize", dir, "native-resize")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	conn, err := dialUnix(process.SocketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	var output strings.Builder
+	buf := make([]byte, 4096)
+	readUntil := func(needle string, timeout time.Duration) bool {
+		deadline := time.Now().Add(timeout)
+		for time.Now().Before(deadline) {
+			if strings.Contains(output.String(), needle) {
+				return true
+			}
+			_ = conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			n, readErr := conn.Read(buf)
+			if n > 0 {
+				output.Write(buf[:n])
+			}
+			if readErr != nil && !os.IsTimeout(readErr) {
+				return strings.Contains(output.String(), needle)
+			}
+		}
+		return strings.Contains(output.String(), needle)
+	}
+	// Wait until the child has printed its startup size and installed the
+	// WINCH trap, otherwise a resize can arrive before the handler exists.
+	if !readUntil("SIZE 40 120", 2*time.Second) {
+		t.Fatalf("initial PTY size output = %q", output.String())
+	}
+	if err := terminal.WriteResize(conn, 140, 50); err != nil {
+		t.Fatal(err)
+	}
+	if !readUntil("SIZE 50 140", 2*time.Second) {
+		t.Fatalf("resized PTY size output = %q", output.String())
 	}
 }
 

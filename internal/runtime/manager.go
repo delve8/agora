@@ -196,7 +196,13 @@ func managedHostCapabilities() session.Capabilities {
 // conversation that looks like lost history. The observer flips it back on as
 // soon as it resolves the transcript.
 func applyManagedHistoryCapability(value *session.Session) {
-	value.Capabilities.CanReadHistory = strings.TrimSpace(value.HistoryPath) != ""
+	path := strings.TrimSpace(value.HistoryPath)
+	if path == "" {
+		value.Capabilities.CanReadHistory = false
+		return
+	}
+	_, err := os.Stat(path)
+	value.Capabilities.CanReadHistory = err == nil
 }
 
 // hostSessionID resolves the canonical session id a Host client is currently

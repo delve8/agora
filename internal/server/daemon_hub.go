@@ -388,6 +388,7 @@ func (h *daemonHub) handleFrame(c *daemonConnection, frame protocol.Envelope) er
 		}
 		delete(h.sessions[c.id], payload.OldSessionID)
 		delete(h.routes, payload.OldSessionID)
+		existing := h.sessions[c.id][payload.NewSessionID]
 		old.SessionID = payload.NewSessionID
 		old.Agent = identity.Agent
 		old.AgentSessionID = identity.AgentSessionID
@@ -395,11 +396,17 @@ func (h *daemonHub) handleFrame(c *daemonConnection, frame protocol.Envelope) er
 			old.HistoryPath = payload.HistoryPath
 		}
 		old.DaemonID = c.id
+		// Keep the live process: a previously discovered history row for the
+		// same canonical id must not overwrite the running PID with 0.
+		if old.PID == 0 && existing.PID > 0 {
+			old.PID = existing.PID
+		}
 		if h.sessions[c.id] == nil {
 			h.sessions[c.id] = make(map[string]protocol.SessionSummary)
 		}
 		h.sessions[c.id][payload.NewSessionID] = old
 		h.routes[payload.NewSessionID] = c.id
+		h.removeHistoryAliasLocked(c.id, old)
 		h.mu.Unlock()
 		return nil
 	case protocol.SessionUpdate:

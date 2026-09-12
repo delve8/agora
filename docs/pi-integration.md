@@ -14,7 +14,7 @@ Pi 是 Agora 首个非 Claude Agent 的推荐接入对象。它不应被套进 C
 Pi managed process
   ├── control/input: Agora-owned PTY（普通 Pi TUI）
   ├── live screen: VT emulator -> Web /pty/snapshot
-  ├── native attach: Unix socket -> agora attach / pi-wrapper
+  ├── native attach: Unix socket -> agora attach / pi-wrapper（同步终端尺寸）
   ├── history: 本地追加式 session JSONL -> Web/SSE
   └── lifecycle: Pi TUI 与 RPC 模式互斥
 ```

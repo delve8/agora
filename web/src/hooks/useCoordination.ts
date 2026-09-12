@@ -41,10 +41,12 @@ export function useCoordination() {
       // preserving only the string ID would make the UI jump to the first
       // session (or show a different workspace). Match the replacement by
       // the stable live-process tuple and follow the rebind automatically.
+      // When the target was already listed as history, the old live row is
+      // gone and that history row becomes live under the same process.
       if (!nextSelectedID && previousSelectedID) {
         const previous = previousSessions.find((session) => session.id === previousSelectedID);
         const replacement = previous && (previous.process_id ?? 0) > 0
-          ? state.sessions.find((session) => session.id !== previousSelectedID && session.daemon_id === previous.daemon_id && session.agent === previous.agent && session.workspace === previous.workspace && session.process_id === previous.process_id && session.capabilities.can_send_input)
+          ? state.sessions.find((session) => session.daemon_id === previous.daemon_id && session.agent === previous.agent && session.workspace === previous.workspace && session.process_id === previous.process_id && session.capabilities.can_send_input)
           : undefined;
         nextSelectedID = replacement?.id ?? "";
       }

@@ -77,11 +77,7 @@ type rawFrame struct {
 	Data       []byte
 }
 
-const (
-	defaultPTYCols       = 120
-	defaultPTYRows       = 40
-	defaultRawFrameLimit = 32
-)
+const defaultRawFrameLimit = 32
 
 func looksLikeApprovalPrompt(snapshot terminal.Snapshot) bool {
 	text := strings.ToLower(strings.Join(snapshot.Lines, "\n"))
@@ -90,9 +86,27 @@ func looksLikeApprovalPrompt(snapshot terminal.Snapshot) bool {
 
 func newPTYObservation() *ptyObservation {
 	return &ptyObservation{
-		emulator: terminal.NewVT10x(defaultPTYCols, defaultPTYRows),
+		emulator: terminal.NewVT10x(terminal.DefaultCols, terminal.DefaultRows),
 		capacity: defaultRawFrameLimit,
 	}
+}
+
+func (o *ptyObservation) resize(cols, rows int) {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.emulator.Resize(cols, rows)
+}
+
+func resizePTY(master *os.File, observation *ptyObservation, cols, rows int) {
+	cols, rows, ok := terminal.ClampSize(cols, rows)
+	if !ok || master == nil {
+		return
+	}
+	_ = pty.Setsize(master, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
+	observation.resize(cols, rows)
 }
 
 func (o *ptyObservation) record(data []byte) bool {
@@ -222,7 +236,7 @@ func (m *PTYManager) launch(agoraID, workspace, claudeSession string, freshSessi
 	cmd.Dir = workspace
 	cmd.Env = cleanClaudeEnv()
 
-	file, err := pty.Start(cmd)
+	file, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: terminal.DefaultCols, Rows: terminal.DefaultRows})
 	if err != nil {
 		return nil, fmt.Errorf("start claude PTY: %w", err)
 	}
@@ -532,7 +546,9 @@ func (m *PTYManager) serveAttach(session *PTYSession) {
 				}
 			}()
 			// Client keyboard -> master, while observing submitted lines.
-			copyTerminalInput(master, c.conn, func() string { m.mu.Lock(); defer m.mu.Unlock(); return session.AgoraID }, session.inputHandler)
+			copyTerminalInput(master, c.conn, func() string { m.mu.Lock(); defer m.mu.Unlock(); return session.AgoraID }, session.inputHandler, func(cols, rows int) {
+				resizePTY(master, session.observation, cols, rows)
+			})
 		}(c)
 	}
 }

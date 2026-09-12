@@ -606,6 +606,7 @@ Daemon 重启不应关闭 `attach.sock`。如果 wrapper 连接依赖 Daemon 返
 - 多个 attach client 的输入广播和互斥策略由 Host 负责；
 - terminal raw bytes 不进入 Server 持久化；
 - Web 的只读 snapshot 是可选能力，不应依赖 wrapper 在线；
+- attach 时 wrapper 把本地终端尺寸发给 Host；Host 对 PTY 做 `Setsize`，并同步只读 snapshot emulator。Agent 启动时先用 120x40 默认窗口（Pi 在 0x0 会退出），attach 后被真实窗口覆盖，后续 `SIGWINCH` 继续同步。键盘和尺寸都走 framed attach 协议，resize 不会被当成按键；
 - wrapper 的本地 attach client 可能在 Daemon 重启期间遇到短暂断线，产品上可以通过 reconnect 或重新执行 attach 恢复；
 - 若要求现有 wrapper 连接完全无感知地跨 Daemon 重启，则 wrapper 必须直接连接稳定的 Host attach socket，而不是连接 Daemon-owned socket。
 

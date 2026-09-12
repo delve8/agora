@@ -103,6 +103,34 @@ func TestDaemonSessionUpdateRemovesHistoryAlias(t *testing.T) {
 	}
 }
 
+func TestDaemonSessionRebindRemovesHistoryAlias(t *testing.T) {
+	hub := newDaemonHub()
+	connection := &daemonConnection{id: "daemon-1", lastSeen: time.Now().UTC()}
+	hub.devices[connection.id] = connection
+	hub.sessions[connection.id] = map[string]protocol.SessionSummary{
+		"daemon/daemon-1/pi://fresh": {SessionID: "daemon/daemon-1/pi://fresh", DaemonID: connection.id, Agent: "pi", AgentSessionID: "pi://fresh", State: session.StateRunning, Connection: session.ConnectionObserved, PID: 42},
+	}
+	hub.history[connection.id] = map[string]protocol.HistorySessionSummary{
+		"daemon/daemon-1/pi://picked": {SessionID: "daemon/daemon-1/pi://picked", DaemonID: connection.id, Agent: "pi", AgentSessionID: "pi://picked", HistoryPath: "/tmp/pi/picked.jsonl", DisplayName: "older conversation"},
+	}
+	rebind, err := protocol.NewEnvelope(protocol.SessionRebind, protocol.SessionRebindPayload{
+		OldSessionID: "daemon/daemon-1/pi://fresh", NewSessionID: "daemon/daemon-1/pi://picked", DaemonID: connection.id, Agent: "pi", AgentSessionID: "pi://picked", HistoryPath: "/tmp/pi/picked.jsonl",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := hub.handleFrame(connection, rebind); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := hub.historySession("daemon/daemon-1/pi://picked", "coord-1"); ok {
+		t.Fatal("history alias survived managed session rebind")
+	}
+	live, ok := hub.sessions[connection.id]["daemon/daemon-1/pi://picked"]
+	if !ok || live.PID != 42 {
+		t.Fatalf("rebound live session = %+v, ok=%v", live, ok)
+	}
+}
+
 func TestSameHostOrigin(t *testing.T) {
 	req := httptest.NewRequest("GET", "http://127.0.0.1:8080/api/daemon/ws", nil)
 	if !sameHostOrigin(req, "http://127.0.0.1:8080") {

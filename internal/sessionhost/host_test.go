@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/delve8/agora/internal/terminal"
 )
 
 func TestHostLifecycleAndAuthenticatedControl(t *testing.T) {
@@ -184,6 +186,71 @@ func TestAttachReplaysTheCurrentScreen(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("an attaching client never saw the screen the Agent painted")
+}
+
+func TestAttachResizesThePTY(t *testing.T) {
+	runtimeDir := t.TempDir()
+	host, err := New(Config{
+		HostID:     "host-resize",
+		SessionID:  "daemon/test/pi://native-resize",
+		DaemonID:   "test",
+		Agent:      "pi",
+		Workspace:  t.TempDir(),
+		Command:    []string{"/bin/sh", "-c", "sleep 30"},
+		RuntimeDir: runtimeDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- host.Run() }()
+	var client *Client
+	t.Cleanup(func() {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		if client != nil {
+			stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = client.Stop(stopCtx)
+		}
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("host did not exit after stopping its Agent")
+		}
+	})
+
+	metadataPath := filepath.Join(runtimeDir, "metadata.json")
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, statErr := os.Stat(metadataPath); statErr == nil {
+			if client, err = NewClient(metadataPath); err == nil {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if client == nil {
+		t.Fatalf("host did not become controllable: %v", err)
+	}
+
+	conn := dialAttach(t, client.AttachSocket())
+	if err := terminal.WriteResize(conn, 140, 50); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var snapshot terminal.Snapshot
+		if err := client.Call(context.Background(), "snapshot", nil, &snapshot); err == nil && snapshot.Cols == 140 && snapshot.Rows == 50 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("attaching client never resized the PTY")
 }
 
 func dialAttach(t *testing.T, socket string) net.Conn {

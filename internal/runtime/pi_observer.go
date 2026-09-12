@@ -104,6 +104,12 @@ func (m *Manager) observePi(ctx context.Context, value session.Session, token ui
 					m.markObservationError(value, readErr)
 				}
 			} else {
+				if value.HistoryPath != cursor.Path || !value.Capabilities.CanReadHistory {
+					value.HistoryPath = cursor.Path
+					applyManagedHistoryCapability(&value)
+					_ = m.store.UpdateSessionObservation(ctx, value)
+					m.notifySessionUpdate(value)
+				}
 				for _, record := range records {
 					// Pi persists an explicit name as a session_info entry. It is
 					// authoritative and must win over the first prompt fallback.
@@ -164,6 +170,11 @@ func (m *Manager) PiHistoryForSession(ctx context.Context, value session.Session
 		return []event.Event{}, nil
 	}
 	records, err := adapter.ReadPiHistory(ctx, adapter.PiHistoryCursor{Path: value.HistoryPath}, value.ID)
+	if os.IsNotExist(err) {
+		// /new reports the future JSONL path before Pi creates the file. Treat
+		// that as an empty transcript instead of failing the UI history request.
+		return []event.Event{}, nil
+	}
 	if err != nil {
 		return nil, err
 	}

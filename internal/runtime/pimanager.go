@@ -291,10 +291,10 @@ func (m *PiManager) start(id, workspace, nativeID, historyPath string, agentArgs
 	// parent session or treat the child as a nested/headless agent. Provider
 	// credentials and normal terminal variables are intentionally preserved.
 	cmd.Env = cleanPiEnv()
-	// Pi's TUI exits when the PTY starts with a 0x0 window size. Claude's
-	// manager also uses a fixed initial viewport; resize the Pi PTY before the
-	// process starts so its first terminal query returns a usable size.
-	master, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: defaultPTYCols, Rows: defaultPTYRows})
+	// Pi's TUI exits when the PTY starts with a 0x0 window size. Start from a
+	// usable default; the wrapper overwrites it with the real terminal size as
+	// soon as it attaches, including later SIGWINCH updates.
+	master, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: terminal.DefaultCols, Rows: terminal.DefaultRows})
 	if err != nil {
 		return nil, fmt.Errorf("start Pi TUI: %w", err)
 	}
@@ -626,7 +626,9 @@ func (m *PiManager) serveAttach(p *PiProcess) {
 					}
 				}
 			}()
-			copyTerminalInput(p.master, conn, func() string { p.mu.Lock(); defer p.mu.Unlock(); return p.AgoraID }, p.inputHandler)
+			copyTerminalInput(p.master, conn, func() string { p.mu.Lock(); defer p.mu.Unlock(); return p.AgoraID }, p.inputHandler, func(cols, rows int) {
+				resizePTY(p.master, p.observation, cols, rows)
+			})
 		}()
 	}
 }
