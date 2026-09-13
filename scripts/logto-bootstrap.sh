@@ -45,8 +45,12 @@ chmod 700 "$STATE_DIR"
 fail() { echo "error: $*" >&2; exit 1; }
 
 # --- 1. m-default secret (never echoed) ---
-PG_CONTAINER="$("$PODMAN" compose -f "$COMPOSE_FILE" --project-name "$PROJECT" ps -q postgres 2>/dev/null | head -1)"
-[ -n "$PG_CONTAINER" ] || fail "Logto postgres container is not running (run scripts/logto-up.sh first)"
+# LOGTO_POSTGRES_CONTAINER lets `podman/docker run` stacks skip compose.
+PG_CONTAINER="${LOGTO_POSTGRES_CONTAINER:-}"
+if [ -z "$PG_CONTAINER" ]; then
+  PG_CONTAINER="$("$PODMAN" compose -f "$COMPOSE_FILE" --project-name "$PROJECT" ps -q postgres 2>/dev/null | head -1)"
+fi
+[ -n "$PG_CONTAINER" ] || fail "Logto postgres container is not running (run scripts/logto-up.sh or scripts/agora-up.sh first)"
 SECRET="$("$PODMAN" exec "$PG_CONTAINER" psql -U postgres -d logto -A -t \
   -c "select secret from applications where id='m-default';" 2>/dev/null | tr -d '[:space:]')"
 [ -n "$SECRET" ] || fail "could not read m-default secret (is Logto seeded yet?)"

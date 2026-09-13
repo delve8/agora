@@ -218,6 +218,19 @@ The image contains the API, the Daemon relay, and the Web UI. Agents do not run
 in it: their processes, PTYs, and provider history stay on the workstation that
 runs `agora daemon`.
 
+One command starts or updates Agora Server plus a local Logto and its Postgres, using only `podman run` / `docker run` (no compose). Named volumes keep data across replacements:
+
+```bash
+./scripts/agora-up.sh          # or: make agora-up
+./scripts/agora-up.sh status   # or: make agora-status
+./scripts/agora-up.sh down     # stop containers, keep volumes
+./scripts/agora-up.sh purge    # stop containers and delete volumes
+```
+
+That stack binds loopback by default (`http://127.0.0.1:8080`, Logto at `:3003`, admin at `:3004`) and provisions the Agora SPA / API resource / bootstrap user the same way `make server` does. Re-running `agora-up` pulls newer images and recreates the three containers without wiping Postgres or the Agora SQLite volume.
+
+To run only the Server against an already-provisioned Logto:
+
 ```bash
 podman run -d --name agora \
   -p 8080:8080 \
@@ -289,6 +302,10 @@ make logto-up     # start the local Logto + PostgreSQL stack
 make logto-status # show local Logto container status
 make logto-down   # stop local Logto, retaining its database volume
 make logto-purge  # stop local Logto and remove its database volume
+make agora-up     # deploy/update Server + Logto + Postgres with docker/podman run
+make agora-status # show those containers
+make agora-down   # stop them, keep volumes
+make agora-purge  # stop them and delete volumes
 ```
 
 `make server` is the deployable browser entry point: it builds `web/dist` and serves the Web UI together with the API and daemon WebSocket endpoint. The browser should open the Server URL directly.

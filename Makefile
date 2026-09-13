@@ -47,7 +47,8 @@ LOGTO_POSTGRES_PASSWORD ?= agora-logto-dev
 
 .PHONY: all build build-go build-web web-install test e2e vet fmt clean \
         local server server-local daemon web start \
-        logto-up logto-bootstrap logto-down logto-purge logto-status install-wrapper
+        logto-up logto-bootstrap logto-down logto-purge logto-status \
+        agora-up agora-status agora-down agora-purge install-wrapper
 
 all: build
 
@@ -146,6 +147,20 @@ logto-purge:
 
 logto-status:
 	$(PODMAN) compose -f "$(LOGTO_COMPOSE_FILE)" --project-name "$(LOGTO_PROJECT)" ps
+
+# Container-only stack (docker/podman run, no compose). Replaces Agora Server,
+# Logto, and Logto's Postgres while keeping named volumes.
+agora-up:
+	ENGINE="$(PODMAN)" ./scripts/agora-up.sh up
+
+agora-status:
+	ENGINE="$(PODMAN)" ./scripts/agora-up.sh status
+
+agora-down:
+	ENGINE="$(PODMAN)" ./scripts/agora-up.sh down
+
+agora-purge:
+	ENGINE="$(PODMAN)" ./scripts/agora-up.sh purge
 
 install-wrapper: build-go
 	@mkdir -p "$(AGORA_WRAPPER_DIR)"
