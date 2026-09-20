@@ -204,15 +204,12 @@ Daemon 只部署在运行 Agent 的用户工作站上。Server 是远程控制�
 产品化安装入口由 Server Web UI 提供。用户在 Web UI 添加设备后，获得固定 HTTPS 安装脚本、短期一次性 pairing code 和类似下面的命令：
 
 ```bash
-curl -fsSL https://agora.example.com/download/install.sh \\
-  | sh -s -- \\
-  --server https://agora.example.com \\
-  --pair <one-time-code>
+curl -fsSL https://agora.example.com/download/install.sh | sh -s -- --pair <one-time-code>
 ```
 
-计划中的脚本负责检测平台/架构、下载并校验发行包、完成配对、写入当前用户的 Server URL 和 device credential，并注册和启动对应的用户级服务。它不默认提权、不写系统级服务，长期 credential 不进入命令行参数、服务环境变量或普通日志。`agora daemon --pair <code>` 仍可作为开发/调试底层入口，但 `agora daemon install` 不作为一期终端用户入口。
+安装脚本负责检测平台/架构、下载并校验发行包、完成配对、写入当前用户的 Server URL 和 device credential，并注册和启动对应的用户级服务。它不默认提权、不写系统级服务，长期 credential 不进入命令行参数、服务环境变量或普通日志。`agora daemon --pair <code>` 仍可作为开发/调试底层入口，但 `agora daemon install` 不作为一期终端用户入口。
 
-上述安装脚本和服务注册属于产品化目标，不代表当前仓库已经提供下载端点或安装器。当前源码树中的 `make server`、`make start` 和 `make local` 仍是开发/试跑流程。Daemon 自更新、Windows Daemon、以及在工作站安装 Server 均不属于一期范围。
+上述下载端点（`/download/install.sh`、`/download/agora-<os>-<arch>`、`/download/checksums.txt`）和用户级服务注册已经由 Server 提供：镜像构建时交叉编译 linux/darwin 的 amd64/arm64 Daemon 并放进 `AGORA_DOWNLOAD_DIR`，安装脚本用 `AGORA_PUBLIC_URL` 渲染。`make server`、`make start` 和 `make local` 仍是开发/试跑流程。Daemon 自更新、Windows Daemon、以及在工作站安装 Server 仍不属于一期范围。
 
 ## 7. 一期不包含
 

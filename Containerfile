@@ -31,6 +31,24 @@ ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags="-s -w" -o /out/agora ./cmd/agora
 
+# ------------------------------------------------ Daemon binaries (download)
+# Workstations get a prebuilt daemon from the Server, so they need no Go
+# toolchain. Cross-compile every supported platform and publish the results
+# under /download (served by internal/server/download.go).
+FROM golang:1.25-alpine AS daemons
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN set -eux; \
+    mkdir -p /out/download; \
+    for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do \
+      os=${target%/*}; arch=${target#*/}; \
+      CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+        go build -trimpath -ldflags="-s -w" -o "/out/download/agora-$os-$arch" ./cmd/agora; \
+    done; \
+    cd /out/download && sha256sum agora-* > checksums.txt
+
 # ------------------------------------------------------------------- Runtime
 FROM alpine:3
 # ca-certificates: the Server talks to Logto over HTTPS and to webhooks.
@@ -39,11 +57,13 @@ RUN apk add --no-cache ca-certificates tzdata \
     && adduser -D -u 10001 agora
 
 COPY --from=build /out/agora /app/agora
+COPY --from=daemons /out/download /app/download
 COPY --from=web /src/web/dist /app/web
 
 ENV AGORA_WEB_DIR=/app/web \
     AGORA_SERVER_DB=/data/server.db \
     AGORA_SERVER_ADDR=0.0.0.0:8080 \
+    AGORA_DOWNLOAD_DIR=/app/download \
     AGORA_AUTH_MODE=logto
 
 # AGORA_SERVER_ADDR is a non-loopback address, so local trust mode refuses to

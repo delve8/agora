@@ -11,7 +11,8 @@ import (
 )
 
 type File struct {
-	DaemonID string `json:"daemon_id"`
+	DaemonID  string `json:"daemon_id"`
+	ServerURL string `json:"server_url,omitempty"`
 }
 
 func ResolveDaemonID(override, path string) (string, error) {
@@ -25,25 +26,41 @@ func ResolveDaemonID(override, path string) (string, error) {
 		path = defaultPath()
 	}
 	value, err := load(path)
-	if err == nil {
-		return value.DaemonID, nil
-	}
-	if !os.IsNotExist(err) {
+	if err != nil && !os.IsNotExist(err) {
 		return "", err
+	}
+	if value.DaemonID != "" {
+		return value.DaemonID, nil
 	}
 	id, err := newUUID()
 	if err != nil {
 		return "", err
 	}
-	if err := save(path, File{DaemonID: id}); err != nil {
+	value.DaemonID = id
+	if err := save(path, value); err != nil {
 		return "", err
 	}
 	return id, nil
 }
 
+// ResolveServerURL returns the Server URL remembered from pairing, so a daemon
+// started later (for example by a service manager after a reboot) connects to
+// the same Server without AGORA_SERVER_URL being exported in its environment.
+func ResolveServerURL(path string) (string, error) {
+	if path == "" {
+		path = defaultPath()
+	}
+	value, err := load(path)
+	if err != nil {
+		return "", err
+	}
+	return value.ServerURL, nil
+}
+
 // SaveDaemonID atomically persists an explicit daemon identity (e.g. the
 // device_id returned by pairing) so later runs resolve the same id without
-// an override. It replaces any previously stored UUID identity.
+// an override. It replaces any previously stored UUID identity while keeping
+// the remembered Server URL.
 func SaveDaemonID(path, id string) error {
 	id = strings.TrimSpace(id)
 	if err := validateDaemonID(id); err != nil {
@@ -52,7 +69,45 @@ func SaveDaemonID(path, id string) error {
 	if path == "" {
 		path = defaultPath()
 	}
-	return save(path, File{DaemonID: id})
+	value, err := loadForUpdate(path)
+	if err != nil {
+		return err
+	}
+	value.DaemonID = id
+	return save(path, value)
+}
+
+// SaveServerURL remembers the Server the daemon was paired with.
+func SaveServerURL(path, serverURL string) error {
+	serverURL = strings.TrimRight(strings.TrimSpace(serverURL), "/")
+	if serverURL == "" {
+		return fmt.Errorf("server url is empty")
+	}
+	if path == "" {
+		path = defaultPath()
+	}
+	value, err := loadForUpdate(path)
+	if err != nil {
+		return err
+	}
+	value.ServerURL = serverURL
+	return save(path, value)
+}
+
+// loadForUpdate reads the config, tolerating a missing file so the caller can
+// create it by saving the returned value.
+func loadForUpdate(path string) (File, error) {
+	if path == "" {
+		path = defaultPath()
+	}
+	value, err := load(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return File{}, nil
+		}
+		return File{}, err
+	}
+	return value, nil
 }
 
 func DeviceCredentialPath(override string) string {
@@ -125,8 +180,12 @@ func load(path string) (File, error) {
 	if err := json.Unmarshal(body, &value); err != nil {
 		return File{}, fmt.Errorf("decode Agora config %s: %w", path, err)
 	}
-	if err := validateDaemonID(value.DaemonID); err != nil {
-		return File{}, fmt.Errorf("invalid Agora config %s: %w", path, err)
+	// A config that only remembers a Server URL (no daemon id yet) is valid;
+	// any stored id still has to be well formed.
+	if value.DaemonID != "" {
+		if err := validateDaemonID(value.DaemonID); err != nil {
+			return File{}, fmt.Errorf("invalid Agora config %s: %w", path, err)
+		}
 	}
 	return value, nil
 }

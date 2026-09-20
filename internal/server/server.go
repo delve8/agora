@@ -41,6 +41,11 @@ type Server struct {
 	// unauthenticated from /api/config so the bundle does not have to be built
 	// per tenant.
 	logtoClient config.LogtoClientConfig
+	// publicURL is the externally reachable Server URL (AGORA_PUBLIC_URL). It is
+	// baked into the daemon install script; when empty the request host is used.
+	publicURL string
+	// downloadDir holds the prebuilt daemon binaries published under /download.
+	downloadDir string
 
 	notifyMu       sync.Mutex
 	notifyPolicies map[string]*notification.Policy
@@ -75,6 +80,8 @@ func NewWithWebDirAndAuth(addr string, db *store.Store, manager *runtime.Manager
 		store: db, manager: manager, daemons: newDaemonHub(db, authConfig.Mode),
 		auth:           auth.NewAuthenticatorWithProvisioning(authConfig.Mode, validator, db, local, authConfig.Provisioning),
 		logtoClient:    config.ResolveLogtoClientConfig(authConfig.Issuer, os.Getenv("AGORA_LOGTO_ENDPOINT"), os.Getenv("AGORA_LOGTO_APP_ID"), authConfig.Audience),
+		publicURL:      os.Getenv("AGORA_PUBLIC_URL"),
+		downloadDir:    os.Getenv("AGORA_DOWNLOAD_DIR"),
 		notifyPolicies: make(map[string]*notification.Policy),
 	}
 	s.daemons.onEvents = s.notifyObservedEvents
@@ -93,6 +100,10 @@ func NewWithWebDirAndAuth(addr string, db *store.Store, manager *runtime.Manager
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
+	// Daemon installer and prebuilt binaries. Public like /healthz: the pairing
+	// code, not the download, is the secret.
+	mux.HandleFunc("GET /download/install.sh", s.installScript)
+	mux.HandleFunc("GET /download/{name}", s.downloadArtifact)
 	// Public client configuration: the browser needs it before it can log in.
 	mux.HandleFunc("GET /api/config", s.publicConfig)
 	mux.HandleFunc("GET /api/daemon/ws", s.daemons.serveHTTP)

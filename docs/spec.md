@@ -517,13 +517,10 @@ Daemon 只部署在运行 Agent 的用户工作站上。Server 是远程控制�
 产品化一期的目标入口由 Server Web UI 提供，而不是要求用户先安装 Agora 再执行独立安装命令。用户在 Web UI 中添加设备后，Server 提供固定 HTTPS 安装脚本入口和一次性 pairing code；目标工作站执行的命令形态为：
 
 ```bash
-curl -fsSL https://agora.example.com/download/install.sh \\
-  | sh -s -- \\
-  --server https://agora.example.com \\
-  --pair <one-time-code>
+curl -fsSL https://agora.example.com/download/install.sh | sh -s -- --pair <one-time-code>
 ```
 
-安装脚本是计划中的产品化能力，目标职责依次为：
+安装脚本的职责依次为：
 
 1. 检测操作系统和 CPU 架构；
 2. 下载对应 Daemon 发行包，并校验 checksum 或签名；
@@ -534,7 +531,7 @@ curl -fsSL https://agora.example.com/download/install.sh \\
 
 脚本只做用户目录安装，不默认提权或写入系统级服务。长期 credential 不得进入命令行参数、服务环境变量、普通日志或 Web UI；pairing code 只能短期、一次性使用。后续升级必须保留用户配置和 credential，并由发行包/安装脚本负责替换和重启，不在一期引入 Daemon 自更新。
 
-`agora daemon` 仍是前台运行入口；现有 `agora daemon --pair <code>` 可以保留为底层开发、调试和自动化测试能力，但 `agora daemon install` 不作为产品化一期的终端用户入口。安装脚本、下载端点、发行包校验和服务注册在实现完成前均属于目标方案，不应视为当前仓库已经提供的功能。
+`agora daemon` 仍是前台运行入口；现有 `agora daemon --pair <code>` 可以保留为底层开发、调试和自动化测试能力，但 `agora daemon install` 不作为产品化一期的终端用户入口。安装脚本、下载端点、发行包校验和服务注册已经实现：Server 提供 `GET /download/install.sh`（用 `AGORA_PUBLIC_URL` 渲染）、`GET /download/agora-<os>-<arch>` 与 `GET /download/checksums.txt`（从 `AGORA_DOWNLOAD_DIR` 读取镜像构建时交叉编译的发行包）；一次性配对由 `agora pair <code>` 完成，它会把 credential、`device_id` 和 Server URL 一并写入 `~/.agora/`，因此后台服务无需环境变量即可重连。
 
 ## 8. 用户界面
 

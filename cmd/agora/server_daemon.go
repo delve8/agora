@@ -62,7 +62,7 @@ func runDaemon(pairCode string) error {
 	d, err := daemon.New(daemon.Config{
 		ID:                 daemonID,
 		Version:            firstEnv("AGORA_VERSION", "dev"),
-		ServerURL:          daemonWSURL(firstEnv("AGORA_SERVER_URL", "http://127.0.0.1:8080")),
+		ServerURL:          daemonWSURL(resolveDaemonServerURL(os.Getenv("AGORA_CONFIG_PATH"))),
 		Credential:         credential,
 		CredentialPath:     os.Getenv("AGORA_DEVICE_CREDENTIAL_PATH"),
 		ClaudeBinary:       os.Getenv("AGORA_CLAUDE_BINARY"),
@@ -93,26 +93,7 @@ func resolveDaemonIdentity(pairCode, configPath, credentialPath string) (string,
 		if override := strings.TrimSpace(os.Getenv("AGORA_DAEMON_ID")); override != "" {
 			return "", "", fmt.Errorf("AGORA_DAEMON_ID cannot be combined with --pair: pairing binds the daemon to a server-issued device_id")
 		}
-		// Default the device alias to the hostname so paired devices are
-		// distinguishable in the web device list without requiring the user to
-		// set AGORA_DEVICE_NAME.
-		deviceName := strings.TrimSpace(os.Getenv("AGORA_DEVICE_NAME"))
-		if deviceName == "" {
-			if hostname, hostErr := os.Hostname(); hostErr == nil {
-				deviceName = strings.TrimSpace(hostname)
-			}
-		}
-		deviceID, credential, err := pairDevice(firstEnv("AGORA_SERVER_URL", "http://127.0.0.1:8080"), pairCode, deviceName)
-		if err != nil {
-			return "", "", err
-		}
-		if err := config.SaveDeviceCredential(credentialPath, credential); err != nil {
-			return "", "", err
-		}
-		if err := config.SaveDaemonID(configPath, deviceID); err != nil {
-			return "", "", err
-		}
-		return deviceID, credential, nil
+		return pairAndPersist(firstEnv("AGORA_SERVER_URL", defaultServerURL), pairCode, configPath, credentialPath)
 	}
 	daemonID, err := config.ResolveDaemonID(os.Getenv("AGORA_DAEMON_ID"), configPath)
 	if err != nil {
@@ -123,6 +104,88 @@ func resolveDaemonIdentity(pairCode, configPath, credentialPath string) (string,
 		credential, _ = config.LoadDeviceCredential(credentialPath)
 	}
 	return daemonID, credential, nil
+}
+
+const defaultServerURL = "http://127.0.0.1:8080"
+
+// resolveDaemonServerURL decides which Server the daemon connects to: the
+// AGORA_SERVER_URL override wins, then the URL remembered during pairing, then
+// the local default.
+func resolveDaemonServerURL(configPath string) string {
+	if value := firstEnv("AGORA_SERVER_URL"); value != "" {
+		return value
+	}
+	if value, err := config.ResolveServerURL(configPath); err == nil && strings.TrimSpace(value) != "" {
+		return value
+	}
+	return defaultServerURL
+}
+
+// pairAndPersist exchanges a pairing code for a device credential and remembers
+// everything a later daemon start needs: the credential, the device id and the
+// Server URL.
+func pairAndPersist(serverURL, pairCode, configPath, credentialPath string) (string, string, error) {
+	// Default the device alias to the hostname so paired devices are
+	// distinguishable in the web device list without requiring the user to
+	// set AGORA_DEVICE_NAME.
+	deviceName := strings.TrimSpace(os.Getenv("AGORA_DEVICE_NAME"))
+	if deviceName == "" {
+		if hostname, hostErr := os.Hostname(); hostErr == nil {
+			deviceName = strings.TrimSpace(hostname)
+		}
+	}
+	deviceID, credential, err := pairDevice(serverURL, pairCode, deviceName)
+	if err != nil {
+		return "", "", err
+	}
+	if err := config.SaveDeviceCredential(credentialPath, credential); err != nil {
+		return "", "", err
+	}
+	if err := config.SaveDaemonID(configPath, deviceID); err != nil {
+		return "", "", err
+	}
+	if err := config.SaveServerURL(configPath, serverURL); err != nil {
+		return "", "", err
+	}
+	return deviceID, credential, nil
+}
+
+// runPair completes pairing as a one-shot: it writes the device credential, the
+// device id and the Server URL, then exits. The daemon then starts as an
+// ordinary service, which is what the download installer configures.
+func runPair(args []string) error {
+	var serverURL, pairCode string
+	for index := 0; index < len(args); index++ {
+		switch value := args[index]; {
+		case value == "--server":
+			if index+1 >= len(args) {
+				return fmt.Errorf("--server requires a value")
+			}
+			index++
+			serverURL = args[index]
+		case strings.HasPrefix(value, "--server="):
+			serverURL = strings.TrimPrefix(value, "--server=")
+		case strings.HasPrefix(value, "-"):
+			return fmt.Errorf("unknown flag %q", value)
+		default:
+			if pairCode != "" {
+				return fmt.Errorf("pair accepts a single pairing code")
+			}
+			pairCode = value
+		}
+	}
+	if strings.TrimSpace(pairCode) == "" {
+		return fmt.Errorf("pair requires a pairing code")
+	}
+	if strings.TrimSpace(serverURL) == "" {
+		serverURL = firstEnv("AGORA_SERVER_URL", defaultServerURL)
+	}
+	deviceID, _, err := pairAndPersist(serverURL, pairCode, os.Getenv("AGORA_CONFIG_PATH"), os.Getenv("AGORA_DEVICE_CREDENTIAL_PATH"))
+	if err != nil {
+		return err
+	}
+	fmt.Printf("paired device %s with %s\n", deviceID, strings.TrimRight(serverURL, "/"))
+	return nil
 }
 
 func pairDevice(serverURL, code, name string) (deviceID, credential string, err error) {

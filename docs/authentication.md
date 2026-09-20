@@ -163,16 +163,16 @@ web_auth_sessions                 # 后续 BFF/session-cookie 演进
 
 1. 用户在 Web UI（已登录）点击“添加设备”；
 2. Server 生成一次性 pairing code，`pair_codes` 记录 `code_hash -> user_id`，短时效（如 10 分钟）；
-3. Web UI 展示固定 HTTPS 安装脚本和一次性 code，用户在目标工作站执行类似 `curl -fsSL https://agora.example.com/download/install.sh | sh -s -- --server https://agora.example.com --pair <one-time-code>` 的命令；
+3. Web UI 展示固定 HTTPS 安装脚本和一次性 code，用户在目标工作站执行类似 `curl -fsSL https://agora.example.com/download/install.sh | sh -s -- --pair <one-time-code>` 的命令；
 4. 安装脚本检测 Linux/macOS 及 CPU 架构，下载并校验对应 Daemon 发行包，然后消费 pairing code 调用配对接口；
 5. Server 验证 code 未过期、未消费，创建 `device_id -> user_id` 并发放随机高熵 device credential；
-6. 安装脚本将 Server URL、credential 和配对返回的 `device_id` 写入当前用户配置目录。当前实现的底层配对入口会将 credential 保存到 `~/.agora/device.credential`（`0600`），并把 `device_id` 写入 `~/.agora/config.json` 作为 daemon 身份；之后每次重连 `daemon.register` 的 `daemon_id` 恒等于该 `device_id`，满足 §6.2 的一致性要求；
+6. 安装脚本将 Server URL、credential 和配对返回的 `device_id` 写入当前用户配置目录。一次性配对由 `agora pair <code>` 完成：credential 保存到 `~/.agora/device.credential`（`0600`），`device_id` 与 Server URL 写入 `~/.agora/config.json`，因此后台服务无需环境变量即可重连；之后每次重连 `daemon.register` 的 `daemon_id` 恒等于该 `device_id`，满足 §6.2 的一致性要求；
 7. 安装脚本在 Linux 生成并启用 `systemd --user` service，在 macOS 生成并加载 `LaunchAgent`，以当前用户身份启动 Daemon 并等待连接确认；
 8. 之后所有 WebSocket 连接使用该 credential。
 
 安装脚本只做用户目录安装，不默认提权或写入系统级服务。pairing code 只能短期、一次性使用；长期 credential 不得进入命令行参数、服务环境变量、普通日志或 Web UI。Linux 和 macOS 是产品化一期的原生 Daemon 平台，Windows Daemon 暂不支持。
 
-`agora daemon --pair <code>` 可以保留为底层开发、调试和自动化测试入口，但不是产品化一期面向终端用户的默认安装方式；`agora daemon install` 也不作为一期用户入口。上述下载脚本、发行包校验和服务注册在实现完成前均属于目标流程。
+`agora daemon --pair <code>` 可以保留为底层开发、调试和自动化测试入口，但不是产品化一期面向终端用户的默认安装方式；`agora daemon install` 也不作为一期用户入口。下载脚本、发行包校验和服务注册已经由 Server 和安装脚本实现，具体见 §6.1 与仓库 README 的 Daemon installation 一节。
 
 **归属在配对时决定，连接时只验证。** 陌生 Daemon 无法自证归属；归属只能由已认证用户在配对时声明。
 

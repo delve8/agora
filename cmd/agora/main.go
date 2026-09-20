@@ -18,7 +18,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: agora serve | agora server | agora daemon | agora session-host --config <path> | agora pty <args...> | agora attach [list [--all] | <#|session-id>] | agora wrap <pi|claude> [session-id|prompt...] | agora wrapper [session-id] | agora pi-wrapper [session-id]")
+		fmt.Fprintln(os.Stderr, "usage: agora serve | agora server | agora daemon | agora pair <code> [--server <url>] | agora session-host --config <path> | agora pty <args...> | agora attach [list [--all] | <#|session-id>] | agora wrap <pi|claude> [session-id|prompt...] | agora wrapper [session-id] | agora pi-wrapper [session-id]")
 		os.Exit(2)
 	}
 	var err error
@@ -39,6 +39,8 @@ func main() {
 		if err == nil {
 			err = runDaemon(pairCode)
 		}
+	case "pair":
+		err = runPair(os.Args[2:])
 	case "pty":
 		err = runPTY(os.Args[2:])
 	case "attach":
@@ -63,7 +65,7 @@ func main() {
 		// Backward-compatible alias for `agora wrap pi`.
 		err = runPiWrapper(os.Args[2:])
 	default:
-		fmt.Fprintln(os.Stderr, "usage: agora serve | agora server | agora daemon | agora session-host --config <path> | agora pty <args...> | agora attach [list [--all] | <#|session-id>] | agora wrap <pi|claude> [session-id|prompt...] | agora wrapper [session-id] | agora pi-wrapper [session-id]")
+		fmt.Fprintln(os.Stderr, "usage: agora serve | agora server | agora daemon | agora pair <code> [--server <url>] | agora session-host --config <path> | agora pty <args...> | agora attach [list [--all] | <#|session-id>] | agora wrap <pi|claude> [session-id|prompt...] | agora wrapper [session-id] | agora pi-wrapper [session-id]")
 		os.Exit(2)
 	}
 	if err != nil {

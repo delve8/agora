@@ -83,7 +83,7 @@ export function DeviceManager({ devices, refresh, onRevoked, onOpen }: DeviceMan
     }
   };
 
-  const command = code ? `AGORA_SERVER_URL=${window.location.origin} agora daemon --pair ${code}` : "";
+  const command = code ? `curl -fsSL ${window.location.origin}/download/install.sh | sh -s -- --pair ${code}` : "";
 
   const copyCommand = async () => {
     if (!command) return;
@@ -312,7 +312,7 @@ export function DeviceManager({ devices, refresh, onRevoked, onOpen }: DeviceMan
           {pairingError && <Alert type="error" showIcon message="获取配对码失败" description={pairingError} action={<Button size="small" onClick={() => void issue()}>重试</Button>} />}
           {!pairingBusy && !pairingError && code && expiresAt && <>
             <Paragraph type="secondary">
-              在目标机器上运行下面的命令，把这个 daemon 绑定到当前账号。配对码仅此一次有效，10 分钟内过期。
+              在目标机器上运行下面的命令。脚本会下载对应平台的 daemon、完成配对，并安装成用户级后台服务（Linux 用 systemd --user，macOS 用 LaunchAgent），开机自动启动。配对码仅此一次有效，10 分钟内过期。
             </Paragraph>
             <div className="pair-code-row">
               <code className="pair-code">{code}</code>
@@ -322,7 +322,7 @@ export function DeviceManager({ devices, refresh, onRevoked, onOpen }: DeviceMan
               <Statistic.Countdown title="有效期至" value={Date.parse(expiresAt)} onFinish={expirePairingCode} format="mm:ss" />
             </div>
             <div>
-              <Text type="secondary">终端里运行：</Text>
+              <Text type="secondary">在目标机器上运行：</Text>
               <div className="pair-command-row">
                 <pre className="pair-command">{command}</pre>
                 <Button
@@ -335,7 +335,7 @@ export function DeviceManager({ devices, refresh, onRevoked, onOpen }: DeviceMan
               </div>
             </div>
             <Paragraph type="secondary" style={{ marginBottom: 0 }}>
-              配对成功后 daemon 会立即连接，刷新会话列表即可看到它的会话。
+              配对成功后 daemon 会以服务方式连接，刷新会话列表即可看到它的会话；以后重启机器也会自动上线。
             </Paragraph>
             <Button icon={<ReloadOutlined />} onClick={() => void issue()}>重新生成</Button>
           </>}
