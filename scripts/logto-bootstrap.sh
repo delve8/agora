@@ -50,6 +50,10 @@ SMTP_USER="${AGORA_SMTP_USER:-}"
 SMTP_PASSWORD="${AGORA_SMTP_PASSWORD:-}"
 SMTP_FROM_EMAIL="${AGORA_SMTP_FROM_EMAIL:-}"
 SMTP_REPLY_TO="${AGORA_SMTP_REPLY_TO:-}"
+# Set AGORA_ALLOW_REGISTRATION=true to let anyone sign up with a verified email
+# address. Requires the SMTP settings above, since sign-up verifies the address.
+# Unset (the default) keeps self-registration closed on the default tenant.
+ALLOW_REGISTRATION="${AGORA_ALLOW_REGISTRATION:-}"
 
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR"
@@ -225,15 +229,15 @@ if [ -n "$ROLE_IDS" ]; then
   [ "${REQUEST_CODE}" -lt 300 ] || echo "note: could not assign admin user roles (HTTP ${REQUEST_CODE})"
 fi
 
-# --- 7. close registration and optionally enable email sign-in ---
+# --- 7. set the sign-in policy and optionally provision email sign-in ---
 # Logto flips a tenant's sign-in mode during its interactive first-admin
 # registration. Users created through the Management API bypass that flow, so
-# set the mode explicitly: sign-in only, self-registration stays closed.
+# set the modes explicitly instead of relying on the seeded default. The admin
+# tenant (the Logto console) always stays closed; only the default tenant
+# (Agora's users) can be opened up.
 request_admin PATCH "/api/sign-in-exp" '{"signInMode":"SignIn"}'
 ok || fail "set admin tenant sign-in mode failed (HTTP ${REQUEST_CODE})"
-request PATCH "/api/sign-in-exp" '{"signInMode":"SignIn"}'
-ok || fail "set default tenant sign-in mode failed (HTTP ${REQUEST_CODE})"
-echo "disabled self-registration on both tenants"
+echo "closed self-registration on the admin tenant"
 
 if [ -n "$SMTP_HOST" ] && [ -n "$SMTP_USER" ] && [ -n "$SMTP_PASSWORD" ] && [ -n "$SMTP_FROM_EMAIL" ]; then
   # AGORA_SMTP_SECURE and AGORA_SMTP_PORT have to be JSON literals for jq
@@ -280,7 +284,22 @@ if [ -n "$SMTP_HOST" ] && [ -n "$SMTP_USER" ] && [ -n "$SMTP_PASSWORD" ] && [ -n
   request PATCH "/api/sign-in-exp" '{"signIn":{"methods":[{"identifier":"email","password":false,"verificationCode":true,"isPasswordPrimary":false},{"identifier":"username","password":true,"verificationCode":false,"isPasswordPrimary":true}]}}'
   ok || fail "enable email sign-in failed (HTTP ${REQUEST_CODE})"
   echo "enabled email verification-code sign-in (username/password kept as fallback)"
+
+  if [ "$ALLOW_REGISTRATION" = "true" ]; then
+    # Open sign-up: an email address and its verification code are enough. Anyone
+    # who can receive mail at an address can create an account in this tenant.
+    request PATCH "/api/sign-in-exp" '{"signInMode":"SignInAndRegister","signUp":{"identifiers":["email"],"password":false,"verify":true}}'
+    ok || fail "enable self-registration failed (HTTP ${REQUEST_CODE})"
+    echo "enabled open registration (email verification required)"
+  else
+    request PATCH "/api/sign-in-exp" '{"signInMode":"SignIn"}'
+    ok || fail "set default tenant sign-in mode failed (HTTP ${REQUEST_CODE})"
+    echo "closed self-registration on the default tenant"
+  fi
 else
+  request PATCH "/api/sign-in-exp" '{"signInMode":"SignIn"}'
+  ok || fail "set default tenant sign-in mode failed (HTTP ${REQUEST_CODE})"
+  echo "closed self-registration on the default tenant"
   echo "note: AGORA_SMTP_* not fully set; skipped email connector (username/password sign-in only)"
 fi
 

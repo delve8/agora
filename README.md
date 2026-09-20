@@ -250,7 +250,9 @@ AGORA_SMTP_FROM_EMAIL=noreply@mail.example.com \
   ./scripts/agora-up.sh
 ```
 
-`AGORA_SMTP_PORT` defaults to `465`, `AGORA_SMTP_SECURE` to `true`, and `AGORA_SMTP_REPLY_TO` is optional. When they are unset the connector is skipped and users sign in with a username and password. Either way the bootstrap closes self-registration on both Logto tenants: accounts are created by an administrator, not by visitors.
+`AGORA_SMTP_PORT` defaults to `465`, `AGORA_SMTP_SECURE` to `true`, and `AGORA_SMTP_REPLY_TO` is optional. When they are unset the connector is skipped, users sign in with a username and password, and self-registration stays closed on both Logto tenants.
+
+Add `AGORA_ALLOW_REGISTRATION=true` together with the SMTP settings to open self-registration on the default tenant: anyone who can receive mail at an address can create an account. Agora does not restrict which tenant users can reach once authenticated, so enable this only for an instance that is meant to be open to anyone. The admin tenant (the Logto console) always keeps self-registration closed.
 
 To run only the Server against an already-provisioned Logto:
 

@@ -68,6 +68,7 @@ else
     AGORA_SMTP_PASSWORD="${AGORA_SMTP_PASSWORD:-}" \
     AGORA_SMTP_FROM_EMAIL="${AGORA_SMTP_FROM_EMAIL:-}" \
     AGORA_SMTP_REPLY_TO="${AGORA_SMTP_REPLY_TO:-}" \
+    AGORA_ALLOW_REGISTRATION="${AGORA_ALLOW_REGISTRATION:-}" \
     ./scripts/logto-bootstrap.sh
   set -a; . "$ENV_FILE"; set +a
 fi
