@@ -83,7 +83,10 @@ export function DeviceManager({ devices, refresh, onRevoked, onOpen }: DeviceMan
     }
   };
 
-  const command = code ? `curl -fsSL ${window.location.origin}/download/install.sh | sh -s -- --pair ${code}` : "";
+  // wget is the default because some corporate networks reset TLS connections
+  // whose ClientHello looks like curl's; the installer itself falls back between
+  // the two for the binary download.
+  const command = code ? `wget -qO- ${window.location.origin}/download/install.sh | sh -s -- --pair ${code}` : "";
 
   const copyCommand = async () => {
     if (!command) return;
@@ -334,7 +337,7 @@ export function DeviceManager({ devices, refresh, onRevoked, onOpen }: DeviceMan
                 </Button>
               </div>
               <Text type="secondary" className="pair-command-hint">
-                网络拦截 curl 时，把开头的 curl -fsSL 换成 wget -qO- 即可。
+                用 curl 的机器可以把开头的 wget -qO- 换成 curl -fsSL。
               </Text>
             </div>
             <Paragraph type="secondary" style={{ marginBottom: 0 }}>

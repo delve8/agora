@@ -188,6 +188,13 @@ in:
 curl -fsSL https://agora.example.com/download/install.sh | sh -s -- --pair <one-time-code>
 ```
 
+On networks that reset TLS connections whose ClientHello looks like curl's (some
+corporate proxies do), the same install works with `wget`:
+
+```bash
+wget -qO- https://agora.example.com/download/install.sh | sh -s -- --pair <one-time-code>
+```
+
 The Server serves two things for this flow:
 
 - `GET /download/install.sh`: the installer, rendered with `AGORA_PUBLIC_URL`
