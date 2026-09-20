@@ -43,6 +43,8 @@ func TestInstallScriptBakesServerAndBaseURL(t *testing.T) {
 		"LaunchAgents",
 		`pair "$PAIR_CODE"`,
 		"wget -qO",
+		"EnvironmentVariables",
+		"AGORA_PI_BINARY",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("install.sh is missing %q:\n%s", want, body)

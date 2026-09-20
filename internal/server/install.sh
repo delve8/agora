@@ -69,6 +69,37 @@ download() { # <url> <destination>
 	return 1
 }
 
+# The daemon resolves the provider it launches itself, and service managers start
+# it with a minimal environment (launchd gives `/usr/bin:/bin:/usr/sbin:/sbin`).
+# A `pi` installed through nvm or Homebrew is then invisible, the daemon cannot
+# start it, and the wrapper blocks until its socket read times out. Record the
+# real provider executables at install time, skipping the Agora wrapper itself,
+# and bake them plus this PATH into the service below.
+resolve_agent() { # <name>
+	name="$1"
+	restore_ifs=$IFS
+	IFS=:
+	for dir in $PATH; do
+		[ -n "$dir" ] || continue
+		candidate="$dir/$name"
+		[ -x "$candidate" ] || continue
+		if [ -L "$candidate" ]; then
+			target=$(readlink "$candidate" 2>/dev/null || true)
+			case "$target" in *agora-wrapper.sh*) continue ;; esac
+		fi
+		if head -c 512 "$candidate" 2>/dev/null | grep -q "agora wrap"; then
+			continue
+		fi
+		IFS=$restore_ifs
+		printf '%s' "$candidate"
+		return 0
+	done
+	IFS=$restore_ifs
+	return 1
+}
+
+xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+
 os=$(uname -s | tr '[:upper:]' '[:lower:]')
 case "$os" in
 	linux|darwin) ;;
@@ -140,6 +171,16 @@ if [ "$WITH_SERVICE" = 0 ]; then
 	exit 0
 fi
 
+SERVICE_PATH="$PATH"
+PI_BINARY="$(resolve_agent pi || true)"
+CLAUDE_BINARY="$(resolve_agent claude || true)"
+if [ -n "$PI_BINARY" ]; then
+	echo "Recording provider pi: $PI_BINARY"
+fi
+if [ -n "$CLAUDE_BINARY" ]; then
+	echo "Recording provider claude: $CLAUDE_BINARY"
+fi
+
 if [ "$os" = "linux" ]; then
 	if ! command -v systemctl >/dev/null 2>&1; then
 		echo "install.sh: systemctl not found; start the daemon manually: $BIN daemon" >&2
@@ -147,7 +188,8 @@ if [ "$os" = "linux" ]; then
 	fi
 	unit_dir="$HOME/.config/systemd/user"
 	mkdir -p "$unit_dir"
-	cat > "$unit_dir/agora-daemon.service" <<UNIT
+	{
+		cat <<UNIT
 [Unit]
 Description=Agora Daemon
 Documentation=$SERVER_URL
@@ -158,10 +200,20 @@ Wants=network-online.target
 ExecStart=$BIN daemon
 Restart=always
 RestartSec=5
+Environment="PATH=$SERVICE_PATH"
+UNIT
+		if [ -n "$PI_BINARY" ]; then
+			printf 'Environment="AGORA_PI_BINARY=%s"\n' "$PI_BINARY"
+		fi
+		if [ -n "$CLAUDE_BINARY" ]; then
+			printf 'Environment="AGORA_CLAUDE_BINARY=%s"\n' "$CLAUDE_BINARY"
+		fi
+		cat <<UNIT
 
 [Install]
 WantedBy=default.target
 UNIT
+	} > "$unit_dir/agora-daemon.service"
 	systemctl --user daemon-reload
 	systemctl --user enable --now agora-daemon.service
 	if command -v loginctl >/dev/null 2>&1; then
@@ -176,7 +228,8 @@ elif [ "$os" = "darwin" ]; then
 	agents="$HOME/Library/LaunchAgents"
 	mkdir -p "$agents" "$HOME/.agora"
 	plist="$agents/com.delve8.agora.daemon.plist"
-	cat > "$plist" <<PLIST
+	{
+		cat <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -185,20 +238,34 @@ elif [ "$os" = "darwin" ]; then
 	<string>com.delve8.agora.daemon</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>$BIN</string>
+		<string>$(xml_escape "$BIN")</string>
 		<string>daemon</string>
 	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>$(xml_escape "$SERVICE_PATH")</string>
+PLIST
+		if [ -n "$PI_BINARY" ]; then
+			printf '\t\t<key>AGORA_PI_BINARY</key>\n\t\t<string>%s</string>\n' "$(xml_escape "$PI_BINARY")"
+		fi
+		if [ -n "$CLAUDE_BINARY" ]; then
+			printf '\t\t<key>AGORA_CLAUDE_BINARY</key>\n\t\t<string>%s</string>\n' "$(xml_escape "$CLAUDE_BINARY")"
+		fi
+		cat <<PLIST
+	</dict>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
 	<true/>
 	<key>StandardOutPath</key>
-	<string>$HOME/.agora/daemon.log</string>
+	<string>$(xml_escape "$HOME/.agora/daemon.log")</string>
 	<key>StandardErrorPath</key>
-	<string>$HOME/.agora/daemon.log</string>
+	<string>$(xml_escape "$HOME/.agora/daemon.log")</string>
 </dict>
 </plist>
 PLIST
+	} > "$plist"
 	launchctl unload "$plist" >/dev/null 2>&1 || true
 	launchctl load "$plist"
 	echo "Installed and started LaunchAgent com.delve8.agora.daemon"
