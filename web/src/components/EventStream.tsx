@@ -46,7 +46,7 @@ function formatEventDate(value: string) {
 }
 
 function EventMeta({ event, user, agent }: { event: Event; user: boolean; agent?: string }) {
-  const label = user ? "You" : "Agent";
+  const label = user ? "你" : "Agent";
   return <Space className="event-meta" size={8} wrap>
     {user ? <Tag color="blue" title={label} aria-label={label} icon={<UserOutlined />} /> : <AgentBadge agent={agent} compact />}
     {event.subtype && <Text type="secondary">{event.subtype}</Text>}
@@ -62,7 +62,7 @@ function TextEvent({ event, agent }: EventRendererProps & { agent?: string }) {
   return <Card className={`event-card event-${event.role || event.kind}`} size="small" bordered={false}>
     <EventMeta event={event} user={event.role === "user" || event.kind === "user"} agent={agent} />
     <div className="event-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{body}</ReactMarkdown></div>
-    {long && <Button type="link" size="small" onClick={() => setExpanded((value) => !value)}>{expanded ? "Show less" : "Show full message"}</Button>}
+    {long && <Button type="link" size="small" onClick={() => setExpanded((value) => !value)}>{expanded ? "收起" : "展开全文"}</Button>}
   </Card>;
 }
 
@@ -81,8 +81,8 @@ function structuredSummary(event: Event, value: string) {
   if (event.tool_name === "Skill") {
     try {
       const input = JSON.parse(event.tool_input || "{}");
-      return input.skill || "Load a skill";
-    } catch { return "Load a skill"; }
+      return input.skill || "加载技能";
+    } catch { return "加载技能"; }
   }
   if (event.tool_name === "WebSearch") {
     try {
@@ -100,27 +100,27 @@ function structuredSummary(event: Event, value: string) {
 }
 
 function ThinkingEvent({ event, agent }: EventRendererProps & { agent?: string }) {
-  const content = cleanThinking(event.thinking || event.content || event.summary || "Thinking activity");
+  const content = cleanThinking(event.thinking || event.content || event.summary || "思考过程");
   return <Collapse defaultActiveKey={[]} className="event-collapse event-thinking" ghost items={[{
     key: event.id,
-    label: <div className="structured-event-label"><Space size={8}><AgentBadge agent={agent} compact /><Tooltip title="Thinking"><span className="structured-event-icon">{structuredEventIcon("", true)}</span></Tooltip><Text type="secondary" ellipsis>{shortText(content, 100)}</Text></Space><Text type="secondary">{formatEventDate(event.created_at)}</Text></div>,
+    label: <div className="structured-event-label"><Space size={8}><AgentBadge agent={agent} compact /><Tooltip title="思考"><span className="structured-event-icon">{structuredEventIcon("", true)}</span></Tooltip><Text type="secondary" ellipsis>{shortText(content, 100)}</Text></Space><Text type="secondary">{formatEventDate(event.created_at)}</Text></div>,
     children: <Paragraph type="secondary" className="preserved-text">{content}</Paragraph>,
   }]} />;
 }
 
 function ToolEvent({ event, result, agent }: EventRendererProps & { result?: boolean; agent?: string }) {
   const details = result ? event.tool_output || event.content || "" : event.tool_input || event.content || "";
-  const name = event.tool_name || event.subtype || "Tool";
-  const label = result ? `${name} result` : name;
+  const name = event.tool_name || event.subtype || "工具";
+  const label = result ? `${name} 结果` : name;
   return <Collapse defaultActiveKey={[]} className={`event-collapse event-tool ${result ? "event-tool-result" : ""}`} ghost items={[{
     key: event.id,
     label: <div className="structured-event-label"><Space size={8}><AgentBadge agent={agent} compact /><Tooltip title={label}><span className="structured-event-icon">{structuredEventIcon(name, false, result)}</span></Tooltip><Text type="secondary" ellipsis>{structuredSummary(event, details)}</Text></Space><Text type="secondary">{formatEventDate(event.created_at)}</Text></div>,
-    children: details ? <pre>{details}</pre> : <Text type="secondary">No details</Text>,
+    children: details ? <pre>{details}</pre> : <Text type="secondary">暂无详情</Text>,
   }]} />;
 }
 
 function ErrorEvent({ event }: EventRendererProps) {
-  return <Alert className="event-alert" type="error" showIcon icon={<ExclamationCircleOutlined />} message={event.summary || "Session error"} description={<div className="preserved-text">{event.content}</div>} />;
+  return <Alert className="event-alert" type="error" showIcon icon={<ExclamationCircleOutlined />} message={event.summary || "会话错误"} description={<div className="preserved-text">{event.content}</div>} />;
 }
 
 function StatusEvent({ event }: EventRendererProps) {
@@ -221,7 +221,7 @@ export function EventStream({ events, showProcessDetails, agent, hasOlderEvents,
   return <Card className="event-stream">
     <div ref={scrollRef} className="events" aria-live="polite" onScroll={handleScroll}>
       {loadingOlder && <div className="history-load-more"><Text type="secondary">加载更早的消息…</Text></div>}
-      {displayed.length === 0 ? <div className="empty-state"><Text type="secondary">{processCount > 0 ? "Process details are hidden. Use Show process details to inspect them." : awaitingHistory ? "该会话还没有历史记录——Agent 写入第一条消息后即可查看。" : "Start a session and send a message; activity will appear here."}</Text></div> : displayed.map((event) => <div className="event-row" key={event.id}><EventRenderer event={event} agent={agent} /></div>)}
+      {displayed.length === 0 ? <div className="empty-state"><Text type="secondary">{processCount > 0 ? "过程详情已隐藏，可用“显示过程详情”查看。" : awaitingHistory ? "该会话还没有历史记录——Agent 写入第一条消息后即可查看。" : "开始一个会话并发送消息后，活动会显示在这里。"}</Text></div> : displayed.map((event) => <div className="event-row" key={event.id}><EventRenderer event={event} agent={agent} /></div>)}
     </div>
   </Card>;
 }

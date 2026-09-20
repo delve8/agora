@@ -21,9 +21,9 @@ export function MessageComposer({ disabled, onSend }: { disabled: boolean; onSen
         event.preventDefault();
         void submit();
       }}
-      placeholder={disabled ? "Create a Claude Code session first" : "Ask Claude Code something… Enter to send · Shift + Enter for a new line"}
+      placeholder={disabled ? "请先创建一个 Claude Code 会话" : "给 Claude Code 发消息… 回车发送 · Shift+回车换行"}
       autoSize={{ minRows: 1, maxRows: 5 }}
     />
-    <Space align="end"><Button type="primary" icon={<SendOutlined />} loading={sending} onClick={() => void submit()} disabled={disabled || !content.trim()}>Send</Button></Space>
+    <Space align="end"><Button type="primary" icon={<SendOutlined />} loading={sending} onClick={() => void submit()} disabled={disabled || !content.trim()}>发送</Button></Space>
   </div>;
 }

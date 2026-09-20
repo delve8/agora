@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
-import { Alert, Button, Cascader, Drawer, Layout, Select, Space, Switch, Tooltip } from "antd";
+import { Alert, Avatar, Button, Cascader, Drawer, Dropdown, Layout, Select, Space, Switch, Tooltip } from "antd";
 import { DesktopOutlined, EyeInvisibleOutlined, EyeOutlined, HistoryOutlined, LogoutOutlined, MenuOutlined, PlayCircleOutlined, PlusOutlined, PoweroffOutlined, RobotOutlined, UserOutlined } from "@ant-design/icons";
 import { EventStream } from "./components/EventStream";
 import { MessageComposer } from "./components/MessageComposer";
@@ -18,7 +18,7 @@ const { Header, Content } = Layout;
 type SessionOption = { value: string; label: ReactNode; children?: SessionOption[] };
 
 function workspaceLabel(workspace: string) {
-  return workspace || "Unknown workspace";
+  return workspace || "未知工作区";
 }
 
 function sessionOptionLabel(session: { display_name: string; id: string; agent?: string; daemon_id?: string; capabilities: { can_resume: boolean; can_stream: boolean } }, deviceLabel: string) {
@@ -26,7 +26,7 @@ function sessionOptionLabel(session: { display_name: string; id: string; agent?:
   const parts: ReactNode[] = [<AgentBadge key="agent" agent={session.agent} compact />, <span key="label">{label}</span>];
   if (deviceLabel) parts.push(<span key="device" className="session-device-badge" title={session.daemon_id}>{deviceLabel}</span>);
   if (session.capabilities.can_resume && !session.capabilities.can_stream) {
-    parts.push(<Tooltip key="inactive" title="Session is inactive and can be resumed"><HistoryOutlined className="session-inactive-icon" /></Tooltip>);
+    parts.push(<Tooltip key="inactive" title="会话未运行，可恢复"><HistoryOutlined className="session-inactive-icon" /></Tooltip>);
   }
   return <Space size={6}>{parts}</Space>;
 }
@@ -128,7 +128,7 @@ export default function App() {
   const submit = async (content: string) => {
     if (!currentSession) return;
     try { await send(currentSession.id, content); setError(""); }
-    catch (value) { setError(value instanceof Error ? value.message : "Unable to send message"); }
+    catch (value) { setError(value instanceof Error ? value.message : "消息发送失败"); }
   };
   const resumeCurrent = async () => {
     if (!currentSession || resuming) return;
@@ -142,7 +142,7 @@ export default function App() {
     try { await stop(currentSession.id); }
     finally { setStopping(false); }
   };
-  if (loading) return <div className="loading-screen">Loading Agora…</div>;
+  if (loading) return <div className="loading-screen">正在加载 Agora…</div>;
 
   const sessionSelector = (open: boolean, setOpen: (value: boolean) => void, path: string[], setPath: (value: string[]) => void) => <Cascader
     className="session-selector"
@@ -166,7 +166,7 @@ export default function App() {
         setPath(path);
       }
     }}
-    placeholder="Select a session"
+    placeholder="选择会话"
     displayRender={(labels) => labels.length > 1 ? <span className="session-selector-value"><span className="session-selector-workspace">{labels[0]}</span><span className="session-selector-sep"> / </span>{labels[1]}</span> : labels[0]}
     showSearch
     allowClear={false}
@@ -194,8 +194,8 @@ export default function App() {
         />}
         {sessions.length > 0 && !createOpen && <Space.Compact className="session-control header-session-control">
           {sessionSelector(selectorOpen, setSelectorOpen, selectorPath, setSelectorPath)}
-          {currentSession?.capabilities.can_resume && !currentSession.capabilities.can_stream && <Tooltip title="Resume this agent session"><Button aria-label="Resume session" icon={<PlayCircleOutlined />} loading={resuming} onClick={() => void resumeCurrent()} /></Tooltip>}
-          {currentSession?.capabilities.can_interrupt && <Tooltip title="Stop this agent session"><Button danger aria-label="Stop session" icon={<PoweroffOutlined />} loading={stopping} onClick={() => void stopCurrent()} /></Tooltip>}
+          {currentSession?.capabilities.can_resume && !currentSession.capabilities.can_stream && <Tooltip title="恢复该 Agent 会话"><Button aria-label="Resume session" icon={<PlayCircleOutlined />} loading={resuming} onClick={() => void resumeCurrent()} /></Tooltip>}
+          {currentSession?.capabilities.can_interrupt && <Tooltip title="停止该 Agent 会话"><Button danger aria-label="Stop session" icon={<PoweroffOutlined />} loading={stopping} onClick={() => void stopCurrent()} /></Tooltip>}
         </Space.Compact>}
       </Space>
       <Space className="header-actions">
@@ -222,11 +222,20 @@ export default function App() {
           />
         </Tooltip>
         <span className="desktop-device-manager"><DeviceManager devices={devices} refresh={refreshDevices} onRevoked={refreshAfterRevoke} /></span>
-        <Button className="desktop-new-session" type="primary" icon={<PlusOutlined />} onClick={() => setCreateOpen(true)}>New session</Button>
-        {auth && <span className="header-auth">
-          <Tooltip title={auth.identity}><span className="auth-identity"><UserOutlined /> {auth.identity}</span></Tooltip>
-          <Tooltip title="Sign out"><Button type="text" size="small" aria-label="Sign out" icon={<LogoutOutlined />} onClick={auth.signOut} /></Tooltip>
-        </span>}
+        <Button className="desktop-new-session" type="primary" icon={<PlusOutlined />} onClick={() => setCreateOpen(true)}>新建会话</Button>
+        {auth && <Dropdown
+          trigger={["click"]}
+          placement="bottomRight"
+          menu={{
+            items: [
+              { key: "identity", label: <span className="header-user-identity">{auth.identity}</span>, disabled: true },
+              { type: "divider" },
+              { key: "signout", icon: <LogoutOutlined />, label: "退出登录", onClick: () => auth.signOut() },
+            ],
+          }}
+        >
+          <Button className="header-user" type="text" aria-label="账户菜单" icon={<Avatar size={22} icon={<UserOutlined />} />} />
+        </Dropdown>}
       </Space>
       <Button
         className="mobile-menu-button"
@@ -304,8 +313,8 @@ export default function App() {
                 optionFilterProp="label"
                 onChange={(value) => { setMobileSessionId(value); setSelectedSessionId(value); closeMobileMenu(); }}
               />
-              {currentSession?.capabilities.can_resume && !currentSession.capabilities.can_stream && <Tooltip title="Resume this agent session"><Button aria-label="Resume session" icon={<PlayCircleOutlined />} loading={resuming} onClick={() => { closeMobileMenu(); void resumeCurrent(); }} /></Tooltip>}
-              {currentSession?.capabilities.can_interrupt && <Tooltip title="Stop this agent session"><Button danger aria-label="Stop session" icon={<PoweroffOutlined />} loading={stopping} onClick={() => { closeMobileMenu(); void stopCurrent(); }} /></Tooltip>}
+              {currentSession?.capabilities.can_resume && !currentSession.capabilities.can_stream && <Tooltip title="恢复该 Agent 会话"><Button aria-label="Resume session" icon={<PlayCircleOutlined />} loading={resuming} onClick={() => { closeMobileMenu(); void resumeCurrent(); }} /></Tooltip>}
+              {currentSession?.capabilities.can_interrupt && <Tooltip title="停止该 Agent 会话"><Button danger aria-label="Stop session" icon={<PoweroffOutlined />} loading={stopping} onClick={() => { closeMobileMenu(); void stopCurrent(); }} /></Tooltip>}
             </Space.Compact></label>
           </>}
           <div className="mobile-menu-actions">

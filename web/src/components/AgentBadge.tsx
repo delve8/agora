@@ -10,7 +10,7 @@ export function agentLabel(agent?: string) {
     case "pi":
       return "Pi";
     default:
-      return agent?.trim() || "Unknown agent";
+      return agent?.trim() || "未知 Agent";
   }
 }
 

@@ -248,7 +248,7 @@ export function DeviceManager({ devices, refresh, onRevoked, onOpen }: DeviceMan
   return <>
     <Button className="device-manager-trigger" icon={<DesktopOutlined />} htmlType="button" onClick={() => { onOpen?.(); setOpen(true); void loadWebhooks(); }}>设备</Button>
     <Drawer
-      title="设备 / Devices"
+      title="设备"
       className="device-drawer"
       width={640}
       open={open}
@@ -269,7 +269,7 @@ export function DeviceManager({ devices, refresh, onRevoked, onOpen }: DeviceMan
           size="small"
         />
       )}
-      <Divider>IM Webhook</Divider>
+      <Divider>IM 通知 Webhook</Divider>
       <Space direction="vertical" size={10} style={{ width: "100%" }}>
         <Typography.Text type="secondary">配置多个 Webhook 后，Agent 任务完成、失败或需要用户介入时，会向启用的地址发送通知。</Typography.Text>
         {webhookError && <Alert type="error" showIcon closable message={webhookError} onClose={() => setWebhookError("")} />}
@@ -283,7 +283,7 @@ export function DeviceManager({ devices, refresh, onRevoked, onOpen }: DeviceMan
         <Space.Compact block>
           <Select value={webhookProvider} onChange={setWebhookProvider} options={[{ value: "generic", label: "Generic" }, { value: "feishu", label: "飞书" }, { value: "dingtalk", label: "钉钉" }, { value: "wecom", label: "企业微信" }]} />
           <Input value={webhookLabel} onChange={(event) => setWebhookLabel(event.target.value)} placeholder="名称（可选）" />
-          <Input value={webhookURL} onChange={(event) => setWebhookURL(event.target.value)} onPressEnter={() => void addWebhook()} placeholder="Webhook URL" />
+          <Input value={webhookURL} onChange={(event) => setWebhookURL(event.target.value)} onPressEnter={() => void addWebhook()} placeholder="Webhook 地址" />
           <Button type="primary" loading={webhookBusy} disabled={!webhookURL.trim()} onClick={() => void addWebhook()}>添加</Button>
         </Space.Compact>
       </Space>

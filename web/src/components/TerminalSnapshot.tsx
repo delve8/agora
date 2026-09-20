@@ -28,9 +28,9 @@ export function TerminalSnapshot({ agent, snapshot, error, loading }: TerminalSn
     stickToBottom.current = screen.scrollHeight - screen.scrollTop - screen.clientHeight < 32;
   };
 
-  return <Card size="small" className="terminal-panel" title={`Native ${agentName} TUI`} extra={snapshot && <Text type="secondary">screen {snapshot.rows} rows</Text>}>
-    {approvalVisible && <Alert type="warning" showIcon message="Claude is waiting for approval in the native terminal" description="Agora can observe this screen but cannot approve or reject it." />}
-    {error && !snapshot ? <Empty className="terminal-empty" description={`PTY observation unavailable: ${error}`} /> : snapshot ? <pre ref={screenRef} className="terminal-screen" onScroll={handleScreenScroll} aria-label={`Native ${agentName} terminal screen`}>{snapshot.lines.join("\n")}</pre> : <Empty className="terminal-empty" description={loading ? "Waiting for terminal output…" : "No terminal snapshot available."} />}
-    {snapshot && <div className="terminal-status"><Tag>{snapshot.alternate_screen ? "alternate screen" : "primary screen"}</Tag><Text type="secondary">parser {snapshot.healthy ? "healthy" : "reported an error"}{snapshot.cursor_visible ? " · cursor visible" : ""} · scroll to inspect the current screen</Text></div>}
+  return <Card size="small" className="terminal-panel" title={`原生 ${agentName} TUI`} extra={snapshot && <Text type="secondary">屏幕 {snapshot.rows} 行</Text>}>
+    {approvalVisible && <Alert type="warning" showIcon message="Claude 正在原生终端等待审批" description="Agora 只能观察这个画面，无法代为同意或拒绝。" />}
+    {error && !snapshot ? <Empty className="terminal-empty" description={`PTY 观察不可用：${error}`} /> : snapshot ? <pre ref={screenRef} className="terminal-screen" onScroll={handleScreenScroll} aria-label={`原生 ${agentName} 终端画面`}>{snapshot.lines.join("\n")}</pre> : <Empty className="terminal-empty" description={loading ? "等待终端输出…" : "暂无终端画面。"} />}
+    {snapshot && <div className="terminal-status"><Tag>{snapshot.alternate_screen ? "备用屏幕" : "主屏幕"}</Tag><Text type="secondary">解析器{snapshot.healthy ? "正常" : "上报了错误"}{snapshot.cursor_visible ? " · 光标可见" : ""} · 可滚动查看当前画面</Text></div>}
   </Card>;
 }

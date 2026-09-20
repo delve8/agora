@@ -77,8 +77,8 @@ function SignInCallback({ onComplete }: { onComplete: () => void }) {
     window.history.replaceState({}, document.title, window.location.pathname);
     onComplete();
   });
-  if (isLoading) return <div className="loading-screen"><Spin /> Completing sign-in…</div>;
-  if (error) return <div className="loading-screen"><Alert type="error" message="Sign-in failed" description={error.message} /></div>;
+  if (isLoading) return <div className="loading-screen"><Spin /> 正在完成登录…</div>;
+  if (error) return <div className="loading-screen"><Alert type="error" message="登录失败" description={error.message} /></div>;
   return null;
 }
 
@@ -104,9 +104,11 @@ function isInvalidTokenError(value: unknown): boolean {
 // claims: username, name and email exist only in the ID token (or userinfo). The
 // signed-in label therefore comes from the browser's ID token, with the Server's
 // principal as the fallback for providers whose access token does carry claims.
+// Email comes first so that accounts created by email verification code (which
+// have neither a username nor a name) show something meaningful.
 function preferredUserLabel(claims?: IdTokenClaims | null): string {
   const record = claims as (Record<string, unknown> | null | undefined);
-  for (const value of [claims?.username, record?.["preferred_username"], claims?.name, claims?.email]) {
+  for (const value of [claims?.name, claims?.email, claims?.username, record?.["preferred_username"]]) {
     if (typeof value === "string" && value.trim()) return value.trim();
   }
   return "";
@@ -164,7 +166,7 @@ function LogtoGate({ children, audience }: { children: ReactNode; audience?: str
           // polling requests would otherwise repeat the same 401 forever.
           await clearAllTokens();
         }
-        setIdentityError(value instanceof Error ? value.message : "Unable to verify identity");
+        setIdentityError(value instanceof Error ? value.message : "无法验证身份");
         setIdentityLoading(false);
       }
     })();
@@ -192,9 +194,9 @@ function LogtoGate({ children, audience }: { children: ReactNode; audience?: str
   // Logto marks the provider as loading while refreshing an access token. Keep
   // authenticated children mounted during that request; otherwise a device
   // action can make the Drawer disappear while its API call is authenticating.
-  if (isLoading && !isAuthenticated) return <div className="loading-screen"><Spin /> Loading authentication…</div>;
-  if (!isAuthenticated) return <div className="loading-screen"><Flex vertical gap="middle" align="center"><h2>Sign in to Agora</h2>{error && <Alert type="error" message={error.message} /> }<Button type="primary" onClick={() => void signIn(authRedirectUri())}>Sign in</Button></Flex></div>;
-  if (identityLoading || !principal) return <div className="loading-screen"><Flex vertical gap="middle" align="center"><Spin />{identityError ? <Alert type="error" message="Agora authentication failed" description={identityError} /> : <span>Verifying identity…</span>}<Space>{identityError && <Button onClick={() => void signIn(authRedirectUri())}>Sign in again</Button>}<Button type="link" onClick={() => void signOut(authRedirectUri())}>Sign out</Button></Space></Flex></div>;
+  if (isLoading && !isAuthenticated) return <div className="loading-screen"><Spin /> 正在加载身份信息…</div>;
+  if (!isAuthenticated) return <div className="loading-screen"><Flex vertical gap="middle" align="center"><h2>登录 Agora</h2>{error && <Alert type="error" message={error.message} /> }<Button type="primary" onClick={() => void signIn(authRedirectUri())}>登录</Button></Flex></div>;
+  if (identityLoading || !principal) return <div className="loading-screen"><Flex vertical gap="middle" align="center"><Spin />{identityError ? <Alert type="error" message="Agora 身份验证失败" description={identityError} /> : <span>正在验证身份…</span>}<Space>{identityError && <Button onClick={() => void signIn(authRedirectUri())}>重新登录</Button>}<Button type="link" onClick={() => void signOut(authRedirectUri())}>退出登录</Button></Space></Flex></div>;
   const label = idTokenName || principal.display_name || principal.user_id;
   const email = principal.email || idTokenEmail;
   const identity = email && !label.includes(email) ? `${label} (${email})` : label;
@@ -224,5 +226,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }
   if (state.status === "none") return <>{children}</>;
   const config = state.config;
-  return <LogtoProvider config={{ endpoint: config.endpoint, appId: config.appId, resources: config.audience ? [config.audience] : undefined }}><LogtoContent audience={config.audience}>{children}</LogtoContent></LogtoProvider>;
+  // "email" is not part of the SDK's reserved scopes (openid/offline_access/
+  // profile), so ask for it explicitly; without it the ID token has no email and
+  // email-code accounts show their opaque user id.
+  return <LogtoProvider config={{ endpoint: config.endpoint, appId: config.appId, scopes: ["email"], resources: config.audience ? [config.audience] : undefined }}><LogtoContent audience={config.audience}>{children}</LogtoContent></LogtoProvider>;
 }

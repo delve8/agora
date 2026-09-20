@@ -100,6 +100,9 @@ button, input, textarea { font: inherit; }
 .loading-screen { min-height: 100vh; display: grid; place-items: center; color: #86909c; background: #f5f7fa; }
 .header-auth { display: inline-flex; align-items: center; gap: 2px; min-width: 0; color: #86909c; font-size: 12px; }
 .header-auth .ant-btn { color: #86909c; }
+.header-user { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; padding: 0; color: #86909c; }
+.header-user:hover { color: #4e5969; }
+.header-user-identity { display: inline-block; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .auth-identity { display: inline-flex; align-items: center; gap: 4px; max-width: 20vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mobile-menu-auth { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-top: 12px; border-top: 1px solid #f0f0f0; color: #667085; font-size: 12px; }
 .mobile-menu-auth .auth-identity { max-width: 60vw; }

@@ -257,15 +257,15 @@ if [ -n "$SMTP_HOST" ] && [ -n "$SMTP_USER" ] && [ -n "$SMTP_PASSWORD" ] && [ -n
       auth: { type: "login", user: $user, pass: $pass },
       fromEmail: $from,
       templates: [
-        { usageType: "SignIn", contentType: "text/plain", subject: "Agora 登录验证码", content: "你的 Agora 登录验证码是 {{code}}，10 分钟内有效。请勿泄露给他人。" },
-        { usageType: "Register", contentType: "text/plain", subject: "Agora 注册验证码", content: "你的 Agora 注册验证码是 {{code}}，10 分钟内有效。" },
-        { usageType: "ForgotPassword", contentType: "text/plain", subject: "Agora 密码重置验证码", content: "你的 Agora 密码重置验证码是 {{code}}，10 分钟内有效。" },
-        { usageType: "OrganizationInvitation", contentType: "text/plain", subject: "Agora 邀请验证码", content: "你的 Agora 邀请验证码是 {{code}}，10 分钟内有效。" },
-        { usageType: "Generic", contentType: "text/plain", subject: "Agora 验证码", content: "你的 Agora 验证码是 {{code}}，10 分钟内有效。" },
-        { usageType: "UserPermissionValidation", contentType: "text/plain", subject: "Agora 权限校验验证码", content: "你的 Agora 权限校验验证码是 {{code}}，10 分钟内有效。" },
-        { usageType: "BindNewIdentifier", contentType: "text/plain", subject: "Agora 绑定邮箱验证码", content: "你的 Agora 绑定新邮箱验证码是 {{code}}，10 分钟内有效。" },
-        { usageType: "MfaVerification", contentType: "text/plain", subject: "Agora 两步验证码", content: "你的 Agora 两步验证码是 {{code}}，10 分钟内有效。" },
-        { usageType: "BindMfa", contentType: "text/plain", subject: "Agora 两步验证绑定码", content: "你的 Agora 两步验证绑定码是 {{code}}，10 分钟内有效。" }
+        { usageType: "SignIn", contentType: "text/plain", subject: "Agora 登录验证码", content: "你的 Agora 登录验证码是\n\n{{code}}\n\n10 分钟内有效，请勿泄露给他人。" },
+        { usageType: "Register", contentType: "text/plain", subject: "Agora 注册验证码", content: "你的 Agora 注册验证码是\n\n{{code}}\n\n10 分钟内有效。" },
+        { usageType: "ForgotPassword", contentType: "text/plain", subject: "Agora 密码重置验证码", content: "你的 Agora 密码重置验证码是\n\n{{code}}\n\n10 分钟内有效。" },
+        { usageType: "OrganizationInvitation", contentType: "text/plain", subject: "Agora 邀请验证码", content: "你的 Agora 邀请验证码是\n\n{{code}}\n\n10 分钟内有效。" },
+        { usageType: "Generic", contentType: "text/plain", subject: "Agora 验证码", content: "你的 Agora 验证码是\n\n{{code}}\n\n10 分钟内有效。" },
+        { usageType: "UserPermissionValidation", contentType: "text/plain", subject: "Agora 权限校验验证码", content: "你的 Agora 权限校验验证码是\n\n{{code}}\n\n10 分钟内有效。" },
+        { usageType: "BindNewIdentifier", contentType: "text/plain", subject: "Agora 绑定邮箱验证码", content: "你的 Agora 绑定新邮箱验证码是\n\n{{code}}\n\n10 分钟内有效。" },
+        { usageType: "MfaVerification", contentType: "text/plain", subject: "Agora 两步验证码", content: "你的 Agora 两步验证码是\n\n{{code}}\n\n10 分钟内有效。" },
+        { usageType: "BindMfa", contentType: "text/plain", subject: "Agora 两步验证绑定码", content: "你的 Agora 两步验证绑定码是\n\n{{code}}\n\n10 分钟内有效。" }
       ]
     } + (if $reply == "" then {} else { replyTo: $reply } end)')"
 

@@ -26,12 +26,12 @@ export function SessionCreate({ onCreate, onCreated, disabled, devices }: Sessio
     .map((device) => ({ value: device.device_id, label: device.name || device.device_id, disabled: !device.connected }));
   return <Card className="setup-card">
     <Space direction="vertical" size={4}>
-      <Text type="secondary">NEW SESSION</Text>
-      <Title level={2}>Start an Agent session</Title>
-      <Text type="secondary">Choose an Agent and workspace. Agora keeps the native Agent experience while giving you a responsive web view for history, activity and explicit input.</Text>
+      <Text type="secondary">新建会话</Text>
+      <Title level={2}>启动 Agent 会话</Title>
+      <Text type="secondary">选择 Agent 和工作区。Agora 保留原生 Agent 体验，同时在网页里提供历史、活动和显式输入。</Text>
     </Space>
-    <Form form={form} layout="vertical" onFinish={submit} initialValues={{ agent: "claude-code", display_name: "New session", role: "agent" }} className="setup-form">
-      <Form.Item name="agent" label="Agent" rules={[{ required: true, message: "Select an agent" }]}>
+    <Form form={form} layout="vertical" onFinish={submit} initialValues={{ agent: "claude-code", display_name: "新会话", role: "agent" }} className="setup-form">
+      <Form.Item name="agent" label="Agent" rules={[{ required: true, message: "请选择 Agent" }]}>
         <Select options={["claude-code", "pi"].map((value) => ({ value, label: <AgentBadge agent={value} /> }))} />
       </Form.Item>
       {activeDevices.length > 0 && <Form.Item name="daemon_id" label="运行设备" tooltip="先选择这台会话运行在哪台 daemon 上；留空则由服务端自动挑选一台在线的。">
@@ -45,12 +45,12 @@ export function SessionCreate({ onCreate, onCreated, disabled, devices }: Sessio
           }}
         />
       </Form.Item>}
-      <Form.Item name="workspace" label="Workspace directory" rules={[{ required: true, message: "Enter an existing workspace path" }]}>
+      <Form.Item name="workspace" label="工作区目录" rules={[{ required: true, message: "请输入已存在的工作区路径" }]}>
         <Input prefix={<FolderOpenOutlined />} placeholder="/path/to/workspace" />
       </Form.Item>
-      <Form.Item name="display_name" label="Display name"><Input /></Form.Item>
-      <Form.Item name="role" label="Role"><Input placeholder="agent, reviewer, implementer…" /></Form.Item>
-      <Button type="primary" htmlType="submit" icon={<RocketOutlined />} loading={busy} disabled={disabled} block>Start session</Button>
+      <Form.Item name="display_name" label="显示名称"><Input /></Form.Item>
+      <Form.Item name="role" label="角色"><Input placeholder="agent、reviewer、implementer…" /></Form.Item>
+      <Button type="primary" htmlType="submit" icon={<RocketOutlined />} loading={busy} disabled={disabled} block>启动会话</Button>
     </Form>
   </Card>;
 }
