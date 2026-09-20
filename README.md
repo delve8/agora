@@ -229,6 +229,29 @@ One command starts or updates Agora Server plus a local Logto and its Postgres, 
 
 That stack binds loopback by default (`http://127.0.0.1:8080`, Logto at `:3003`, admin at `:3004`) and provisions the Agora SPA / API resource / bootstrap user the same way `make server` does. Re-running `agora-up` pulls newer images and recreates the three containers without wiping Postgres or the Agora SQLite volume.
 
+To publish HTTPS with Let's Encrypt, set public hostnames. Caddy then binds 80/443, obtains and renews certificates, and Logto/Agora stay on the internal network:
+
+```bash
+AGORA_DOMAIN=agora.example.com \
+LOGTO_DOMAIN=logto.example.com \
+CADDY_EMAIL=you@example.com \
+  ./scripts/agora-up.sh
+```
+
+Optional `LOGTO_ADMIN_DOMAIN` defaults to `admin.$LOGTO_DOMAIN`. Point those names at this host before running; HTTP-01 needs ports 80 and 443 reachable from the internet. The issuer becomes `https://logto.example.com/oidc`, so the loopback JWKS sidecar is not used.
+
+Optional email sign-in. Set an SMTP sender and the bootstrap provisions an Email connector and switches the default tenant to an email verification code (the username/password method stays available as a fallback):
+
+```bash
+AGORA_SMTP_HOST=smtpdm.aliyun.com \
+AGORA_SMTP_USER=noreply@mail.example.com \
+AGORA_SMTP_PASSWORD=secret \
+AGORA_SMTP_FROM_EMAIL=noreply@mail.example.com \
+  ./scripts/agora-up.sh
+```
+
+`AGORA_SMTP_PORT` defaults to `465`, `AGORA_SMTP_SECURE` to `true`, and `AGORA_SMTP_REPLY_TO` is optional. When they are unset the connector is skipped and users sign in with a username and password. Either way the bootstrap closes self-registration on both Logto tenants: accounts are created by an administrator, not by visitors.
+
 To run only the Server against an already-provisioned Logto:
 
 ```bash

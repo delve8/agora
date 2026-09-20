@@ -39,6 +39,18 @@ SPA_NAME="Agora Web"
 RESOURCE_NAME="Agora API"
 BOOTSTRAP_USERNAME="${AGORA_LOGTO_BOOTSTRAP_USERNAME:-agora_admin}"
 
+# Optional email connector. Fill all four of host/user/password/from to provision
+# an SMTP connector and switch the default tenant to email verification-code
+# sign-in (username/password stays enabled as a fallback). Left unset, the tenant
+# keeps username/password only.
+SMTP_HOST="${AGORA_SMTP_HOST:-}"
+SMTP_PORT="${AGORA_SMTP_PORT:-465}"
+SMTP_SECURE="${AGORA_SMTP_SECURE:-true}"
+SMTP_USER="${AGORA_SMTP_USER:-}"
+SMTP_PASSWORD="${AGORA_SMTP_PASSWORD:-}"
+SMTP_FROM_EMAIL="${AGORA_SMTP_FROM_EMAIL:-}"
+SMTP_REPLY_TO="${AGORA_SMTP_REPLY_TO:-}"
+
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR"
 
@@ -197,6 +209,15 @@ request_admin POST "/api/organizations/t-admin/users" "$(jq -n --arg id "$ADMIN_
 [ "${REQUEST_CODE}" -lt 300 ] || echo "note: could not add admin bootstrap user to admin organization (HTTP ${REQUEST_CODE})"
 request_admin POST "/api/organizations/t-admin/users/roles" "$(jq -n --arg id "$ADMIN_USER_ID" '{userIds:[$id], organizationRoleIds:["admin"]}')" || true
 [ "${REQUEST_CODE}" -lt 300 ] || echo "note: could not assign admin organization role (HTTP ${REQUEST_CODE})"
+
+# The OSS admin console runs against the default tenant, so the admin user also
+# has to be a member of the "t-default" organization. Without it the console
+# fails right after sign-in with "user is not a member of the organization".
+request_admin POST "/api/organizations/t-default/users" "$(jq -n --arg id "$ADMIN_USER_ID" '{userIds:[$id]}')" || true
+[ "${REQUEST_CODE}" -lt 300 ] || echo "note: could not add admin bootstrap user to t-default organization (HTTP ${REQUEST_CODE})"
+request_admin POST "/api/organizations/t-default/users/roles" "$(jq -n --arg id "$ADMIN_USER_ID" '{userIds:[$id], organizationRoleIds:["admin"]}')" || true
+[ "${REQUEST_CODE}" -lt 300 ] || echo "note: could not assign t-default organization role (HTTP ${REQUEST_CODE})"
+
 request_admin GET "/api/roles?type=User"
 ROLE_IDS="$(printf '%s' "$REQUEST_BODY" | jq -r '.[] | .id' | paste -sd, -)"
 if [ -n "$ROLE_IDS" ]; then
@@ -204,7 +225,66 @@ if [ -n "$ROLE_IDS" ]; then
   [ "${REQUEST_CODE}" -lt 300 ] || echo "note: could not assign admin user roles (HTTP ${REQUEST_CODE})"
 fi
 
-# --- 7. write env file for the Makefile ---
+# --- 7. close registration and optionally enable email sign-in ---
+# Logto flips a tenant's sign-in mode during its interactive first-admin
+# registration. Users created through the Management API bypass that flow, so
+# set the mode explicitly: sign-in only, self-registration stays closed.
+request_admin PATCH "/api/sign-in-exp" '{"signInMode":"SignIn"}'
+ok || fail "set admin tenant sign-in mode failed (HTTP ${REQUEST_CODE})"
+request PATCH "/api/sign-in-exp" '{"signInMode":"SignIn"}'
+ok || fail "set default tenant sign-in mode failed (HTTP ${REQUEST_CODE})"
+echo "disabled self-registration on both tenants"
+
+if [ -n "$SMTP_HOST" ] && [ -n "$SMTP_USER" ] && [ -n "$SMTP_PASSWORD" ] && [ -n "$SMTP_FROM_EMAIL" ]; then
+  # AGORA_SMTP_SECURE and AGORA_SMTP_PORT have to be JSON literals for jq
+  # ("true"/"false" and a number).
+  EMAIL_CONFIG="$(jq -nc \
+    --arg host "$SMTP_HOST" \
+    --argjson port "$SMTP_PORT" \
+    --argjson secure "$SMTP_SECURE" \
+    --arg user "$SMTP_USER" \
+    --arg pass "$SMTP_PASSWORD" \
+    --arg from "$SMTP_FROM_EMAIL" \
+    --arg reply "$SMTP_REPLY_TO" \
+    '{
+      host: $host,
+      port: $port,
+      secure: $secure,
+      auth: { type: "login", user: $user, pass: $pass },
+      fromEmail: $from,
+      templates: [
+        { usageType: "SignIn", contentType: "text/plain", subject: "Agora 登录验证码", content: "你的 Agora 登录验证码是 {{code}}，10 分钟内有效。请勿泄露给他人。" },
+        { usageType: "Register", contentType: "text/plain", subject: "Agora 注册验证码", content: "你的 Agora 注册验证码是 {{code}}，10 分钟内有效。" },
+        { usageType: "ForgotPassword", contentType: "text/plain", subject: "Agora 密码重置验证码", content: "你的 Agora 密码重置验证码是 {{code}}，10 分钟内有效。" },
+        { usageType: "OrganizationInvitation", contentType: "text/plain", subject: "Agora 邀请验证码", content: "你的 Agora 邀请验证码是 {{code}}，10 分钟内有效。" },
+        { usageType: "Generic", contentType: "text/plain", subject: "Agora 验证码", content: "你的 Agora 验证码是 {{code}}，10 分钟内有效。" },
+        { usageType: "UserPermissionValidation", contentType: "text/plain", subject: "Agora 权限校验验证码", content: "你的 Agora 权限校验验证码是 {{code}}，10 分钟内有效。" },
+        { usageType: "BindNewIdentifier", contentType: "text/plain", subject: "Agora 绑定邮箱验证码", content: "你的 Agora 绑定新邮箱验证码是 {{code}}，10 分钟内有效。" },
+        { usageType: "MfaVerification", contentType: "text/plain", subject: "Agora 两步验证码", content: "你的 Agora 两步验证码是 {{code}}，10 分钟内有效。" },
+        { usageType: "BindMfa", contentType: "text/plain", subject: "Agora 两步验证绑定码", content: "你的 Agora 两步验证绑定码是 {{code}}，10 分钟内有效。" }
+      ]
+    } + (if $reply == "" then {} else { replyTo: $reply } end)')"
+
+  request GET "/api/connectors"
+  EMAIL_CONNECTOR_ID="$(printf '%s' "$REQUEST_BODY" | jq -r '.[] | select(.connectorId=="simple-mail-transfer-protocol") | .id' | head -1)"
+  if [ -z "$EMAIL_CONNECTOR_ID" ]; then
+    request POST "/api/connectors" "$(jq -nc --argjson config "$EMAIL_CONFIG" '{connectorId:"simple-mail-transfer-protocol", config:$config, metadata:{name:{en:"SMTP Email","zh-CN":"SMTP 邮件"}}}')"
+    ok || fail "create email connector failed (HTTP ${REQUEST_CODE})"
+    echo "created email connector (simple-mail-transfer-protocol)"
+  else
+    request PATCH "/api/connectors/${EMAIL_CONNECTOR_ID}" "$(jq -nc --argjson config "$EMAIL_CONFIG" '{config:$config}')"
+    ok || fail "update email connector failed (HTTP ${REQUEST_CODE})"
+    echo "updated email connector ${EMAIL_CONNECTOR_ID}"
+  fi
+
+  request PATCH "/api/sign-in-exp" '{"signIn":{"methods":[{"identifier":"email","password":false,"verificationCode":true,"isPasswordPrimary":false},{"identifier":"username","password":true,"verificationCode":false,"isPasswordPrimary":true}]}}'
+  ok || fail "enable email sign-in failed (HTTP ${REQUEST_CODE})"
+  echo "enabled email verification-code sign-in (username/password kept as fallback)"
+else
+  echo "note: AGORA_SMTP_* not fully set; skipped email connector (username/password sign-in only)"
+fi
+
+# --- 8. write env file for the Makefile ---
 cat > "$ENV_FILE" <<EOF
 LOGTO_ENDPOINT=${LOGTO_ENDPOINT}
 LOGTO_ADMIN_ENDPOINT=${LOGTO_ADMIN_ENDPOINT}
