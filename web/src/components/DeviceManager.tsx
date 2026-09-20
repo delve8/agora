@@ -333,6 +333,9 @@ export function DeviceManager({ devices, refresh, onRevoked, onOpen }: DeviceMan
                   {copiedCommand ? "已复制" : "复制"}
                 </Button>
               </div>
+              <Text type="secondary" className="pair-command-hint">
+                网络拦截 curl 时，把开头的 curl -fsSL 换成 wget -qO- 即可。
+              </Text>
             </div>
             <Paragraph type="secondary" style={{ marginBottom: 0 }}>
               配对成功后 daemon 会以服务方式连接，刷新会话列表即可看到它的会话；以后重启机器也会自动上线。

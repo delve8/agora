@@ -47,19 +47,26 @@ SERVER_URL=$(printf '%s' "$SERVER_URL" | sed 's:/*$::')
 BASE_URL=$(printf '%s' "$BASE_URL" | sed 's:/*$::')
 [ -n "$BASE_URL" ] || BASE_URL="$SERVER_URL"
 
-command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || {
-	echo "install.sh: curl or wget is required" >&2
+command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1 || {
+	echo "install.sh: curl, wget or python3 is required" >&2
 	exit 1
 }
 
-fetch() { # <url> <destination>
+# Try every available downloader instead of committing to the first one found.
+# Some corporate networks reset TLS connections whose ClientHello looks like
+# curl's while allowing wget or python, so a curl that is installed but blocked
+# must not stop the install.
+download() { # <url> <destination>
 	if command -v curl >/dev/null 2>&1; then
-		curl -fsSL "$1" -o "$2"
-	elif command -v wget >/dev/null 2>&1; then
-		wget -qO "$2" "$1"
-	else
-		return 1
+		curl -fsSL "$1" -o "$2" && return 0
 	fi
+	if command -v wget >/dev/null 2>&1; then
+		wget -qO "$2" "$1" && return 0
+	fi
+	if command -v python3 >/dev/null 2>&1; then
+		python3 -c 'import sys, urllib.request; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])' "$1" "$2" && return 0
+	fi
+	return 1
 }
 
 os=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -80,14 +87,14 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
 echo "Downloading $artifact ..."
-if ! fetch "$BASE_URL/download/$artifact" "$tmp/agora"; then
+if ! download "$BASE_URL/download/$artifact" "$tmp/agora"; then
 	echo "install.sh: failed to download $BASE_URL/download/$artifact" >&2
 	exit 1
 fi
 chmod +x "$tmp/agora"
 
 # Checksum verification is best effort: an older Server may not publish one.
-if fetch "$BASE_URL/download/checksums.txt" "$tmp/checksums.txt" 2>/dev/null; then
+if download "$BASE_URL/download/checksums.txt" "$tmp/checksums.txt" 2>/dev/null; then
 	expected=$(awk -v name="$artifact" '$2 == name { print $1 }' "$tmp/checksums.txt" | head -1)
 	if [ -n "$expected" ]; then
 		if command -v sha256sum >/dev/null 2>&1; then

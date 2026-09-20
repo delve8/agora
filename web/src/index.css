@@ -118,6 +118,7 @@ button, input, textarea { font: inherit; }
 .pair-expiry .ant-statistic-title { margin-bottom: 2px; color: #86909c; font-size: 12px; }
 .pair-expiry .ant-statistic-content { font-size: 20px; color: #172033; font-variant-numeric: tabular-nums; }
 .pair-command { margin: 6px 0 0; padding: 10px 12px; border-radius: 6px; overflow-x: auto; background: #0d0f13; color: #d9dee8; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.pair-command-hint { display: block; margin-top: 6px; font-size: 12px; }
 .agent-badge { flex: 0 0 auto; width: 24px; margin-inline-end: 0; padding-inline: 0; text-align: center; font-size: 11px; }
 .agent-badge .anticon { margin-inline-end: 0; }
 .agent-badge .agent-logo { display: block; width: 14px; height: 14px; margin: 0 auto; }

@@ -42,6 +42,7 @@ func TestInstallScriptBakesServerAndBaseURL(t *testing.T) {
 		"agora-daemon.service",
 		"LaunchAgents",
 		`pair "$PAIR_CODE"`,
+		"wget -qO",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("install.sh is missing %q:\n%s", want, body)
