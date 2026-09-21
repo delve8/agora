@@ -20,6 +20,15 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      # The Server image is amd64 by default: emulating an arm64 leg on an amd64
+      # runner costs ~25 minutes per push (the web bundle is built inside the
+      # image), and the deployments are x86. Set this to
+      # `linux/amd64,linux/arm64` to publish a multi-arch image deliberately.
+      platforms:
+        description: "Image platforms to build"
+        default: "linux/amd64"
+        required: false
 
 concurrency:
   group: image-${{ github.ref }}
@@ -115,9 +124,11 @@ jobs:
             VERSION=${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
             COMMIT=${{ github.sha }}
             BUILD_DATE=${{ steps.builddate.outputs.value }}
-          # arm64 matters for workstations and Apple silicon clusters; drop it if
-          # build minutes are tight.
-          platforms: linux/amd64,linux/arm64
+          # The Server image follows the deployment architecture (x86). This is
+          # unrelated to the daemon artifacts published under /download: those
+          # are cross-compiled for linux/darwin on amd64/arm64 in one stage and
+          # cost seconds, so Apple silicon workstations are unaffected.
+          platforms: ${{ inputs.platforms || 'linux/amd64' }}
           # Pull requests validate that the image builds without publishing it.
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
