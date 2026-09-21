@@ -134,7 +134,9 @@ func TestDaemonLocalWrapperFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	// Creating a session spawns a Session Host; under a fully parallel package
+	// run that is slower than the response itself ever is.
+	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
 	request := protocol.WrapperRequest{Workspace: workspace, DisplayName: "wrapper test", Role: "terminal", Agent: "claude", Prompts: []string{"hello"}}
 	if err := json.NewEncoder(conn).Encode(request); err != nil {
 		t.Fatal(err)

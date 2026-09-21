@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -368,5 +369,58 @@ func TestUpdateCopesWithAnInstallerThatPredatesNoRestart(t *testing.T) {
 	}
 	if !strings.Contains(output, "predates --no-restart") {
 		t.Fatalf("update output = %q, want the compatibility note", output)
+	}
+}
+
+// This deployment resets curl's TLS ClientHello while wget works, and another
+// network may reset Go's. Fetching therefore has to fall through the same
+// downloaders the served installer tries, instead of pinning one HTTP stack.
+func TestFetchFallsBackToAnotherDownloader(t *testing.T) {
+	original := updateDownloaders
+	t.Cleanup(func() { updateDownloaders = original })
+
+	failed := errors.New("connection reset by peer")
+	attempts := 0
+	updateDownloaders = []func(string) ([]byte, error){
+		func(string) ([]byte, error) { attempts++; return nil, failed },
+		func(string) ([]byte, error) { attempts++; return []byte("payload"), nil },
+	}
+	body, err := fetchBytes("https://example.invalid/artifact")
+	if err != nil || string(body) != "payload" {
+		t.Fatalf("fetchBytes = %q, %v, want the second downloader's body", body, err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want the fallback to run", attempts)
+	}
+
+	updateDownloaders = []func(string) ([]byte, error){
+		func(string) ([]byte, error) { return nil, failed },
+		func(string) ([]byte, error) { return nil, errors.New("second failure") },
+	}
+	if _, err := fetchBytes("https://example.invalid/artifact"); err == nil || !strings.Contains(err.Error(), "connection reset") {
+		t.Fatalf("all downloaders failing = %v, want the first error reported", err)
+	}
+}
+
+// The external downloaders run the tools that exist and are quiet about their
+// own failures.
+func TestFetchWithCommandUsesTheTool(t *testing.T) {
+	dir := t.TempDir()
+	tool := filepath.Join(dir, "fake-wget")
+	payload := "artifact bytes"
+	script := "#!/bin/sh\n# args: -q -O <dest> <url>\nprintf '%s' '" + payload + "' > \"$3\"\n"
+	if err := os.WriteFile(tool, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fetch := fetchWithCommand(tool, wgetArgs)
+	body, err := fetch("https://example.invalid/artifact")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != payload {
+		t.Fatalf("body = %q, want what the tool wrote", body)
+	}
+	if _, err := fetchWithCommand(filepath.Join(dir, "missing-tool"), wgetArgs)("https://example.invalid/x"); err == nil {
+		t.Fatal("a missing downloader did not fail")
 	}
 }

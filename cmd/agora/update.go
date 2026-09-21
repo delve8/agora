@@ -473,6 +473,40 @@ func fetchText(target string) (string, error) {
 }
 
 func fetchBytes(target string) ([]byte, error) {
+	return fetchWithDownloaders(target)
+}
+
+var updateHTTPClient = &http.Client{Timeout: 60 * time.Second}
+
+// fetchWithDownloaders mirrors the installer's fallback: some networks reset TLS
+// connections whose ClientHello looks like a particular tool's, which is exactly
+// why the served installer tries curl, wget and python in turn. The same
+// deployment can therefore be reachable for one HTTP stack and not another, so a
+// self-update must not depend on Go's.
+//
+// The Go client is tried first because it needs no process, and its failures are
+// already reported by the caller when every downloader fails.
+func fetchWithDownloaders(target string) ([]byte, error) {
+	var firstErr error
+	for _, downloader := range updateDownloaders {
+		body, err := downloader(target)
+		if err == nil {
+			return body, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	return nil, firstErr
+}
+
+var updateDownloaders = []func(string) ([]byte, error){
+	fetchWithHTTP,
+	fetchWithWget,
+	fetchWithCurl,
+}
+
+func fetchWithHTTP(target string) ([]byte, error) {
 	response, err := updateHTTPClient.Get(target)
 	if err != nil {
 		return nil, err
@@ -484,7 +518,43 @@ func fetchBytes(target string) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(response.Body, 64<<20))
 }
 
-var updateHTTPClient = &http.Client{Timeout: 60 * time.Second}
+// fetchWithCommand downloads through an external tool. wget first: it is the one
+// that survives the resets this project has seen, and it is quiet about them.
+func fetchWithCommand(name string, args func(target, destination string) []string) func(string) ([]byte, error) {
+	return func(target string) ([]byte, error) {
+		if _, err := exec.LookPath(name); err != nil {
+			return nil, err
+		}
+		dir, err := os.MkdirTemp("", "agora-update-*")
+		if err != nil {
+			return nil, err
+		}
+		defer os.RemoveAll(dir)
+		destination := filepath.Join(dir, "download")
+		command := exec.Command(name, args(target, destination)...)
+		command.Stderr = io.Discard
+		if err := command.Run(); err != nil {
+			return nil, fmt.Errorf("%s %s: %w", name, target, err)
+		}
+		return os.ReadFile(destination)
+	}
+}
+
+// wgetArgs and curlArgs are the downloaders' "write this URL to this file"
+// forms. wget is tried before curl because this deployment resets curl's TLS
+// ClientHello while leaving wget alone.
+func wgetArgs(target, destination string) []string {
+	return []string{"-q", "-O", destination, target}
+}
+
+func curlArgs(target, destination string) []string {
+	return []string{"-fsSL", "-o", destination, target}
+}
+
+var (
+	fetchWithWget = fetchWithCommand("wget", wgetArgs)
+	fetchWithCurl = fetchWithCommand("curl", curlArgs)
+)
 
 func runCommand(name string, args ...string) error {
 	command := exec.Command(name, args...)
