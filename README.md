@@ -4,7 +4,7 @@ Agora is a local-first console that adds Web/IM observation and input to native 
 
 ## Architecture
 
-In split deployment, the public `agora server` owns the HTTP API, serves the Web UI, and relays messages to registered Daemons. Each workstation runs `agora daemon`, which owns the local PTYs and Claude Code processes. `agora serve` remains available as an explicit local combined mode.
+In split deployment, the public `agora server` owns the HTTP API, serves the Web UI, and relays messages to registered Daemons. Each workstation runs `agora daemon`, which owns the local Agents. Every Agent runs under its own `agora session-host` process, so an Agent survives a Daemon restart; `agora serve` remains available as an explicit local combined mode and starts Agents the same way.
 
 ```text
 Browser ──HTTP/SSE──→ Agora Server ──WebSocket──→ Agora Daemon ──PTY──→ Claude Code
@@ -229,6 +229,36 @@ it pairs and then runs the Daemon in the foreground instead of installing a
 service. Pass `--no-service` to the installer to stop after the binary and
 pairing. See [the deployment boundary in the specification](docs/spec.md#72-daemon-部署与安装边界)
 and [the pairing contract](docs/authentication.md#61-安装与配对流程) for details.
+
+#### Updating a workstation
+
+Once paired, the workstation updates itself from the Server it is paired with:
+
+```bash
+agora update --check    # installed vs published version and checksum, changes nothing
+agora update            # download, verify, replace, restart the background service
+```
+
+`agora update` fetches the same `/download/install.sh` the first install used,
+so download, checksum verification, atomic replacement of the binary and the
+PATH wrapper, and the service definition all follow one implementation. It then
+restarts the service itself (`launchctl kickstart -k` on macOS,
+`systemctl --user restart` on Linux) and reports what changed.
+
+- `--server <url>` updates from a different Server; the default is the paired
+  one, remembered in `~/.agora/config.json`.
+- `--install-dir <dir>` overrides `~/.local/bin`. A path that is a symlink into
+  a source checkout (what `make install-wrapper` creates) is refused unless
+  `--force` is given, because replacing it would leave the checkout stale.
+- `--no-restart` installs the new binary and leaves the running daemon alone.
+- `agora version` prints the build; the Server reports its own and the
+  published artifact's at `GET /api/version` (and `GET /healthz`).
+- Sessions that are already running keep their existing `session-host` process,
+  which still runs the old binary. Stop and resume such a session to move it.
+- The Server is a container image; updating it is a redeploy, not `agora update`.
+  Build metadata is injected at build time (`VERSION`, `COMMIT`, `BUILD_DATE`),
+  so the daemon, `/api/version` and the published `version.txt` agree:
+  `make build VERSION=1.2.3`, or CI passing the tag/commit to the image build.
 
 ## Container image
 

@@ -202,7 +202,7 @@ func TestGetEventsReadsManagedJSONL(t *testing.T) {
 	if err := db.CreateSession(context.Background(), value); err != nil {
 		t.Fatal(err)
 	}
-	manager := runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), runtime.NewPTYManager("", ""))
+	manager := runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), runtime.NewClaudeProvider("", ""))
 	srv := New(":0", db, manager)
 	req := httptest.NewRequest(http.MethodGet, "/api/sessions/sess-1/events", nil)
 	resp := httptest.NewRecorder()
@@ -239,7 +239,7 @@ func TestStateListsEphemeralHistoryWithoutPersisting(t *testing.T) {
 	if err := db.CreateCoordination(context.Background(), coord); err != nil {
 		t.Fatal(err)
 	}
-	manager := runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), runtime.NewPTYManager("", home))
+	manager := runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), runtime.NewClaudeProvider("", home))
 	srv := New(":0", db, manager)
 	stateReq := httptest.NewRequest(http.MethodGet, "/api/state", nil)
 	stateResp := httptest.NewRecorder()
@@ -450,7 +450,7 @@ func TestResumeEphemeralHistoryUsesSameID(t *testing.T) {
 		t.Fatal(err)
 	}
 	binary := filepath.Join(home, "claude-test")
-	if err := os.WriteFile(binary, []byte("#!/bin/sh\nsleep 2\n"), 0o700); err != nil {
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nexec sleep 30\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	db, err := store.Open(filepath.Join(t.TempDir(), "agora.db"))
@@ -462,7 +462,8 @@ func TestResumeEphemeralHistoryUsesSameID(t *testing.T) {
 	if err := db.CreateCoordination(context.Background(), coord); err != nil {
 		t.Fatal(err)
 	}
-	manager := runtime.NewManager(db, adapter.NewClaudeCodeAdapter(binary), runtime.NewPTYManager(binary, home))
+	manager := runtime.NewManager(db, adapter.NewClaudeCodeAdapter(binary), runtime.NewClaudeProvider(binary, home))
+	manager.EnableSessionHosts(os.Args[0])
 	defer manager.Close()
 	srv := New(":0", db, manager)
 	stateReq := httptest.NewRequest(http.MethodGet, "/api/state", nil)
@@ -488,6 +489,9 @@ func TestResumeEphemeralHistoryUsesSameID(t *testing.T) {
 	if resumed.ID != originalID || resumed.Source != session.SourceManaged || !resumed.Capabilities.CanSendInput {
 		t.Fatalf("unexpected resumed session: %+v", resumed)
 	}
+	// The Agent belongs to a Session Host, which outlives this test unless it is
+	// stopped explicitly.
+	t.Cleanup(func() { _ = manager.StopSession(resumed) })
 	stored, err := db.ListSessions(context.Background(), coord.ID)
 	if err != nil || len(stored) != 1 || stored[0].ID != originalID {
 		t.Fatalf("resume created duplicate metadata: %+v, %v", stored, err)
@@ -500,7 +504,7 @@ func TestPTYSnapshotUnavailable(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	manager := runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), runtime.NewPTYManager("", ""))
+	manager := runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), runtime.NewClaudeProvider("", ""))
 	srv := New(":0", db, manager)
 	req := httptest.NewRequest(http.MethodGet, "/api/sessions/missing/pty/snapshot", nil)
 	resp := httptest.NewRecorder()
@@ -518,7 +522,7 @@ func TestHealthz(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	manager := runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), runtime.NewPTYManager("", ""))
+	manager := runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), runtime.NewClaudeProvider("", ""))
 	srv := New(":0", db, manager)
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	resp := httptest.NewRecorder()
@@ -547,7 +551,7 @@ func TestFrontendServesAssetsAndSPAFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	srv := NewWithWebDir(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), runtime.NewPTYManager("", "")), webDir)
+	srv := NewWithWebDir(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), runtime.NewClaudeProvider("", "")), webDir)
 	for _, test := range []struct {
 		path string
 		want string
@@ -584,7 +588,7 @@ func TestFrontendReturnsNotFoundWhenUnavailable(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	srv := NewWithWebDir(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), runtime.NewPTYManager("", "")), filepath.Join(t.TempDir(), "missing"))
+	srv := NewWithWebDir(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), runtime.NewClaudeProvider("", "")), filepath.Join(t.TempDir(), "missing"))
 	resp := httptest.NewRecorder()
 	srv.HTTP.Handler.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/", nil))
 	if resp.Code != http.StatusNotFound {

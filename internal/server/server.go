@@ -46,9 +46,46 @@ type Server struct {
 	publicURL string
 	// downloadDir holds the prebuilt daemon binaries published under /download.
 	downloadDir string
+	// buildInfo is what this Server is (and, through /api/version, what it
+	// publishes): `agora update --check` compares it with the local binary.
+	buildMu   sync.Mutex
+	buildInfo map[string]string
 
 	notifyMu       sync.Mutex
 	notifyPolicies map[string]*notification.Policy
+}
+
+// SetBuildInfo records the version, commit and build date of this binary. It is
+// set by the command that constructs the Server, which is where the linker's
+// values live.
+func (s *Server) SetBuildInfo(version, commit, date string) {
+	s.buildMu.Lock()
+	defer s.buildMu.Unlock()
+	s.buildInfo = map[string]string{"version": version, "commit": commit, "date": date}
+}
+
+// buildInfoJSON is what /api/version and /healthz answer with. It also reports
+// the version of the artifacts in the download directory, because that, not the
+// Server's own build, is what a workstation installs: they are built together,
+// but a half-updated deployment is worth seeing.
+func (s *Server) buildInfoJSON() map[string]string {
+	s.buildMu.Lock()
+	info := make(map[string]string, len(s.buildInfo)+4)
+	for key, value := range s.buildInfo {
+		info[key] = value
+	}
+	s.buildMu.Unlock()
+	if _, ok := info["version"]; !ok {
+		info["version"] = "unknown"
+	}
+	if s.downloadDir != "" {
+		if body, err := os.ReadFile(filepath.Join(s.downloadDir, "version.txt")); err == nil {
+			if value := strings.TrimSpace(string(body)); value != "" {
+				info["artifact_version"] = value
+			}
+		}
+	}
+	return info
 }
 
 func New(addr string, db *store.Store, manager *runtime.Manager) *Server {
@@ -91,8 +128,7 @@ func NewWithWebDirAndAuth(addr string, db *store.Store, manager *runtime.Manager
 	}
 	if manager != nil {
 		manager.SetEventHandler(func(item event.Event) { s.notifyObservedEvents(item.SessionID, []event.Event{item}) })
-		manager.SetAttentionHandler(s.notifySessionAttention)
-		manager.SetSessionExitHandler(func(value session.Session, exited runtime.PTYExit) {
+		manager.SetSessionExitHandler(func(value session.Session, exited runtime.AgentExit) {
 			if exited.ExitCode != 0 && !exited.Intentional {
 				s.notifyTaskResult(value.ID, false, value.LastError, "")
 			}
@@ -106,6 +142,7 @@ func NewWithWebDirAndAuth(addr string, db *store.Store, manager *runtime.Manager
 	mux.HandleFunc("GET /download/{name}", s.downloadArtifact)
 	// Public client configuration: the browser needs it before it can log in.
 	mux.HandleFunc("GET /api/config", s.publicConfig)
+	mux.HandleFunc("GET /api/version", s.version)
 	mux.HandleFunc("GET /api/daemon/ws", s.daemons.serveHTTP)
 	mux.HandleFunc("POST /api/daemon/pair", s.pairDaemon)
 	mux.HandleFunc("POST /api/daemon/wrap", s.daemonWrap)
@@ -404,7 +441,14 @@ func (s *Server) sessionOpenURL(id string) string {
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	body := s.buildInfoJSON()
+	body["status"] = "ok"
+	writeJSON(w, http.StatusOK, body)
+}
+
+// version answers what this Server runs and what it publishes for workstations.
+func (s *Server) version(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, s.buildInfoJSON())
 }
 
 // publicConfig tells the Web UI how to authenticate. It is intentionally
@@ -419,6 +463,30 @@ func (s *Server) publicConfig(w http.ResponseWriter, _ *http.Request) {
 		"logto_app_id":   s.logtoClient.AppID,
 		"logto_audience": s.logtoClient.Audience,
 	})
+}
+
+// wrapperRequestInput is the body of POST /api/daemon/wrap.
+type wrapperRequestInput struct {
+	SessionID   string            `json:"session_id"`
+	AgentArgs   []string          `json:"agent_args"`
+	Workspace   string            `json:"workspace"`
+	DisplayName string            `json:"display_name"`
+	Role        string            `json:"role"`
+	Agent       string            `json:"agent"`
+	Prompts     []string          `json:"prompts"`
+	Terminal    map[string]string `json:"terminal"`
+}
+
+// wrapperCreatePayload is the Daemon frame a wrapper request turns into. It is a
+// separate function so a new field in the wrapper protocol cannot be added here
+// and silently forgotten on the way to the Daemon.
+func wrapperCreatePayload(input wrapperRequestInput, daemonID string) protocol.SessionCreatePayload {
+	return protocol.SessionCreatePayload{
+		AgentArgs: input.AgentArgs,
+		Role:      input.Role,
+		Terminal:  input.Terminal,
+		DaemonID:  daemonID,
+	}
 }
 
 // daemonWrap is the local terminal wrapper API. It authenticates with the
@@ -452,15 +520,7 @@ func (s *Server) daemonWrap(w http.ResponseWriter, r *http.Request) {
 		writeErrorStatus(w, http.StatusServiceUnavailable, fmt.Errorf("daemon %s is offline or unavailable", daemonID))
 		return
 	}
-	var input struct {
-		SessionID   string   `json:"session_id"`
-		AgentArgs   []string `json:"agent_args"`
-		Workspace   string   `json:"workspace"`
-		DisplayName string   `json:"display_name"`
-		Role        string   `json:"role"`
-		Agent       string   `json:"agent"`
-		Prompts     []string `json:"prompts"`
-	}
+	var input wrapperRequestInput
 	if err := decodeJSON(r, &input); err != nil {
 		writeErrorStatus(w, http.StatusBadRequest, err)
 		return
@@ -543,7 +603,12 @@ func (s *Server) daemonWrap(w http.ResponseWriter, r *http.Request) {
 	// The workspace belongs to the Daemon host, not necessarily the Server
 	// host. The Daemon validates that this absolute path exists locally when it
 	// handles the session.create frame.
-	result, err := s.daemons.createSession(r.Context(), protocol.SessionCreatePayload{CoordinationID: coordinationID, Workspace: workspace, DisplayName: displayName, Role: input.Role, Agent: agent, AgentArgs: input.AgentArgs, DaemonID: daemonID}, daemonID)
+	payload := wrapperCreatePayload(input, daemonID)
+	payload.CoordinationID = coordinationID
+	payload.Workspace = workspace
+	payload.DisplayName = displayName
+	payload.Agent = agent
+	result, err := s.daemons.createSession(r.Context(), payload, daemonID)
 	if err != nil {
 		writeErrorStatus(w, http.StatusBadGateway, err)
 		return
@@ -635,7 +700,7 @@ func (s *Server) authorizeSession(ctx context.Context, value session.Session) er
 
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/healthz" || r.URL.Path == "/api/config" || r.URL.Path == "/api/daemon/ws" || r.URL.Path == "/api/daemon/pair" || r.URL.Path == "/api/daemon/wrap" || !strings.HasPrefix(r.URL.Path, "/api/") {
+		if r.URL.Path == "/healthz" || r.URL.Path == "/api/config" || r.URL.Path == "/api/version" || r.URL.Path == "/api/daemon/ws" || r.URL.Path == "/api/daemon/pair" || r.URL.Path == "/api/daemon/wrap" || !strings.HasPrefix(r.URL.Path, "/api/") {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -1685,13 +1750,7 @@ func (s *Server) attachAddr(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.manager != nil && s.manager.CanManageSessions() {
-		var addr string
-		var err error
-		if value.Agent == "pi" {
-			addr, err = s.manager.AttachPiAddr(id)
-		} else {
-			addr, err = s.manager.AttachAddr(id)
-		}
+		addr, err := s.manager.AttachAddr(id)
 		if err != nil {
 			writeErrorStatus(w, http.StatusNotFound, err)
 			return

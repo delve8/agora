@@ -32,8 +32,8 @@ func (a *ClaudeCodeAdapter) Capabilities() Capabilities {
 }
 
 // StartTurn is retained for interface compatibility but is not used: managed
-// sessions run continuously in a PTY owned by PTYManager, and input is written
-// straight into the PTY master.
+// sessions run continuously in a PTY owned by a Session Host, and input is
+// written straight into that PTY.
 func (a *ClaudeCodeAdapter) StartTurn(context.Context, session.Session, string, func(TurnEvent)) error {
-	return fmt.Errorf("StartTurn is obsolete; managed sessions are driven through PTYManager.Input")
+	return fmt.Errorf("StartTurn is obsolete; managed sessions are driven through the Session Host")
 }

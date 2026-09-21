@@ -731,22 +731,16 @@ func (m *Manager) rebindSession(id, agent, nativeID, historyPath, workspace, dis
 			} else {
 				managerErr = fmt.Errorf("managed session %s has no session-host", id)
 			}
-		} else if agent == "pi" && m.pi != nil {
-			managerErr = m.pi.Rebind(id, newID, nativeID)
-		} else if agent == "claude" && m.pty != nil {
-			managerErr = m.pty.Rebind(id, newID, nativeID)
 		}
 		if managerErr != nil {
 			_ = m.store.RekeySession(context.Background(), newID, old)
 			return session.Session{}, managerErr
 		}
+		// The rekey is committed: a caller holding the previous id must keep
+		// reaching this session (a wrapper attaches with the id the Daemon just
+		// returned for a newly created session).
+		m.rememberRekey(id, newID)
 		m.mu.Lock()
-		if active := m.active[id]; active {
-			m.active[newID] = active
-			delete(m.active, id)
-		}
-		m.generation[newID] = m.generation[id]
-		delete(m.generation, id)
 		m.mu.Unlock()
 		m.stopSwitchWatcher(id)
 	} else {
@@ -757,10 +751,6 @@ func (m *Manager) rebindSession(id, agent, nativeID, historyPath, workspace, dis
 			} else {
 				managerErr = fmt.Errorf("managed session %s has no session-host", id)
 			}
-		} else if agent == "pi" && m.pi != nil {
-			managerErr = m.pi.Rebind(id, newID, nativeID)
-		} else if agent == "claude" && m.pty != nil {
-			managerErr = m.pty.Rebind(id, newID, nativeID)
 		}
 		if managerErr != nil {
 			return session.Session{}, managerErr

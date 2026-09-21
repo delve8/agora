@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -16,15 +17,23 @@ import (
 	"github.com/delve8/agora/internal/store"
 )
 
+const usageLine = "usage: agora serve | agora server | agora daemon | agora update [--check] | agora version | " +
+	"agora pair <code> [--server <url>] | agora session-host --config <path> | agora pty <args...> | " +
+	"agora attach [list [--all] | <#|session-id>] | agora wrap <pi|claude> [session-id|prompt...]"
+
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: agora serve | agora server | agora daemon | agora pair <code> [--server <url>] | agora session-host --config <path> | agora pty <args...> | agora attach [list [--all] | <#|session-id>] | agora wrap <pi|claude> [session-id|prompt...] | agora wrapper [session-id] | agora pi-wrapper [session-id]")
+		fmt.Fprintln(os.Stderr, usageLine)
 		os.Exit(2)
 	}
 	var err error
 	switch os.Args[1] {
 	case "serve":
 		err = serve()
+	case "version", "--version", "-v":
+		err = runVersion(os.Args[2:])
+	case "update":
+		err = runUpdate(os.Args[2:])
 	case "server":
 		err = runServer()
 	case "session-host":
@@ -65,10 +74,17 @@ func main() {
 		// Backward-compatible alias for `agora wrap pi`.
 		err = runPiWrapper(os.Args[2:])
 	default:
-		fmt.Fprintln(os.Stderr, "usage: agora serve | agora server | agora daemon | agora pair <code> [--server <url>] | agora session-host --config <path> | agora pty <args...> | agora attach [list [--all] | <#|session-id>] | agora wrap <pi|claude> [session-id|prompt...] | agora wrapper [session-id] | agora pi-wrapper [session-id]")
+		fmt.Fprintln(os.Stderr, usageLine)
 		os.Exit(2)
 	}
 	if err != nil {
+		var passthrough passthroughAgentError
+		if errors.As(err, &passthrough) {
+			// A provider CLI command (`pi update`) is not an Agent session. This is
+			// a routing answer for the PATH wrapper, not a failure; the wrapper
+			// starts the real binary when it sees this exit code.
+			os.Exit(passthrough.ExitCode())
+		}
 		log.Printf("agora: %v", err)
 		if value, ok := err.(interface{ ExitCode() int }); ok {
 			os.Exit(value.ExitCode())
@@ -85,12 +101,18 @@ func serve() error {
 	defer database.Close()
 
 	agentAdapter := adapter.NewClaudeCodeAdapter(os.Getenv("AGORA_CLAUDE_BINARY"))
-	ptyManager := runtime.NewPTYManager(os.Getenv("AGORA_CLAUDE_BINARY"), os.Getenv("HOME"))
+	ptyManager := runtime.NewClaudeProvider(os.Getenv("AGORA_CLAUDE_BINARY"), os.Getenv("HOME"))
 	manager := runtime.NewManager(database, agentAdapter, ptyManager)
-	manager.AttachPi(runtime.NewPiManager(runtime.PiConfig{
+	// Every Agent runs under its own Session Host, in this process and in a
+	// Daemon alike: the local Server spawns `session-host` from its own binary.
+	manager.EnableSessionHosts(os.Args[0])
+	manager.AttachPi(runtime.NewPiProvider(runtime.PiConfig{
 		Binary: os.Getenv("AGORA_PI_BINARY"), Provider: os.Getenv("AGORA_PI_PROVIDER"),
 		Model: os.Getenv("AGORA_PI_MODEL"), SessionDir: os.Getenv("AGORA_PI_SESSION_DIR"),
 	}))
+	if err := manager.AdoptSessionHosts(context.Background()); err != nil {
+		log.Printf("agora: adopt session hosts: %v", err)
+	}
 	if err := manager.ReconcileObservers(context.Background()); err != nil {
 		log.Printf("agora: reconcile observers: %v", err)
 	}
@@ -102,6 +124,7 @@ func serve() error {
 		addr = "127.0.0.1:8080"
 	}
 	srv := server.NewWithWebDir(addr, database, manager, os.Getenv("AGORA_WEB_DIR"))
+	srv.SetBuildInfo(buildInfo())
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

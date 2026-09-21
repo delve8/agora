@@ -30,9 +30,9 @@ func newReporterTestManager(t *testing.T) (*Manager, *sessionhost.Client, string
 		t.Fatal(err)
 	}
 
-	manager := NewDaemonManager(NewMemoryStore(), "daemon-1", adapter.NewClaudeCodeAdapter(""), NewPTYManager("", home))
+	manager := NewDaemonManager(NewMemoryStore(), "daemon-1", adapter.NewClaudeCodeAdapter(""), NewClaudeProvider("", home))
 	manager.EnableSessionHosts(os.Args[0])
-	manager.AttachPi(NewPiManager(PiConfig{Binary: agent, SessionDir: sessionDir}))
+	manager.AttachPi(NewPiProvider(PiConfig{Binary: agent, SessionDir: sessionDir}))
 
 	ctx := context.Background()
 	provisional := "pending/session-reporter-test"

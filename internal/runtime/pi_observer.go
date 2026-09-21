@@ -79,12 +79,6 @@ func (m *Manager) observePi(ctx context.Context, value session.Session, token ui
 		}
 		if cursor.Path == "" {
 			nativeID := strings.TrimPrefix(value.AgentSessionID, "pi://")
-			if nativeID == "" && m.pi != nil {
-				nativeID = m.pi.NativeID(value.ID)
-				if nativeID != "" {
-					value.AgentSessionID = "pi://" + nativeID
-				}
-			}
 			if nativeID != "" {
 				cursor.Path = adapter.FindPiHistoryBySessionID(m.piHistoryRoot(), nativeID)
 				if cursor.Path != "" {
@@ -131,7 +125,6 @@ func (m *Manager) observePi(ctx context.Context, value session.Session, token ui
 					cursor.Line = record.Cursor.Line
 					cursor.LastID = record.Event.ExternalID
 					_ = m.store.SaveObservationCursor(ctx, store.ObservationCursor{SessionID: value.ID, Path: cursor.Path, ByteOffset: cursor.ByteOffset, Line: cursor.Line, LastID: cursor.LastID})
-					m.advanceObservation(value.ID)
 					m.publish(value.CoordinationID, record.Event)
 				}
 				if len(records) > 0 {
@@ -140,20 +133,6 @@ func (m *Manager) observePi(ctx context.Context, value session.Session, token ui
 					value.State = session.StateWaiting
 					value.Connection = session.ConnectionObserved
 					_ = m.store.UpdateSessionObservation(ctx, value)
-				}
-			}
-		}
-		if m.pi != nil {
-			if events, eventErr := m.pi.Events(value.ID); eventErr == nil {
-				select {
-				case item, ok := <-events:
-					if !ok {
-						return
-					}
-					if item.Event.ID != "" {
-						m.publish(value.CoordinationID, item.Event)
-					}
-				default:
 				}
 			}
 		}

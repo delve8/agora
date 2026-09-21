@@ -42,6 +42,7 @@ func runServer() error {
 		return err
 	}
 	srv := server.NewWithWebDirAndAuth(addr, database, manager, os.Getenv("AGORA_WEB_DIR"), authConfig)
+	srv.SetBuildInfo(buildInfo())
 	// The split server deliberately has no local runtime manager. Keep the
 	// shutdown callback nil-safe; a SIGTERM must not turn into a panic while
 	// the server is already shutting down.
@@ -60,19 +61,18 @@ func runDaemon(pairCode string) error {
 		return err
 	}
 	d, err := daemon.New(daemon.Config{
-		ID:                 daemonID,
-		Version:            firstEnv("AGORA_VERSION", "dev"),
-		ServerURL:          daemonWSURL(resolveDaemonServerURL(os.Getenv("AGORA_CONFIG_PATH"))),
-		Credential:         credential,
-		CredentialPath:     os.Getenv("AGORA_DEVICE_CREDENTIAL_PATH"),
-		ClaudeBinary:       os.Getenv("AGORA_CLAUDE_BINARY"),
-		PiBinary:           firstEnv("AGORA_PI_BINARY", "PI_BINARY"),
-		PiProvider:         firstEnv("AGORA_PI_PROVIDER", "PI_PROVIDER"),
-		PiModel:            firstEnv("AGORA_PI_MODEL", "PI_MODEL"),
-		PiSessionDir:       firstEnv("AGORA_PI_SESSION_DIR", "PI_SESSION_DIR"),
-		LocalSocketPath:    os.Getenv("AGORA_DAEMON_SOCKET"),
-		HomeDir:            os.Getenv("HOME"),
-		SessionHostEnabled: true,
+		ID:              daemonID,
+		Version:         buildVersion(),
+		ServerURL:       daemonWSURL(resolveDaemonServerURL(os.Getenv("AGORA_CONFIG_PATH"))),
+		Credential:      credential,
+		CredentialPath:  os.Getenv("AGORA_DEVICE_CREDENTIAL_PATH"),
+		ClaudeBinary:    os.Getenv("AGORA_CLAUDE_BINARY"),
+		PiBinary:        firstEnv("AGORA_PI_BINARY", "PI_BINARY"),
+		PiProvider:      firstEnv("AGORA_PI_PROVIDER", "PI_PROVIDER"),
+		PiModel:         firstEnv("AGORA_PI_MODEL", "PI_MODEL"),
+		PiSessionDir:    firstEnv("AGORA_PI_SESSION_DIR", "PI_SESSION_DIR"),
+		LocalSocketPath: os.Getenv("AGORA_DAEMON_SOCKET"),
+		HomeDir:         os.Getenv("HOME"),
 	})
 	if err != nil {
 		return err

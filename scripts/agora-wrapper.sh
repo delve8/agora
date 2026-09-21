@@ -100,6 +100,8 @@ resolve_original_agent() {
 }
 
 run_original_agent() {
+  local reason="${1:-local daemon is unavailable}"
+  shift || true
   local original_name="$agent"
   local configured=""
   case "$agent" in
@@ -113,7 +115,7 @@ run_original_agent() {
   if ! original="$(resolve_original_agent "$configured" "$original_name")"; then
     exit 1
   fi
-  echo "agora wrapper: local daemon is unavailable; starting original $original_name directly: $original" >&2
+  echo "agora wrapper: $reason; starting original $original_name directly: $original" >&2
   exec "$original" "$@"
 }
 
@@ -125,20 +127,24 @@ if [[ ! -S "$daemon_socket" ]]; then
     echo "agora wrapper: local daemon is unavailable; cannot attach to existing session ${1}" >&2
     exit 1
   fi
-  run_original_agent "$@"
+  run_original_agent "local daemon is unavailable" "$@"
 fi
 
 if [[ -n "$agora_bin" && -x "$agora_bin" ]]; then
-  # Exit code 75 (EX_TEMPFAIL) means the local Daemon could not be reached.
-  # Only that transport failure permits fallback; validation and Agent errors
-  # must still be returned to the caller.
+  # Exit code 75 (EX_TEMPFAIL) means the local Daemon could not be reached, and
+  # 76 means the invocation is a provider CLI command rather than an Agent
+  # session (`pi update`, `pi -p ...`). Both run the original binary unchanged;
+  # validation and Agent errors must still be returned to the caller.
   if "$agora_bin" wrap "$agent" "$@"; then
     exit 0
   else
     status=$?
   fi
-  if [[ "$status" -eq 75 ]] && ! is_existing_agora_session "${1:-}"; then
-    run_original_agent "$@"
+  if ! is_existing_agora_session "${1:-}"; then
+    case "$status" in
+      75) run_original_agent "local daemon is unavailable" "$@" ;;
+      76) run_original_agent "$agent was invoked as a CLI command, not an Agent session" "$@" ;;
+    esac
   fi
   exit "$status"
 fi
@@ -147,4 +153,4 @@ if is_existing_agora_session "${1:-}"; then
   echo "agora wrapper: Agora binary not found; cannot attach to existing session ${1}" >&2
   exit 1
 fi
-run_original_agent "$@"
+run_original_agent "Agora binary not found" "$@"

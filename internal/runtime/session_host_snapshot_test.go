@@ -32,9 +32,9 @@ func TestHostedSessionSnapshotIsServedByTheHost(t *testing.T) {
 
 	ctx := context.Background()
 	store := NewMemoryStore()
-	manager := NewDaemonManager(store, "daemon-1", adapter.NewClaudeCodeAdapter(""), NewPTYManager("", home))
+	manager := NewDaemonManager(store, "daemon-1", adapter.NewClaudeCodeAdapter(""), NewClaudeProvider("", home))
 	manager.EnableSessionHosts(os.Args[0])
-	manager.AttachPi(NewPiManager(PiConfig{Binary: agent, SessionDir: sessionDir}))
+	manager.AttachPi(NewPiProvider(PiConfig{Binary: agent, SessionDir: sessionDir}))
 	defer manager.Close()
 
 	created, err := manager.CreateManagedSessionWithAgentArgs(ctx, "pending/session-snapshot-test", "coord-1", workspace, "New session", "terminal", "pi", nil)

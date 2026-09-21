@@ -261,4 +261,5 @@ principal.user_id
 - SSE 直接消费进程内 pub/sub；
 - `internal/store` 仍包含 Event/Message 表。
 
-下一阶段实现应先抽取本协议的 envelope 和 runtime sink，再迁移 PTY 到 Daemon，不能先删除现有 `agora serve` 路径。
+PTY 已迁移到 Session Host（`agora serve` 也通过 `session-host` 启动 Agent），
+该阶段完成。

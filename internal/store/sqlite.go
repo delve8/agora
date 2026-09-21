@@ -308,7 +308,11 @@ func (s *Store) UpdateSessionState(ctx context.Context, id, state string) error 
 
 func (s *Store) UpdateSessionObservation(ctx context.Context, v session.Session) error {
 	return s.withBusyRetry(ctx, func() error {
-		_, err := s.db.ExecContext(ctx, `UPDATE sessions SET state=?,source=?,connection=?,process_id=?,session_meta_path=?,history_path=?,claude_session_id=?,last_discovered_at=?,last_observed_at=?,last_error=?,updated_at=? WHERE id=?`, v.State, v.Source, v.Connection, v.ProcessID, v.SessionMetaPath, v.HistoryPath, v.ClaudeSessionID, formatOptionalTime(v.LastDiscoveredAt), formatOptionalTime(v.LastObservedAt), v.LastError, nowString(), v.ID)
+		caps, err := json.Marshal(v.Capabilities)
+		if err != nil {
+			return err
+		}
+		_, err = s.db.ExecContext(ctx, `UPDATE sessions SET state=?,source=?,connection=?,process_id=?,session_meta_path=?,history_path=?,claude_session_id=?,last_discovered_at=?,last_observed_at=?,last_error=?,capabilities_json=?,updated_at=? WHERE id=?`, v.State, v.Source, v.Connection, v.ProcessID, v.SessionMetaPath, v.HistoryPath, v.ClaudeSessionID, formatOptionalTime(v.LastDiscoveredAt), formatOptionalTime(v.LastObservedAt), v.LastError, string(caps), nowString(), v.ID)
 		return err
 	})
 }

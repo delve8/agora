@@ -7,6 +7,13 @@
 
 # syntax=docker/dockerfile:1
 
+# Build metadata. The Server and the daemon artifacts it publishes are built from
+# the same value, so /api/version, /download/version.txt and the running daemon
+# agree. CI passes the tag or commit.
+ARG VERSION=dev
+ARG COMMIT=none
+ARG BUILD_DATE=unknown
+
 # ---------------------------------------------------------------- Web bundle
 FROM node:24-alpine AS web
 WORKDIR /src/web
@@ -20,6 +27,10 @@ RUN npm run build
 
 # --------------------------------------------------------------- Go binaries
 FROM golang:1.25-alpine AS build
+# Declared per stage: build args do not carry into a stage on their own.
+ARG VERSION
+ARG COMMIT
+ARG BUILD_DATE
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -29,13 +40,18 @@ COPY . .
 ARG TARGETOS=linux
 ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w" -o /out/agora ./cmd/agora
+    go build -trimpath \
+      -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${BUILD_DATE}" \
+      -o /out/agora ./cmd/agora
 
 # ------------------------------------------------ Daemon binaries (download)
 # Workstations get a prebuilt daemon from the Server, so they need no Go
 # toolchain. Cross-compile every supported platform and publish the results
 # under /download (served by internal/server/download.go).
 FROM golang:1.25-alpine AS daemons
+ARG VERSION
+ARG COMMIT
+ARG BUILD_DATE
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -45,9 +61,12 @@ RUN set -eux; \
     for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do \
       os=${target%/*}; arch=${target#*/}; \
       CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
-        go build -trimpath -ldflags="-s -w" -o "/out/download/agora-$os-$arch" ./cmd/agora; \
+        go build -trimpath \
+          -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${BUILD_DATE}" \
+          -o "/out/download/agora-$os-$arch" ./cmd/agora; \
     done; \
     cp scripts/agora-wrapper.sh /out/download/agora-wrapper.sh; \
+    printf '%s\n' "${VERSION}" > /out/download/version.txt; \
     cd /out/download && sha256sum agora-* > checksums.txt
 
 # ------------------------------------------------------------------- Runtime

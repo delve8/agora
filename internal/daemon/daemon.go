@@ -28,21 +28,20 @@ import (
 )
 
 type Config struct {
-	ID                 string
-	Version            string
-	ServerURL          string
-	Credential         string
-	CredentialPath     string
-	ClaudeBinary       string
-	PiBinary           string
-	PiProvider         string
-	PiModel            string
-	PiSessionDir       string
-	LocalSocketPath    string
-	HomeDir            string
-	Heartbeat          time.Duration
-	OutboxLimit        int
-	SessionHostEnabled bool
+	ID              string
+	Version         string
+	ServerURL       string
+	Credential      string
+	CredentialPath  string
+	ClaudeBinary    string
+	PiBinary        string
+	PiProvider      string
+	PiModel         string
+	PiSessionDir    string
+	LocalSocketPath string
+	HomeDir         string
+	Heartbeat       time.Duration
+	OutboxLimit     int
 }
 
 type Daemon struct {
@@ -82,13 +81,13 @@ func New(config Config) (*Daemon, error) {
 	if config.OutboxLimit <= 0 {
 		config.OutboxLimit = 256
 	}
-	manager := runtime.NewDaemonManager(runtime.NewMemoryStore(), config.ID, adapter.NewClaudeCodeAdapter(config.ClaudeBinary), runtime.NewPTYManager(config.ClaudeBinary, config.HomeDir))
-	if config.SessionHostEnabled {
-		manager.EnableSessionHosts(os.Args[0])
-	}
-	manager.AttachPi(runtime.NewPiManager(runtime.PiConfig{Binary: config.PiBinary, Provider: config.PiProvider, Model: config.PiModel, SessionDir: config.PiSessionDir}))
+	manager := runtime.NewDaemonManager(runtime.NewMemoryStore(), config.ID, adapter.NewClaudeCodeAdapter(config.ClaudeBinary), runtime.NewClaudeProvider(config.ClaudeBinary, config.HomeDir))
+	// Session Hosts are the only way an Agent runs: every session gets its own
+	// `agora session-host` process, so the Daemon never owns an Agent PTY.
+	manager.EnableSessionHosts(os.Args[0])
+	manager.AttachPi(runtime.NewPiProvider(runtime.PiConfig{Binary: config.PiBinary, Provider: config.PiProvider, Model: config.PiModel, SessionDir: config.PiSessionDir}))
 	daemon := &Daemon{config: config, manager: manager, outbox: newOutbox(config.OutboxLimit), events: make(map[string]context.CancelFunc), registeredCh: make(chan struct{})}
-	manager.SetSessionExitHandler(func(value session.Session, exited runtime.PTYExit) {
+	manager.SetSessionExitHandler(func(value session.Session, exited runtime.AgentExit) {
 		daemon.stopEventBridge(value.ID)
 		_ = daemon.send(protocol.SessionExit, protocol.ExitPayload{SessionID: value.ID, State: value.State, ExitCode: exited.ExitCode, LastError: value.LastError, Intentional: exited.Intentional})
 	})
@@ -103,9 +102,6 @@ func New(config Config) (*Daemon, error) {
 		}
 		payload.Events = body
 		_ = daemon.send(protocol.EventBatch, payload)
-	})
-	manager.SetAttentionHandler(func(id, attention string) {
-		_ = daemon.send(protocol.SessionUpdate, protocol.SessionUpdatePayload{SessionID: id, Attention: attention})
 	})
 	manager.SetSessionUpdateHandler(func(value session.Session) {
 		_ = daemon.send(protocol.SessionUpdate, protocol.SessionUpdatePayload{SessionID: value.ID, DaemonID: config.ID, Agent: value.Agent, AgentSessionID: value.AgentSessionID, HistoryPath: value.HistoryPath, DisplayName: value.DisplayName, DisplayNameSource: value.DisplayNameSource, State: value.State, Connection: value.Connection, PID: value.ProcessID, LastError: value.LastError})
@@ -676,7 +672,7 @@ func (d *Daemon) handle(frame protocol.Envelope) error {
 					if agent == "claude" {
 						value.ClaudeSessionID = strings.TrimPrefix(identity.AgentSessionID, "claude://")
 					}
-					value, err = d.manager.ResumeSession(context.Background(), value)
+					value, err = d.manager.ResumeSession(runtime.WithTerminalEnv(context.Background(), payload.Terminal), value)
 				}
 			}
 		} else {
@@ -693,21 +689,33 @@ func (d *Daemon) handle(frame protocol.Envelope) error {
 			}
 			provisional := "pending/" + protocol.NewID("session")
 			if err == nil {
-				value, err = d.manager.CreateManagedSessionWithAgentArgs(context.Background(), provisional, payload.CoordinationID, workspace, payload.DisplayName, payload.Role, agent, payload.AgentArgs)
+				// The requesting terminal's identity travels with the create request:
+				// the Daemon is a service, so it has no TERM of its own to give the
+				// Agent, and an Agent without one renders for 16 colours.
+				createCtx := runtime.WithTerminalEnv(context.Background(), payload.Terminal)
+				value, err = d.manager.CreateManagedSessionWithAgentArgs(createCtx, provisional, payload.CoordinationID, workspace, payload.DisplayName, payload.Role, agent, payload.AgentArgs)
 			}
 			if err == nil {
-				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				nativeID, waitErr := d.manager.WaitAgentSessionID(ctx, provisional)
-				cancel()
-				if waitErr != nil {
-					err = waitErr
+				// A Pi invocation that forwards the user's arguments cannot be told
+				// which session id to use, so the provider may create its own and
+				// report it before the identity is adopted here. Adopt what the
+				// provider already decided instead of overwriting it.
+				if resolved := d.manager.ResolveSessionID(provisional); resolved != provisional {
+					value, err = d.manager.GetSession(context.Background(), resolved)
 				} else {
-					uri := agent + "://" + nativeID
-					canonicalID, identityErr := session.NewSessionID(d.config.ID, agent, uri)
-					if identityErr != nil {
-						err = identityErr
-					} else if value, err = d.manager.SetAgentIdentity(context.Background(), provisional, agent, uri); err == nil {
-						value, err = d.manager.RekeySession(context.Background(), provisional, canonicalID)
+					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					nativeID, waitErr := d.manager.WaitAgentSessionID(ctx, provisional)
+					cancel()
+					if waitErr != nil {
+						err = waitErr
+					} else {
+						uri := agent + "://" + nativeID
+						canonicalID, identityErr := session.NewSessionID(d.config.ID, agent, uri)
+						if identityErr != nil {
+							err = identityErr
+						} else if value, err = d.manager.SetAgentIdentity(context.Background(), provisional, agent, uri); err == nil {
+							value, err = d.manager.RekeySession(context.Background(), provisional, canonicalID)
+						}
 					}
 				}
 			}
@@ -827,12 +835,12 @@ func (d *Daemon) handle(frame protocol.Envelope) error {
 		if value, err := d.manager.GetSession(context.Background(), payload.SessionID); err != nil {
 			response.Error = err.Error()
 		} else {
+			// The provider may have rekeyed the session after the caller was
+			// handed its id (a Pi process that picks its own session). Attach the
+			// session the id now names, not the stale string.
+			target := value.ID
 			var socket string
-			if value.Agent == "pi" {
-				socket, err = d.manager.AttachPiAddr(payload.SessionID)
-			} else {
-				socket, err = d.manager.AttachAddr(payload.SessionID)
-			}
+			socket, err = d.manager.AttachAddr(target)
 			if err != nil {
 				response.Error = err.Error()
 			} else {

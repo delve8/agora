@@ -107,10 +107,14 @@ type Host struct {
 	attachPath  string
 	token       string
 	observation terminal.Emulator
+	terminal    *terminalObserver
 	events      map[net.Conn]struct{}
 
-	mu       sync.Mutex
-	inputMu  sync.Mutex
+	mu      sync.Mutex
+	inputMu sync.Mutex
+	// ptyMu serializes writes to the Agent, so a capability answer from the
+	// observer cannot interleave with a client's keystrokes.
+	ptyMu    sync.Mutex
 	clients  map[net.Conn]struct{}
 	input    *inputObserver
 	stopping bool
@@ -251,6 +255,7 @@ func (h *Host) prepareSockets() error {
 	h.mu.Lock()
 	h.control, h.attach, h.controlPath, h.attachPath, h.token = control, attach, controlPath, attachPath, token
 	h.observation = terminal.NewVT10x(terminal.DefaultCols, terminal.DefaultRows)
+	h.terminal = newTerminalObserver()
 	h.input = &inputObserver{onLine: h.broadcastInput}
 	h.meta = Metadata{SchemaVersion: MetadataVersion, HostID: h.config.HostID, SessionID: h.config.SessionID, CoordinationID: h.config.CoordinationID, DaemonID: h.config.DaemonID, Agent: h.config.Agent, AgentSessionID: h.config.AgentSessionID, Workspace: h.config.Workspace, DisplayName: h.config.DisplayName, DisplayNameSource: h.config.DisplayNameSource, HistoryPath: h.config.HistoryPath, HostPID: os.Getpid(), HostStartedAt: now, ControlSocket: controlPath, AttachSocket: attachPath, State: "starting", CreatedAt: now, UpdatedAt: now, TokenFile: tokenPath}
 	meta := h.meta
@@ -265,6 +270,7 @@ func (h *Host) readOutput() {
 		if n > 0 {
 			data := append([]byte(nil), buf[:n]...)
 			h.mu.Lock()
+			attached := len(h.clients) > 0
 			if h.observation != nil {
 				_ = h.observation.Write(data)
 			}
@@ -273,6 +279,12 @@ func (h *Host) readOutput() {
 				clients = append(clients, conn)
 			}
 			h.mu.Unlock()
+			// The Agent's terminal setup happens before any client attaches, so
+			// the Host answers its capability queries and remembers the modes it
+			// enabled for the clients that attach later.
+			if reply := h.terminal.Observe(data, attached); len(reply) > 0 {
+				h.writeToAgent(reply)
+			}
 			for _, conn := range clients {
 				_, _ = conn.Write(data)
 			}
@@ -300,6 +312,14 @@ func (h *Host) serveAttach() {
 		// the same lock to hand bytes to the clients, so a client that attaches
 		// to a session which already painted sees the screen first and live
 		// output after it, with nothing lost in between.
+		//
+		// Modes come first: the Agent enabled them (bracketed paste, the kitty
+		// keyboard protocol, mouse reporting) while no client existed, and
+		// without them the client terminal and the Agent disagree about what a
+		// pasted newline or Shift+Enter means.
+		if modes := h.terminal.Replay(); modes != "" {
+			_, _ = conn.Write([]byte(modes))
+		}
 		if h.observation != nil {
 			if screen := h.observation.Snapshot().Render(); screen != "" {
 				_, _ = conn.Write([]byte(screen))
@@ -382,7 +402,7 @@ func (h *Host) handleControl(conn net.Conn) {
 			result.OK, result.Error = false, "agent is not ready"
 			break
 		}
-		if _, err := io.WriteString(h.pty, payload.Content+"\r"); err != nil {
+		if _, err := h.writeToAgent([]byte(payload.Content + "\r")); err != nil {
 			result.OK, result.Error = false, err.Error()
 		} else {
 			h.processInput([]byte(payload.Content + "\r"))
@@ -491,14 +511,28 @@ func (h *Host) broadcastInput(line string) {
 type inputWriter struct{ host *Host }
 
 func (w inputWriter) Write(data []byte) (int, error) {
-	if w.host == nil || w.host.pty == nil {
+	if w.host == nil {
 		return 0, errors.New("agent is not ready")
 	}
-	n, err := w.host.pty.Write(data)
+	n, err := w.host.writeToAgent(data)
 	if err == nil {
 		w.host.processInput(data[:n])
 	}
 	return n, err
+}
+
+// writeToAgent is the only path that writes to the Agent. It serializes the
+// terminal's capability answers with the keystrokes of attached clients.
+func (h *Host) writeToAgent(data []byte) (int, error) {
+	h.mu.Lock()
+	master := h.pty
+	h.mu.Unlock()
+	if master == nil {
+		return 0, errors.New("agent is not ready")
+	}
+	h.ptyMu.Lock()
+	defer h.ptyMu.Unlock()
+	return master.Write(data)
 }
 
 func (h *Host) close() {

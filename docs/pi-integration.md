@@ -37,7 +37,20 @@ Pi 和 Agora 现有设计的匹配点：
 pi --session <id> --provider anthropic --model <provider-model> ...
 ```
 
-因此 Pi 的版本新增参数也可以直接使用。Agora 只会将 binary 放在参数列表最前面，并通过 PTY 建立 attach；参数含义和运行模式完全由 Pi 决定。传入 `--print`、`--mode json` 或 `--mode rpc` 时，Pi 会按自身语义运行，可能不会显示 TUI，这是预期行为。
+因此 Pi 的版本新增参数也可以直接使用。Agora 只会将 binary 放在参数列表最前面，并通过 PTY 建立 attach；参数含义和运行模式完全由 Pi 决定。
+
+例外是**不是 Agent 会话的调用**：Pi 自己的 CLI 子命令和一次性输出开关没有 TUI 可接管，Agora 不建会话，
+而是让 wrapper 直接 exec 真实 binary（wrapper 以 exit code 76 识别，退出码原样透传）：
+
+```text
+pi install <source> | remove | uninstall | update | list | config | auth
+pi --help | --version | --print/-p | --export | --list-models | --mode json|rpc
+```
+
+判定与 Pi 自身对 argv 的解读一致：只有第一个参数会被 Pi 当成子命令，`--` 之后的参数是 message，
+所以 `pi update` 走升级子命令，而 `pi -- update`、`pi "update that file"` 仍是托管会话；`--mode text`
+（默认值）也仍是托管会话。这样 `pi update` 不会被包成一个空会话，`pi -p` 的 stdout 也不会被 PTY
+改写，而是一次性运行产生的 transcript 仍会被 history discovery 收录。
 
 Agora 还会注入一个自有扩展用于上报 session 切换（详见 `docs/session-host.md` §8）：
 

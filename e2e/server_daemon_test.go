@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -20,9 +21,49 @@ import (
 	"github.com/delve8/agora/internal/runtime"
 	"github.com/delve8/agora/internal/server"
 	"github.com/delve8/agora/internal/session"
+	"github.com/delve8/agora/internal/sessionhost"
 	"github.com/delve8/agora/internal/store"
 	"github.com/delve8/agora/internal/terminal"
 )
+
+// TestMain lets the e2e binary act as `agora session-host`, so hosted sessions
+// can be exercised end to end without the real CLI: SessionHostRegistry.Spawn
+// re-executes the test binary with `session-host --config <path>`.
+func TestMain(m *testing.M) {
+	if len(os.Args) > 1 && os.Args[1] == "session-host" {
+		os.Exit(runSessionHostProcess(os.Args[2:]))
+	}
+	os.Exit(m.Run())
+}
+
+func runSessionHostProcess(args []string) int {
+	configPath := ""
+	for index := 0; index < len(args); index++ {
+		if args[index] == "--config" && index+1 < len(args) {
+			configPath = args[index+1]
+		}
+	}
+	if configPath == "" {
+		fmt.Fprintln(os.Stderr, "session-host test helper: --config is required")
+		return 2
+	}
+	sessionhost.IgnoreTerminalSignals()
+	config, err := sessionhost.LoadConfig(configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "session-host test helper: %v\n", err)
+		return 1
+	}
+	host, err := sessionhost.New(config)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "session-host test helper: %v\n", err)
+		return 1
+	}
+	if err := host.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "session-host test helper: %v\n", err)
+		return 1
+	}
+	return 0
+}
 
 func TestDaemonLocalWrapperFlow(t *testing.T) {
 	home := t.TempDir()
@@ -63,6 +104,9 @@ func TestDaemonLocalWrapperFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Session Hosts outlive the Daemon by design, so the test has to stop the
+	// Agent it started instead of leaving a process behind.
+	t.Cleanup(func() { stopSessionHosts(t, home) })
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	daemonDone := make(chan error, 1)
@@ -107,7 +151,7 @@ func TestDaemonLocalWrapperFlow(t *testing.T) {
 		t.Fatalf("wrapper returned non-canonical session id %q: %v", response.SessionID, err)
 	}
 
-	if output := attachScreen(t, response.Socket, 5*time.Second); !strings.Contains(output, "READY") {
+	if output := attachScreen(t, response.Socket, 20*time.Second); !strings.Contains(output, "READY") {
 		t.Fatalf("wrapper attach output = %q", output)
 	}
 
@@ -458,6 +502,26 @@ func TestDaemonStateKeepsHistorySessionsBesideLiveSession(t *testing.T) {
 	for _, id := range olderIDs {
 		if !seen["pi://"+id] {
 			t.Fatalf("history session %s is hidden by the live session: %+v", id, state.Sessions)
+		}
+	}
+}
+
+// stopSessionHosts terminates the Session Hosts a test started. They own their
+// Agent processes and deliberately survive their Daemon, so nothing else will.
+func stopSessionHosts(t *testing.T, home string) {
+	t.Helper()
+	root := filepath.Join(home, ".agora", "runtime", "sessions")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		metadata, loadErr := sessionhost.LoadMetadata(filepath.Join(root, entry.Name(), "metadata.json"))
+		if loadErr != nil || metadata.HostPID <= 0 {
+			continue
+		}
+		if process, findErr := os.FindProcess(metadata.HostPID); findErr == nil {
+			_ = process.Signal(syscall.SIGTERM)
 		}
 	}
 }

@@ -310,7 +310,9 @@ UI 显示"该会话还没有历史记录"，而不是一个看起来像历史丢
 
 以下耦合是真实存在的迁移点，不应在文档中假装已经抽象：
 
-- `runtime.Manager` 持有 `*adapter.ClaudeCodeAdapter` 和 `*PTYManager`；
+- `runtime.Manager` 持有 `*adapter.ClaudeCodeAdapter` 和 provider 的 argv/env 构造器
+  （`ClaudeProvider` / `PiProvider`）；Agent 进程一律由 Session Host 持有，
+  Manager 只管理 Session 记录、observer 和 host 注册表；
 - `adapter/discovery.go` 的 catalog、`FindHistoryBySessionID` 和 `ParseHistoryEvent` 写死 `~/.claude/projects`、Claude 文件名和字段；
 - `adapter/stream_json.go` 解析 Claude stream-json envelope；
 - `daemon.Config` 只有 `ClaudeBinary`；

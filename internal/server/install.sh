@@ -16,15 +16,18 @@ BASE_URL="{{ .BaseURL }}"
 PAIR_CODE=""
 INSTALL_DIR="${AGORA_INSTALL_DIR:-$HOME/.local/bin}"
 WITH_SERVICE=1
+RESTART=1
 
 usage() {
 	cat <<'USAGE'
-usage: install.sh [--pair <code>] [--server <url>] [--install-dir <dir>] [--no-service]
+usage: install.sh [--pair <code>] [--server <url>] [--install-dir <dir>] [--no-service] [--no-restart]
 
   --pair <code>        pairing code from the Agora Web UI (Add device)
   --server <url>       Agora Server base URL (defaults to the one this script came from)
   --install-dir <dir>  where to put the agora binary (default: ~/.local/bin)
   --no-service         install the binary only; do not set up a background service
+  --no-restart         write the service definition but do not start or restart it
+                       (`agora update` uses this and restarts the service itself)
 USAGE
 }
 
@@ -37,6 +40,7 @@ while [ $# -gt 0 ]; do
 		--install-dir) INSTALL_DIR="${2:-}"; shift 2 ;;
 		--install-dir=*) INSTALL_DIR="${1#*=}"; shift ;;
 		--no-service) WITH_SERVICE=0; shift ;;
+		--no-restart) RESTART=0; shift ;;
 		-h|--help) usage; exit 0 ;;
 		*) echo "install.sh: unknown argument: $1" >&2; usage >&2; exit 2 ;;
 	esac
@@ -144,13 +148,22 @@ if download "$BASE_URL/download/checksums.txt" "$tmp/checksums.txt" 2>/dev/null;
 	fi
 fi
 
-mkdir -p "$INSTALL_DIR"
-if command -v install >/dev/null 2>&1; then
-	install -m 0755 "$tmp/agora" "$INSTALL_DIR/agora"
-else
-	cp "$tmp/agora" "$INSTALL_DIR/agora"
-	chmod 0755 "$INSTALL_DIR/agora"
-fi
+# install_file replaces a file atomically: write next to the destination, then
+# rename over it. A half-copied binary would otherwise leave the machine with
+# neither the old nor the new daemon.
+install_file() { # <source> <destination>
+	mkdir -p "$(dirname "$2")"
+	rm -f "$2.tmp.$$"
+	if command -v install >/dev/null 2>&1; then
+		install -m 0755 "$1" "$2.tmp.$$"
+	else
+		cp "$1" "$2.tmp.$$"
+		chmod 0755 "$2.tmp.$$"
+	fi
+	mv -f "$2.tmp.$$" "$2"
+}
+
+install_file "$tmp/agora" "$INSTALL_DIR/agora"
 BIN="$INSTALL_DIR/agora"
 echo "Installed $BIN"
 
@@ -158,12 +171,7 @@ echo "Installed $BIN"
 # `claude`, so the native commands create Agora-managed sessions. An existing
 # provider binary that is not our wrapper is never replaced.
 if download "$BASE_URL/download/agora-wrapper.sh" "$tmp/agora-wrapper.sh"; then
-	if command -v install >/dev/null 2>&1; then
-		install -m 0755 "$tmp/agora-wrapper.sh" "$INSTALL_DIR/agora-wrapper.sh"
-	else
-		cp "$tmp/agora-wrapper.sh" "$INSTALL_DIR/agora-wrapper.sh"
-		chmod 0755 "$INSTALL_DIR/agora-wrapper.sh"
-	fi
+	install_file "$tmp/agora-wrapper.sh" "$INSTALL_DIR/agora-wrapper.sh"
 	for name in pi claude; do
 		target="$INSTALL_DIR/$name"
 		if [ -L "$target" ] && [ "$(basename "$(readlink "$target")")" = "agora-wrapper.sh" ]; then
@@ -241,15 +249,27 @@ WantedBy=default.target
 UNIT
 	} > "$unit_dir/agora-daemon.service"
 	systemctl --user daemon-reload
-	systemctl --user enable --now agora-daemon.service
+	if [ "$RESTART" = 1 ]; then
+		systemctl --user enable --now agora-daemon.service
+	else
+		# Enabling does not start a running unit, so an update can refresh the
+		# definition without touching the daemon that is serving sessions.
+		systemctl --user enable agora-daemon.service
+	fi
 	if command -v loginctl >/dev/null 2>&1; then
 		if ! loginctl enable-linger "$(id -un)" >/dev/null 2>&1; then
 			echo "Note: run 'sudo loginctl enable-linger $(id -un)' so the daemon starts without an interactive login." >&2
 		fi
 	fi
-	echo "Installed and started systemd user service agora-daemon.service"
+	if [ "$RESTART" = 1 ]; then
+		echo "Installed and started systemd user service agora-daemon.service"
+	else
+		echo "Updated systemd user service agora-daemon.service (not restarted)"
+		echo "  restart: systemctl --user restart agora-daemon"
+	fi
 	echo "  status: systemctl --user status agora-daemon"
 	echo "  logs:   journalctl --user -u agora-daemon -f"
+	echo "Check for updates later with: $BIN update --check"
 elif [ "$os" = "darwin" ]; then
 	agents="$HOME/Library/LaunchAgents"
 	mkdir -p "$agents" "$HOME/.agora"
@@ -292,9 +312,17 @@ PLIST
 </plist>
 PLIST
 	} > "$plist"
-	launchctl unload "$plist" >/dev/null 2>&1 || true
-	launchctl load "$plist"
-	echo "Installed and started LaunchAgent com.delve8.agora.daemon"
+	if [ "$RESTART" = 1 ]; then
+		launchctl unload "$plist" >/dev/null 2>&1 || true
+		launchctl load "$plist"
+		echo "Installed and started LaunchAgent com.delve8.agora.daemon"
+	else
+		# The loaded job keeps running; the new definition applies on the next
+		# start, which `agora update` performs itself.
+		echo "Updated LaunchAgent com.delve8.agora.daemon (not restarted)"
+		echo "  restart: launchctl kickstart -k gui/$(id -u)/com.delve8.agora.daemon"
+	fi
 	echo "  status: launchctl list | grep agora"
 	echo "  logs:   tail -f $HOME/.agora/daemon.log"
+	echo "Check for updates later with: $BIN update --check"
 fi

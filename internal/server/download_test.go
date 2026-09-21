@@ -46,6 +46,13 @@ func TestInstallScriptBakesServerAndBaseURL(t *testing.T) {
 		"EnvironmentVariables",
 		"AGORA_PI_BINARY",
 		"agora-wrapper.sh",
+		// Updating re-runs this installer, so it has to replace files atomically
+		// and be able to leave the service alone.
+		"--no-restart",
+		"install_file",
+		"mv -f",
+		"launchctl kickstart -k",
+		"systemctl --user restart agora-daemon",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("install.sh is missing %q:\n%s", want, body)

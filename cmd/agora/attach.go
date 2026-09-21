@@ -29,10 +29,12 @@ func runWrapper(args []string) error {
 		sessionID = strings.TrimSpace(args[0])
 		args = args[1:]
 	}
-	for _, arg := range args {
-		if strings.HasPrefix(arg, "-") {
-			return fmt.Errorf("claude wrapper does not pass Claude options to the Daemon; use the real claude binary for command options")
-		}
+	if sessionID == "" && !claudeRunsAnAgentSession(args) {
+		// Claude options cannot be part of a managed session: the Daemon builds
+		// the Claude argv itself (adding --session-id or --resume) and the wrapper
+		// only contributes an initial prompt. An option is therefore a Claude CLI
+		// invocation and must run as the real binary.
+		return passthroughAgentError{agent: "claude"}
 	}
 	var attached protocol.WrapperResponse
 	var err error
@@ -49,6 +51,57 @@ func runWrapper(args []string) error {
 	return runAttachSocket(attached.Socket)
 }
 
+// claudeManagementCommands act on Claude Code itself (background sessions,
+// authentication, plugins, diagnostics) instead of starting an Agent session, so
+// the wrapper must not turn one into an initial prompt. The set is the
+// "CLI commands" table of the Claude Code CLI reference
+// (https://docs.claude.com/en/docs/claude-code/cli-reference), checked against
+// claude-code 2.1.250; `plugins` is an alias of `plugin` and `kill` of `stop`.
+// It is maintained by hand: Claude only recognises a command as the first word
+// of argv, so it cannot be told apart from a prompt by shape alone.
+var claudeManagementCommands = map[string]bool{
+	"update":             true,
+	"gateway":            true,
+	"install":            true,
+	"auth":               true,
+	"agents":             true,
+	"attach":             true,
+	"auto-mode":          true,
+	"daemon":             true,
+	"doctor":             true,
+	"import":             true,
+	"logs":               true,
+	"mcp":                true,
+	"plugin":             true,
+	"plugins":            true,
+	"project":            true,
+	"remote-control":     true,
+	"respawn":            true,
+	"rm":                 true,
+	"self-hosted-runner": true,
+	"setup-token":        true,
+	"stop":               true,
+	"kill":               true,
+	"ultrareview":        true,
+}
+
+// claudeRunsAnAgentSession reports whether the invocation can be a managed
+// session, which for Claude means "an initial prompt, or nothing at all". The
+// wrapper deliberately does not forward Claude options, so anything
+// option-shaped (`--help`, `-p`, `--resume`) is a Claude CLI invocation and the
+// PATH wrapper runs the real binary for it.
+func claudeRunsAnAgentSession(args []string) bool {
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "-") {
+			return false
+		}
+	}
+	if len(args) == 0 {
+		return true
+	}
+	return !claudeManagementCommands[args[0]]
+}
+
 func createDaemonWrapperSession(agent string, prompts []string) (protocol.WrapperResponse, error) {
 	workspace, err := os.Getwd()
 	if err != nil {
@@ -57,7 +110,7 @@ func createDaemonWrapperSession(agent string, prompts []string) (protocol.Wrappe
 	// The workspace is already shown as the parent item in the UI. Keep the
 	// wrapper-created session name generated so provider history (Pi session_info
 	// or Claude title/first user) can replace it after the history is observed.
-	return callLocalDaemon(protocol.WrapperRequest{Workspace: workspace, DisplayName: "New session", Role: "terminal", Agent: agent, Prompts: prompts})
+	return callLocalDaemon(protocol.WrapperRequest{Workspace: workspace, DisplayName: "New session", Role: "terminal", Agent: agent, Prompts: prompts, Terminal: terminalEnv()})
 }
 
 func createDaemonWrapperSessionWithArgs(agent string, args []string) (protocol.WrapperResponse, error) {
@@ -68,7 +121,24 @@ func createDaemonWrapperSessionWithArgs(agent string, args []string) (protocol.W
 	// The workspace is already shown as the parent item in the UI. Keep the
 	// wrapper-created session name generated so provider history (especially Pi
 	// session_info) can replace it after the history is observed.
-	return callLocalDaemon(protocol.WrapperRequest{Workspace: workspace, DisplayName: "New session", Role: "terminal", Agent: agent, AgentArgs: args})
+	return callLocalDaemon(protocol.WrapperRequest{Workspace: workspace, DisplayName: "New session", Role: "terminal", Agent: agent, AgentArgs: args, Terminal: terminalEnv()})
+}
+
+// terminalEnv is the identity of the terminal the user is running in. The Daemon
+// is a service without a terminal of its own, so a managed Agent otherwise sees
+// no TERM at all: it renders with 16 colours and cannot tell which emulator it
+// runs under (Pi uses that to detect terminals it must handle specially).
+func terminalEnv() map[string]string {
+	values := make(map[string]string, 4)
+	for _, key := range []string{"TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION"} {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			values[key] = value
+		}
+	}
+	if len(values) == 0 {
+		return nil
+	}
+	return values
 }
 
 func attachDaemonWrapperSession(sessionID string) (protocol.WrapperResponse, error) {
@@ -146,6 +216,10 @@ func runAttachSocket(addr string) error {
 		return fmt.Errorf("connect to %s: %w", addr, err)
 	}
 	defer conn.Close()
+	// The Agent's terminal modes belong to the session, not to this terminal:
+	// leaving bracketed paste, the kitty keyboard protocol or mouse reporting
+	// switched on would leak into the user's shell after the attach ends.
+	defer fmt.Fprint(os.Stdout, terminal.ModesReset)
 
 	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
 	if err != nil {

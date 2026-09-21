@@ -24,6 +24,10 @@ var downloadArtifacts = map[string]string{
 	"agora-darwin-arm64": "application/octet-stream",
 	"agora-wrapper.sh":   "text/x-shellscript; charset=utf-8",
 	"checksums.txt":      "text/plain; charset=utf-8",
+	// version.txt is what `agora update --check` compares the installed binary
+	// against. Servers built before it exists answer 404 and the client falls
+	// back to comparing checksums.
+	"version.txt": "text/plain; charset=utf-8",
 }
 
 // installScript renders the daemon installer with this deployment's URLs baked

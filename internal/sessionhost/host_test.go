@@ -275,3 +275,79 @@ func readAttach(t *testing.T, conn net.Conn) string {
 	}
 	return string(data)
 }
+
+// A client that attaches after the Agent configured its terminal must receive
+// the modes the Agent enabled, not just the screen. Without them the client
+// terminal does not know that pasted text is bracketed, so a pasted newline
+// submits instead of inserting a line break.
+func TestAttachReplaysAgentTerminalModes(t *testing.T) {
+	runtimeDir := t.TempDir()
+	host, err := New(Config{
+		HostID:     "host-terminal-modes",
+		SessionID:  "daemon/test/pi://native-terminal-modes",
+		DaemonID:   "test",
+		Agent:      "pi",
+		Workspace:  t.TempDir(),
+		Command:    []string{"/bin/sh", "-c", "printf '\\033[?2004h\\033[>7u\\033[?u'; sleep 30"},
+		RuntimeDir: runtimeDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- host.Run() }()
+	var client *Client
+	t.Cleanup(func() {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		if client != nil {
+			stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = client.Stop(stopCtx)
+		}
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("host did not exit after stopping its Agent")
+		}
+	})
+
+	metadataPath := filepath.Join(runtimeDir, "metadata.json")
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, statErr := os.Stat(metadataPath); statErr == nil {
+			if client, err = NewClient(metadataPath); err == nil {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if client == nil {
+		t.Fatalf("host did not become controllable: %v", err)
+	}
+
+	// The Agent wrote its setup before this client existed, so only the replay
+	// can deliver it. Each attach is a fresh connection, so the test retries
+	// until the Agent's setup has been observed; the wrapper can win that race,
+	// it just must not lose the modes because of it.
+	deadline = time.Now().Add(5 * time.Second)
+	var data string
+	for {
+		conn := dialAttach(t, client.AttachSocket())
+		data = readAttach(t, conn)
+		_ = conn.Close()
+		if (strings.Contains(data, "\x1b[?2004h") && strings.Contains(data, "\x1b[=7;1u")) || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !strings.Contains(data, "\x1b[?2004h") {
+		t.Errorf("attach replay %q is missing bracketed paste", data)
+	}
+	if !strings.Contains(data, "\x1b[=7;1u") {
+		t.Errorf("attach replay %q is missing the keyboard-protocol flags", data)
+	}
+}

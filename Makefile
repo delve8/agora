@@ -1,5 +1,13 @@
 SHELL := /bin/sh
 
+# Build metadata, injected into the binary so `agora version`, /api/version and
+# `agora update --check` can name what they are. Override on the command line for
+# a release: make build VERSION=1.2.3
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
+BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+LDFLAGS ?= -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.date=$(BUILD_DATE)
+
 GO ?= go
 NPM ?= npm
 WEB_DIR ?= web
@@ -66,7 +74,7 @@ build: build-go build-web
 
 build-go:
 	@mkdir -p "$(BIN_DIR)"
-	$(GO) build -o "$(AGORA_BIN)" ./cmd/agora
+	$(GO) build -ldflags "$(LDFLAGS)" -o "$(AGORA_BIN)" ./cmd/agora
 
 web-install:
 	@if [ ! -d "$(WEB_DIR)/node_modules" ]; then \

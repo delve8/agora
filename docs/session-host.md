@@ -610,6 +610,25 @@ Daemon 重启不应关闭 `attach.sock`。如果 wrapper 连接依赖 Daemon 返
 - wrapper 的本地 attach client 可能在 Daemon 重启期间遇到短暂断线，产品上可以通过 reconnect 或重新执行 attach 恢复；
 - 若要求现有 wrapper 连接完全无感知地跨 Daemon 重启，则 wrapper 必须直接连接稳定的 Host attach socket，而不是连接 Daemon-owned socket。
 
+### 9.1 Host 作为 Agent 的终端（终端能力与模式回放）
+
+Agent 在**任何 client attach 之前**就启动了，所以它启动时做的终端协商和模式设置会双重丢失：模式序列没有接收者，能力查询没有应答者。实测（pi 0.85.1）：
+
+```text
+pi 启动即写出：\x1b[?2004h  \x1b[>7u  \x1b[?u  \x1b[c
+              bracketed paste  push kitty flags=7  查 flags  查设备属性
+```
+
+- 若 `\x1b[?u` 无应答，pi 在约 150ms 后放弃：既不启用 kitty keyboard protocol，也不启用 xterm modifyOtherKeys。结果就是 **Shift+Enter 与 Enter 无法区分**（只能退到 `ctrl+j`）。
+- `\x1b[?2004h` 同样发在没有 client 的时候。后来的 client 终端不知道 bracketed paste 已开启，**粘贴内容里的换行就成为提交**而不是换行。
+
+因此 Host 必须自己充当 Agent 的终端：
+
+- **应答能力查询**：收到 `CSI ? u` 时，若无 client 在接收同一份输出，Host 用 Agent 自己请求的 flags 作答（`CSI ? <flags> u`）；有 client 时转发，由真实终端作答（真实终端永远是更好的权威）。同时跟踪 `CSI > N u` push、`CSI < u` pop、`CSI = N ; m u` set；
+- **跟踪并回放持久模式**：bracketed paste（`?2004`）、鼠标上报、focus events（`?1004`）、application cursor keys（`?1`）、kitty flags、modifyOtherKeys（`>4;2m`）；Agent 关闭的模式不回放。回放对 kitty flags 用**绝对设置**形式 `CSI = N ; 1 u`，避免每次 attach 往终端模式栈里压一层；
+- **回放顺序**：先模式，再屏幕重绘（见 `Snapshot.Render`），最后才是实时输出；
+- Agent 的环境需要 `TERM`/`COLORTERM`/`TERM_PROGRAM`，但 Daemon 是服务、本身没有终端。创建请求携带发起方终端的身份（`WrapperRequest.terminal` → `SessionCreatePayload.terminal`），Daemon 用它构造 Agent 的 env；没有发起方时退化为 `TERM=xterm-256color`。否则 Agent 会把 truecolor 降级成 256 色（实测 `38;2;102;102;102` → `38;5;241`），也认不出自己运行在哪个 emulator 下。
+
 对于 stdio RPC、HTTP/ACP 等没有 PTY 的 Agent，Host 只暴露 control/event surface，不创建 attach socket。
 
 ## 10. 安全设计
@@ -769,7 +788,7 @@ type SessionHost interface {
 ### Phase A：抽象当前 Daemon 直接管理的 runtime
 
 - 提取 Host-like interface；
-- 把 PiManager/PTYManager 的 process key、transport、observer 边界整理清楚；
+- 把 Pi/Claude provider 的 argv/env 构造与 Host 的 process/transport/observer 边界整理清楚；
 - 为每个 managed Session 定义 host ID 和 metadata schema；
 - 不改变现有 Server API。
 

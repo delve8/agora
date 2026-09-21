@@ -214,6 +214,9 @@ type SessionCreatePayload struct {
 	// is expected to run on. The server only sends the frame to that daemon's
 	// connection; the field lets the daemon verify the target defensively.
 	DaemonID string `json:"daemon_id,omitempty"`
+	// Terminal is the requesting terminal's identity, forwarded from the
+	// wrapper; it becomes the Agent's TERM/COLORTERM environment.
+	Terminal map[string]string `json:"terminal,omitempty"`
 }
 
 type SessionCreatedPayload struct {
@@ -326,6 +329,11 @@ type WrapperRequest struct {
 	Role        string   `json:"role,omitempty"`
 	Agent       string   `json:"agent,omitempty"`
 	Prompts     []string `json:"prompts,omitempty"`
+	// Terminal carries the requesting terminal's identity (TERM, COLORTERM,
+	// TERM_PROGRAM, TERM_PROGRAM_VERSION). The Daemon has no terminal of its
+	// own, so without it a managed Agent cannot tell truecolor from 256 colors
+	// or which emulator it is running under.
+	Terminal map[string]string `json:"terminal,omitempty"`
 }
 
 type WrapperResponse struct {
