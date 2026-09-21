@@ -274,6 +274,12 @@ func (m *Manager) refreshSwitchCandidates(ctx context.Context, watcher *switchWa
 	started := time.Now()
 	entries, err := m.switchCatalog(ctx, watcher.agent)
 	if err != nil {
+		if ctx.Err() != nil {
+			// The watcher was stopped while its catalog was being listed
+			// (rebind, session exit, Daemon shutdown). That is a normal end, not
+			// an outage, and logging it on every restart hides real failures.
+			return
+		}
 		log.Printf("agora: context switch catalog unavailable: %v", err)
 		switchDebugf("catalog id=%s error=%v", watcher.id, err)
 		return

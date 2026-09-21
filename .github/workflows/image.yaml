@@ -103,10 +103,12 @@ jobs:
           file: ./Containerfile
           # The tag (or commit on main) labels the Server and the daemon
           # artifacts it publishes, so `agora update --check` can compare them.
+          # BUILD_DATE uses the timestamp the metadata action already renders for
+          # the image labels: github.run_started_at is not a build-arg context.
           build-args: |
             VERSION=${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
             COMMIT=${{ github.sha }}
-            BUILD_DATE=${{ github.run_started_at }}
+            BUILD_DATE=${{ steps.meta.outputs.created }}
           # arm64 matters for workstations and Apple silicon clusters; drop it if
           # build minutes are tight.
           platforms: linux/amd64,linux/arm64
