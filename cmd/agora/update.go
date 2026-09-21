@@ -628,12 +628,16 @@ func fetchWithCommand(name string, args func(target, destination string) []strin
 // wgetArgs and curlArgs are the downloaders' "write this URL to this file"
 // forms. wget is tried before curl because this deployment resets curl's TLS
 // ClientHello while leaving wget alone.
+//
+// Both are bounded, because the defaults are not: curl waits forever on a
+// stalled connection, and wget ships with 20 retries and a 900s read timeout.
+// A stall must fail fast and hand over, not turn seconds into an hour.
 func wgetArgs(target, destination string) []string {
-	return []string{"-q", "-O", destination, target}
+	return []string{"-q", "--tries=2", "--timeout=60", "--waitretry=3", "-O", destination, target}
 }
 
 func curlArgs(target, destination string) []string {
-	return []string{"-fsSL", "-o", destination, target}
+	return []string{"-fsSL", "--connect-timeout", "15", "--speed-limit", "1024", "--speed-time", "60", "-o", destination, target}
 }
 
 var (
@@ -649,12 +653,25 @@ func runCommand(name string, args ...string) error {
 	return command.Run()
 }
 
+// installerTimeout bounds the served installer. Its downloads are bounded too,
+// but a wedged network stack must not turn `agora update` into a command that
+// never returns.
+const installerTimeout = 20 * time.Minute
+
 // runInstallerScript runs the Server's installer with `sh -s`, the same way the
 // documented `curl | sh -s -- ...` one-liner does.
 func runInstallerScript(script []byte, args []string) error {
-	command := exec.Command("sh", args...)
+	ctx, cancel := context.WithTimeout(context.Background(), installerTimeout)
+	defer cancel()
+	command := exec.CommandContext(ctx, "sh", args...)
 	command.Stdin = bytes.NewReader(script)
 	command.Stdout = os.Stdout
 	command.Stderr = os.Stderr
-	return command.Run()
+	if err := command.Run(); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("the installer did not finish within %s", installerTimeout)
+		}
+		return err
+	}
+	return nil
 }

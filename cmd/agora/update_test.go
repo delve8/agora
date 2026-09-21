@@ -428,11 +428,30 @@ func TestFetchFallsBackToAnotherDownloader(t *testing.T) {
 
 // The external downloaders run the tools that exist and are quiet about their
 // own failures.
+// A stalled downloader must not hold the whole update: the arguments carry
+// timeouts, because curl's default is to wait forever and wget's is to retry 20
+// times with a 900s read timeout.
+func TestDownloaderArgumentsAreBounded(t *testing.T) {
+	for _, args := range [][]string{wgetArgs("u", "d"), curlArgs("u", "d")} {
+		joined := strings.Join(args, " ")
+		if !strings.Contains(joined, "timeout") {
+			t.Errorf("args %q have no timeout", joined)
+		}
+	}
+	if joined := strings.Join(wgetArgs("u", "d"), " "); !strings.Contains(joined, "--tries=2") {
+		t.Errorf("wget args %q keep the default retry count", joined)
+	}
+}
+
 func TestFetchWithCommandUsesTheTool(t *testing.T) {
 	dir := t.TempDir()
 	tool := filepath.Join(dir, "fake-wget")
 	payload := "artifact bytes"
-	script := "#!/bin/sh\n# args: -q -O <dest> <url>\nprintf '%s' '" + payload + "' > \"$3\"\n"
+	// Read the destination from -O rather than from a fixed position, so the
+	// downloader's extra bounding flags do not have to be mirrored here.
+	script := "#!/bin/sh\n" +
+		"while [ $# -gt 0 ]; do case \"$1\" in -O) shift; dest=\"$1\" ;; esac; shift; done\n" +
+		"printf '%s' '" + payload + "' > \"$dest\"\n"
 	if err := os.WriteFile(tool, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}

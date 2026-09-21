@@ -60,15 +60,23 @@ command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || command -v
 # Some corporate networks reset TLS connections whose ClientHello looks like
 # curl's while allowing wget or python, so a curl that is installed but blocked
 # must not stop the install.
+#
+# Every attempt is bounded, because the defaults are not: curl waits forever on a
+# stalled connection, and wget ships with --tries=20 and a 900s read timeout, so
+# one stall turns a 10-second download into an hour of retries. A stalled attempt
+# must fail quickly and hand over to the next downloader.
 download() { # <url> <destination>
 	if command -v curl >/dev/null 2>&1; then
-		curl -fsSL "$1" -o "$2" 2>/dev/null && return 0
+		curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 60 \
+			-o "$2" "$1" 2>/dev/null && return 0
 	fi
 	if command -v wget >/dev/null 2>&1; then
-		wget -qO "$2" "$1" && return 0
+		wget -q --tries=2 --timeout=60 --waitretry=3 -O "$2" "$1" && return 0
 	fi
 	if command -v python3 >/dev/null 2>&1; then
-		python3 -c 'import sys, urllib.request; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])' "$1" "$2" && return 0
+		python3 -c 'import shutil, sys, urllib.request
+with urllib.request.urlopen(sys.argv[1], timeout=60) as source, open(sys.argv[2], "wb") as target:
+    shutil.copyfileobj(source, target)' "$1" "$2" && return 0
 	fi
 	return 1
 }
