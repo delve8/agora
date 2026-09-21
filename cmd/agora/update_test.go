@@ -44,6 +44,7 @@ type updateFixture struct {
 	server     *httptest.Server
 	installLog string
 	script     string
+	wrapper    string
 	hash       string
 }
 
@@ -55,6 +56,7 @@ func (f *updateFixture) serveChecksum(_ *testing.T, hash string) {
 func newUpdateFixture(t *testing.T) *updateFixture {
 	t.Helper()
 	fixture := &updateFixture{installLog: filepath.Join(t.TempDir(), "installer.log"), hash: strings.Repeat("a", 64)}
+	fixture.wrapper = "#!/bin/sh\n# Agora PATH wrapper for tests\n"
 	// The usage line is how this command recognises an installer that knows
 	// --no-restart, so the fixture documents it like the real one does.
 	fixture.script = "#!/bin/sh\n" +
@@ -68,6 +70,9 @@ func newUpdateFixture(t *testing.T) *updateFixture {
 	mux.HandleFunc("/download/version.txt", func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprint(w, "2.0.0\n")
 	})
+	mux.HandleFunc("/download/agora-wrapper.sh", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, fixture.wrapper)
+	})
 	mux.HandleFunc("/download/checksums.txt", func(w http.ResponseWriter, _ *http.Request) {
 		artifact, err := artifactName()
 		if err != nil {
@@ -78,6 +83,24 @@ func newUpdateFixture(t *testing.T) *updateFixture {
 	fixture.server = httptest.NewServer(mux)
 	t.Cleanup(fixture.server.Close)
 	return fixture
+}
+
+// installFullInstallation writes what a complete installation looks like: the
+// binary, the wrapper, and the pi/claude links. --check treats all three as one
+// installation, so tests that only care about the binary verdict need this.
+func installFullInstallation(t *testing.T, options updateOptions, fixture *updateFixture, binary []byte) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(options.installDir, "agora"), binary, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(options.installDir, "agora-wrapper.sh"), []byte(fixture.wrapper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"pi", "claude"} {
+		if err := os.Symlink("agora-wrapper.sh", filepath.Join(options.installDir, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func testUpdateOptions(t *testing.T) updateOptions {
@@ -114,15 +137,16 @@ func TestUpdateCheckComparesInstalledAndPublishedBuilds(t *testing.T) {
 		t.Fatal("--check ran the installer")
 	}
 
-	// The published hash now matches what is installed: nothing to do.
+	// The published hash now matches what is installed, and the rest of the
+	// installation is in place: nothing to do.
 	installed, err := os.ReadFile(target)
 	if err != nil {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(installed)
-	published := hex.EncodeToString(sum[:])
-	fixture.serveChecksum(t, published)
+	fixture.serveChecksum(t, hex.EncodeToString(sum[:]))
 	options.runVersion = func(string) (string, error) { return "2.0.0", nil }
+	installFullInstallation(t, options, fixture, installed)
 	output = captureStdout(t, func() {
 		if err := applyUpdateOptions(options); err != nil {
 			t.Fatalf("check: %v", err)
@@ -422,5 +446,69 @@ func TestFetchWithCommandUsesTheTool(t *testing.T) {
 	}
 	if _, err := fetchWithCommand(filepath.Join(dir, "missing-tool"), wgetArgs)("https://example.invalid/x"); err == nil {
 		t.Fatal("a missing downloader did not fail")
+	}
+}
+
+// The PATH wrapper is what makes `pi` and `claude` create managed sessions, so
+// --check has to cover it: a fresh binary with a stale wrapper silently keeps
+// old behaviour.
+func TestUpdateCheckReportsAStaleWrapper(t *testing.T) {
+	fixture := newUpdateFixture(t)
+	options := testUpdateOptions(t)
+	options.baseURL = fixture.server.URL
+	options.check = true
+	target := filepath.Join(options.installDir, "agora")
+	installed := []byte("current binary")
+	if err := os.WriteFile(target, []byte("current binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(installed)
+	fixture.serveChecksum(t, hex.EncodeToString(sum[:]))
+	options.runVersion = func(string) (string, error) { return "2.0.0", nil }
+
+	// Wrapper missing, links missing: not up to date.
+	output := captureStdout(t, func() {
+		if err := applyUpdateOptions(options); err != nil {
+			t.Fatalf("check: %v", err)
+		}
+	})
+	if !strings.Contains(output, "PATH wrapper is not") {
+		t.Fatalf("check output = %q, want the wrapper reported", output)
+	}
+	if strings.Contains(output, "up to date") {
+		t.Fatalf("check output = %q, want no up-to-date verdict", output)
+	}
+
+	// Wrapper and links in place: up to date.
+	installFullInstallation(t, options, fixture, installed)
+	output = captureStdout(t, func() {
+		if err := applyUpdateOptions(options); err != nil {
+			t.Fatalf("check: %v", err)
+		}
+	})
+	if !strings.Contains(output, "up to date (2.0.0)") {
+		t.Fatalf("check output = %q, want an up-to-date verdict", output)
+	}
+	if !strings.Contains(output, "pi, claude -> agora-wrapper.sh") {
+		t.Fatalf("check output = %q, want the links described", output)
+	}
+}
+
+// A provider binary the user installed at those names is not the Agora wrapper;
+// the installer leaves it alone and --check must not call it up to date.
+func TestUpdateCheckDistinguishesAProviderBinary(t *testing.T) {
+	for _, name := range []string{"pi", "claude"} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("#!/bin/sh\necho real provider\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		wrapper, description := inspectWrapper(dir)
+		if wrapper.linked {
+			t.Fatalf("%s: a provider binary counted as the Agora wrapper (%s)", name, description)
+		}
+		if !strings.Contains(description, "not the Agora wrapper") {
+			t.Fatalf("%s: description = %q, want it named as a provider binary", name, description)
+		}
 	}
 }

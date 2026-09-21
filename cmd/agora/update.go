@@ -226,22 +226,107 @@ func checkForUpdate(options updateOptions, base, installDir string) error {
 		}
 	}
 
+	// The PATH wrapper is part of the installation, not a side file: it is what
+	// makes `pi` and `claude` create managed sessions. A stale wrapper with a
+	// fresh binary would silently keep old behaviour, so it is checked too.
+	wrapper, wrapperLinked := inspectWrapper(installDir)
+	wrapperPublished := ""
+	if body, err := fetchBytes(base + "/download/agora-wrapper.sh"); err == nil {
+		sum := sha256.Sum256(body)
+		wrapperPublished = hex.EncodeToString(sum[:])
+	}
+
 	fmt.Fprintf(os.Stdout, "installed  %s  %s  sha256 %s\n", installedVersion, target, shortHash(installed))
+	fmt.Fprintf(os.Stdout, "           wrapper sha256 %s  %s\n", shortHash(wrapper.hash), wrapperLinked)
 	publishedName := published.version
 	if publishedName == "" {
 		publishedName = "unknown"
 	}
 	fmt.Fprintf(os.Stdout, "published  %s  %s/download/%s  sha256 %s\n", publishedName, base, artifact, shortHash(published.hash))
+	fmt.Fprintf(os.Stdout, "           wrapper sha256 %s\n", shortHash(wrapperPublished))
 
+	binaryStale := installed != published.hash
+	wrapperStale := wrapperPublished == "" || wrapper.hash != wrapperPublished || !wrapper.linked
 	switch {
-	case installed == published.hash:
+	case !binaryStale && !wrapperStale:
 		fmt.Fprintf(os.Stdout, "up to date (%s)\n", publishedName)
+	case !binaryStale:
+		fmt.Fprintf(os.Stdout, "the %s binary is current, but its PATH wrapper is not (%s); run `agora update`\n", publishedName, wrapper.reason(wrapperPublished))
 	case published.version != "" && installedVersion != "unknown" && installedVersion != published.version:
 		fmt.Fprintf(os.Stdout, "update available: %s -> %s (run `agora update`)\n", installedVersion, publishedName)
 	default:
 		fmt.Fprintf(os.Stdout, "the installed binary differs from the published %s build (local or older build); run `agora update` to replace it\n", publishedName)
 	}
 	return nil
+}
+
+// installedWrapper describes the PATH wrapper next to the binary.
+type installedWrapper struct {
+	hash   string
+	linked bool
+	names  []string
+}
+
+// reason explains why a wrapper is considered out of date.
+func (w installedWrapper) reason(published string) string {
+	switch {
+	case w.hash == "":
+		return "not installed"
+	case published != "" && w.hash != published:
+		return "differs from the published one"
+	case !w.linked:
+		return "pi and claude do not point at it"
+	default:
+		return "unknown"
+	}
+}
+
+// inspectWrapper reads the wrapper and whether pi/claude still resolve to it. A
+// provider binary that is not the Agora wrapper is reported as such, not as a
+// missing link: the installer deliberately leaves those alone.
+func inspectWrapper(installDir string) (installedWrapper, string) {
+	wrapper := installedWrapper{}
+	if hash, err := fileSHA256(filepath.Join(installDir, "agora-wrapper.sh")); err == nil {
+		wrapper.hash = hash
+	}
+	linked := make([]string, 0, 2)
+	real := make([]string, 0, 2)
+	for _, name := range []string{"pi", "claude"} {
+		path := filepath.Join(installDir, name)
+		info, err := os.Lstat(path)
+		if err != nil {
+			real = append(real, name+" missing")
+			continue
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			if base := filepath.Base(readlinkOrEmpty(path)); base == "agora-wrapper.sh" || base == "agora" {
+				linked = append(linked, name)
+				continue
+			}
+		}
+		real = append(real, name+" is not the Agora wrapper")
+	}
+	wrapper.names = linked
+	wrapper.linked = len(linked) == 2
+	description := "not installed"
+	switch {
+	case len(linked) > 0:
+		description = strings.Join(linked, ", ") + " -> agora-wrapper.sh"
+		if len(real) > 0 {
+			description += " (" + strings.Join(real, "; ") + ")"
+		}
+	case len(real) > 0:
+		description = strings.Join(real, "; ")
+	}
+	return wrapper, description
+}
+
+func readlinkOrEmpty(path string) string {
+	value, err := os.Readlink(path)
+	if err != nil {
+		return ""
+	}
+	return value
 }
 
 func applyUpdate(options updateOptions, base, installDir string) error {
