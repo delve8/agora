@@ -58,7 +58,7 @@ command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || command -v
 # must not stop the install.
 download() { # <url> <destination>
 	if command -v curl >/dev/null 2>&1; then
-		curl -fsSL "$1" -o "$2" && return 0
+		curl -fsSL "$1" -o "$2" 2>/dev/null && return 0
 	fi
 	if command -v wget >/dev/null 2>&1; then
 		wget -qO "$2" "$1" && return 0
