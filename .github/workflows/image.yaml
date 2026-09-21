@@ -96,6 +96,14 @@ jobs:
             type=sha,format=short
             type=raw,value=latest,enable={{is_default_branch}}
 
+      # The linker bakes this into the binary, where `agora version`,
+      # GET /api/version and the published version.txt read it from. The
+      # metadata action does not expose its own timestamp as an output, so
+      # render one here.
+      - name: Build timestamp
+        id: builddate
+        run: echo "value=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
@@ -103,12 +111,10 @@ jobs:
           file: ./Containerfile
           # The tag (or commit on main) labels the Server and the daemon
           # artifacts it publishes, so `agora update --check` can compare them.
-          # BUILD_DATE uses the timestamp the metadata action already renders for
-          # the image labels: github.run_started_at is not a build-arg context.
           build-args: |
             VERSION=${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
             COMMIT=${{ github.sha }}
-            BUILD_DATE=${{ steps.meta.outputs.created }}
+            BUILD_DATE=${{ steps.builddate.outputs.value }}
           # arm64 matters for workstations and Apple silicon clusters; drop it if
           # build minutes are tight.
           platforms: linux/amd64,linux/arm64
