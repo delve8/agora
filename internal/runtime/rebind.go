@@ -436,7 +436,6 @@ func recordOutsideEvidenceWindow(item event.Event) bool {
 type switchCatalogCache struct {
 	at      time.Time
 	entries []switchCandidate
-	err     error
 }
 
 // switchCatalog snapshots every transcript the provider knows about. The
@@ -447,16 +446,24 @@ func (m *Manager) switchCatalog(ctx context.Context, agent string) ([]switchCand
 	cached, ok := m.switchCache[agent]
 	m.mu.Unlock()
 	if ok && time.Since(cached.at) < switchCatalogTTL {
-		return cached.entries, cached.err
+		return cached.entries, nil
 	}
 	entries, err := m.listSwitchCatalog(ctx, agent)
+	if err != nil {
+		// Only successful listings are shared. A failure is cheap to retry, and
+		// caching it would hand it to every watcher for the whole TTL: one
+		// watcher stopping mid-listing (a rebind, a session exit, a Daemon
+		// shutdown) cancelled the context, and the cached cancellation then
+		// looked like a provider outage to sessions that were perfectly healthy.
+		return nil, err
+	}
 	m.mu.Lock()
 	if m.switchCache == nil {
 		m.switchCache = make(map[string]switchCatalogCache)
 	}
-	m.switchCache[agent] = switchCatalogCache{at: time.Now(), entries: entries, err: err}
+	m.switchCache[agent] = switchCatalogCache{at: time.Now(), entries: entries}
 	m.mu.Unlock()
-	return entries, err
+	return entries, nil
 }
 
 func (m *Manager) listSwitchCatalog(ctx context.Context, agent string) ([]switchCandidate, error) {

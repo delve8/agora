@@ -268,3 +268,57 @@ func TestSwitchIncrementRetainsRecordsInsideEvidenceWindow(t *testing.T) {
 		t.Fatalf("cursor stayed at %d for a record outside the window", consumed)
 	}
 }
+
+// A listing that fails (a watcher stopping mid-listing cancels the context) must
+// not be shared: caching the failure turned one canceled watcher into a
+// provider-outage log line for every other session for the whole TTL.
+func TestSwitchCatalogDoesNotReplayAFailedListing(t *testing.T) {
+	sessionDir := t.TempDir()
+	manager := NewPiProviderRuntime(NewMemoryStore(), "daemon-1", PiConfig{SessionDir: sessionDir})
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := manager.switchCatalog(canceled, "pi"); err == nil {
+		t.Fatal("a canceled listing succeeded")
+	}
+	entries, err := manager.switchCatalog(context.Background(), "pi")
+	if err != nil {
+		t.Fatalf("a canceled listing poisoned the cache for every watcher: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("entries = %+v, want an empty catalog for an empty history", entries)
+	}
+}
+
+// Successful listings are still shared, so a busy history is parsed once per TTL.
+func TestSwitchCatalogCachesSuccessfulListings(t *testing.T) {
+	sessionDir := t.TempDir()
+	manager := NewPiProviderRuntime(NewMemoryStore(), "daemon-1", PiConfig{SessionDir: sessionDir})
+	writePiTranscriptRecord(t, filepath.Join(sessionDir, "one.jsonl"), "one", "hello", time.Now())
+
+	first, err := manager.switchCatalog(context.Background(), "pi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writePiTranscriptRecord(t, filepath.Join(sessionDir, "two.jsonl"), "two", "hello again", time.Now())
+	second, err := manager.switchCatalog(context.Background(), "pi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second) != len(first) {
+		t.Fatalf("second listing = %d entries, want the cached %d", len(second), len(first))
+	}
+
+	manager.mu.Lock()
+	cache := manager.switchCache["pi"]
+	cache.at = time.Now().Add(-time.Minute)
+	manager.switchCache["pi"] = cache
+	manager.mu.Unlock()
+	third, err := manager.switchCatalog(context.Background(), "pi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(third) <= len(first) {
+		t.Fatalf("expired listing = %d entries, want the new transcript included", len(third))
+	}
+}
