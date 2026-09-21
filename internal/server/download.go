@@ -22,6 +22,7 @@ var downloadArtifacts = map[string]string{
 	"agora-linux-arm64":  "application/octet-stream",
 	"agora-darwin-amd64": "application/octet-stream",
 	"agora-darwin-arm64": "application/octet-stream",
+	"agora-wrapper.sh":   "text/x-shellscript; charset=utf-8",
 	"checksums.txt":      "text/plain; charset=utf-8",
 }
 

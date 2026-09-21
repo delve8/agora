@@ -154,9 +154,35 @@ fi
 BIN="$INSTALL_DIR/agora"
 echo "Installed $BIN"
 
+# Install the PATH wrapper next to the binary and expose it as `pi` and
+# `claude`, so the native commands create Agora-managed sessions. An existing
+# provider binary that is not our wrapper is never replaced.
+if download "$BASE_URL/download/agora-wrapper.sh" "$tmp/agora-wrapper.sh"; then
+	if command -v install >/dev/null 2>&1; then
+		install -m 0755 "$tmp/agora-wrapper.sh" "$INSTALL_DIR/agora-wrapper.sh"
+	else
+		cp "$tmp/agora-wrapper.sh" "$INSTALL_DIR/agora-wrapper.sh"
+		chmod 0755 "$INSTALL_DIR/agora-wrapper.sh"
+	fi
+	for name in pi claude; do
+		target="$INSTALL_DIR/$name"
+		if [ -L "$target" ] && [ "$(basename "$(readlink "$target")")" = "agora-wrapper.sh" ]; then
+			ln -sf agora-wrapper.sh "$target"
+			echo "Refreshed $target -> agora-wrapper.sh"
+		elif [ -e "$target" ] || [ -L "$target" ]; then
+			echo "Note: $target exists and is not the Agora wrapper; leaving it untouched." >&2
+		else
+			ln -sf agora-wrapper.sh "$target"
+			echo "Installed $target -> agora-wrapper.sh"
+		fi
+	done
+else
+	echo "Note: could not download the PATH wrapper; pi and claude will not route through Agora." >&2
+fi
+
 case ":$PATH:" in
 	*":$INSTALL_DIR:"*) ;;
-	*) echo "Note: add $INSTALL_DIR to PATH to run 'agora' directly." ;;
+	*) echo "Note: add $INSTALL_DIR to PATH so 'agora', 'pi' and 'claude' resolve." ;;
 esac
 
 if [ -n "$PAIR_CODE" ]; then

@@ -41,7 +41,7 @@ if [[ -z "$agora_bin" ]]; then
     agora_bin="$(command -v agora)"
   else
     script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-    for candidate in "$script_dir/../bin/agora" "$script_dir/../agora"; do
+    for candidate in "$script_dir/agora" "$script_dir/../bin/agora" "$script_dir/../agora"; do
       if [[ -x "$candidate" ]]; then
         agora_bin="$candidate"
         break

@@ -45,6 +45,7 @@ func TestInstallScriptBakesServerAndBaseURL(t *testing.T) {
 		"wget -qO",
 		"EnvironmentVariables",
 		"AGORA_PI_BINARY",
+		"agora-wrapper.sh",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("install.sh is missing %q:\n%s", want, body)

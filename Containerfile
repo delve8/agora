@@ -47,6 +47,7 @@ RUN set -eux; \
       CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
         go build -trimpath -ldflags="-s -w" -o "/out/download/agora-$os-$arch" ./cmd/agora; \
     done; \
+    cp scripts/agora-wrapper.sh /out/download/agora-wrapper.sh; \
     cd /out/download && sha256sum agora-* > checksums.txt
 
 # ------------------------------------------------------------------- Runtime

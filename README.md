@@ -199,17 +199,26 @@ The Server serves two things for this flow:
 
 - `GET /download/install.sh`: the installer, rendered with `AGORA_PUBLIC_URL`
   baked in as both the Server URL and the download base URL.
-- `GET /download/agora-<os>-<arch>` and `GET /download/checksums.txt`: prebuilt
-  Daemons for linux/darwin on amd64/arm64, produced by the image build and read
-  from `AGORA_DOWNLOAD_DIR` (default `/app/download` in the image). These routes
-  are public like `/healthz`; the pairing code, not the download, is the secret.
+- `GET /download/agora-<os>-<arch>`, `GET /download/agora-wrapper.sh` and
+  `GET /download/checksums.txt`: prebuilt Daemons for linux/darwin on
+  amd64/arm64 plus the PATH wrapper, produced by the image build and read from
+  `AGORA_DOWNLOAD_DIR` (default `/app/download` in the image). These routes are
+  public like `/healthz`; the pairing code, not the download, is the secret.
 
 The installer detects the platform and architecture, verifies the download
 against `checksums.txt`, installs the binary under `~/.local/bin`, and runs
 `agora pair <code>`, which records the device credential, the device id and the
-Server URL in `~/.agora/`. It then installs a user-level background service:
-`systemd --user` on Linux and a launchd `LaunchAgent` on macOS, both with
-restart-on-failure and start-at-login. Windows is not supported.
+Server URL in `~/.agora/`. It also installs the PATH wrapper as
+`~/.local/bin/pi` and `~/.local/bin/claude`, so the native commands create
+Agora-managed sessions instead of running the provider outside Agora; an
+existing provider binary is never replaced.
+
+It then installs a user-level background service: `systemd --user` on Linux and
+a launchd `LaunchAgent` on macOS, both with restart-on-failure and
+start-at-login. Service managers start the daemon with a minimal environment, so
+the installer resolves the real `pi`/`claude` executables and writes them, plus
+the installer's PATH, into the service definition (`AGORA_PI_BINARY`,
+`AGORA_CLAUDE_BINARY`). Windows is not supported.
 
 Because pairing remembers the Server URL, the service needs no environment
 variables: later `agora daemon` runs, including after a reboot, reconnect to the
