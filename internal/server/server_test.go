@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/delve8/agora/internal/auth"
 	"github.com/delve8/agora/internal/config"
 	"github.com/delve8/agora/internal/coordination"
+	"github.com/delve8/agora/internal/event"
 	"github.com/delve8/agora/internal/protocol"
 	"github.com/delve8/agora/internal/runtime"
 	"github.com/delve8/agora/internal/session"
@@ -1043,5 +1045,127 @@ func TestDaemonWrapEndpointRemoved(t *testing.T) {
 	srv.HTTP.Handler.ServeHTTP(resp, req)
 	if resp.Code != http.StatusNotFound {
 		t.Fatalf("POST /api/daemon/wrap returned %d, want 404", resp.Code)
+	}
+}
+
+// In serve mode the Server owns the runtime manager: handoff extracts a
+// dossier from a local history session and writes a brand-new Pi transcript.
+func TestHandoffSessionLocalServeMode(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "agora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	if err := db.CreateCoordination(ctx, coordination.Coordination{ID: "coord-1", Name: "Test", CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	sourceWorkspace := t.TempDir()
+	sourcePath, err := (adapter.ClaudeSessionWriter{HomeDir: t.TempDir(), Version: "2.1.278"}).WriteSessionFile(
+		sourceWorkspace, "11111111-1111-4111-8111-111111111111",
+		[]adapter.HandoffMessage{{Role: "user", Content: "实现会话管理"}, {Role: "assistant", Content: "已完成，待办是补测试。"}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceID := "daemon/local/claude://11111111-1111-4111-8111-111111111111"
+	if err := db.CreateSession(ctx, session.Session{
+		ID: sourceID, CoordinationID: "coord-1", DaemonID: "local", Agent: "claude",
+		AgentSessionID: "claude://11111111-1111-4111-8111-111111111111", Workspace: sourceWorkspace,
+		DisplayName: "源会话", Source: session.SourceHistory, HistoryPath: sourcePath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manager := runtime.NewPiProviderRuntime(db, "local", runtime.PiConfig{SessionDir: t.TempDir()})
+	srv := New(":0", db, manager)
+	targetWorkspace := t.TempDir()
+
+	body := `{"target_agent":"pi","target_workspace":` + strconv.Quote(targetWorkspace) + `}`
+	req := httptest.NewRequest(http.MethodPost, sessionAPIPath(sourceID, "/handoff"), bytes.NewBufferString(body))
+	resp := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("handoff returned %d: %s", resp.Code, resp.Body.String())
+	}
+	var value session.Session
+	if err := json.Unmarshal(resp.Body.Bytes(), &value); err != nil {
+		t.Fatal(err)
+	}
+	if value.Agent != "pi" || value.ID == sourceID || value.AgentSessionID == "claude://11111111-1111-4111-8111-111111111111" {
+		t.Fatalf("handoff reused the source identity: %+v", value)
+	}
+	if _, err := os.Stat(value.HistoryPath); err != nil {
+		t.Fatalf("handoff transcript missing: %v", err)
+	}
+	if _, err := db.GetSession(ctx, value.ID); err != nil {
+		t.Fatalf("handoff session not stored: %v", err)
+	}
+}
+
+// In split mode the Server extracts the dossier and the owning Daemon writes
+// the transcript, so the cross-device handoff is two daemon requests.
+func TestHandoffSessionRoutesToDaemon(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "agora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	if err := db.CreateCoordination(ctx, coordination.Coordination{ID: "coord-1", Name: "Test", CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	srv := New(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), nil))
+	now := time.Now().UTC()
+	sourceID := "daemon/daemon-1/claude://source-1"
+	seedDaemonHistorySession(srv, "daemon-1", protocol.HistorySessionSummary{
+		SessionID: sourceID, DaemonID: "daemon-1", Agent: "claude", AgentSessionID: "claude://source-1",
+		ClaudeSessionID: "source-1", Workspace: "/tmp/source", HistoryPath: "/tmp/source.jsonl",
+		DisplayName: "Source", CreatedAt: now, UpdatedAt: now,
+	})
+	connection := srv.daemons.devices["daemon-1"]
+	connection.send = make(chan protocol.Envelope, 8)
+
+	newSessionID := "daemon/daemon-1/pi://fresh-1"
+	go func() {
+		for request := range connection.send {
+			var response protocol.Envelope
+			switch request.Type {
+			case protocol.SessionHistoryRequest:
+				events, _ := json.Marshal([]event.Event{{Kind: event.KindUser, Content: "实现会话管理"}, {Kind: event.KindAssistant, Content: "已完成，待办是补测试。"}})
+				response, _ = protocol.NewEnvelope(protocol.SessionHistoryResponse, protocol.HistoryResponsePayload{SessionID: sourceID, Events: events})
+			case protocol.SessionHandoff:
+				response, _ = protocol.NewEnvelope(protocol.SessionHandoffResult, protocol.SessionHandoffResultPayload{
+					SessionID: newSessionID, DaemonID: "daemon-1", Agent: "pi", AgentSessionID: "pi://fresh-1",
+					Workspace: "/tmp/target", HistoryPath: "/tmp/pi/fresh-1.jsonl", DisplayName: "交接",
+				})
+			default:
+				continue
+			}
+			response.RequestID = request.RequestID
+			srv.daemons.mu.RLock()
+			pending := srv.daemons.pending[request.RequestID]
+			srv.daemons.mu.RUnlock()
+			if pending != nil {
+				pending <- response
+			}
+		}
+	}()
+
+	body := `{"target_agent":"pi","target_daemon_id":"daemon-1","target_workspace":"/tmp/target"}`
+	req := httptest.NewRequest(http.MethodPost, sessionAPIPath(sourceID, "/handoff"), bytes.NewBufferString(body))
+	resp := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("handoff returned %d: %s", resp.Code, resp.Body.String())
+	}
+	var value session.Session
+	if err := json.Unmarshal(resp.Body.Bytes(), &value); err != nil {
+		t.Fatal(err)
+	}
+	if value.ID != newSessionID || value.Agent != "pi" {
+		t.Fatalf("handoff session = %+v", value)
+	}
+	if _, err := db.GetSession(ctx, newSessionID); err != nil {
+		t.Fatalf("handoff session not stored: %v", err)
 	}
 }

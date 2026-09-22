@@ -832,6 +832,44 @@ func (d *Daemon) handle(frame protocol.Envelope) error {
 		d.historyMu.Unlock()
 		d.stopEventBridge(payload.SessionID)
 		return d.sendResync()
+	case protocol.SessionHandoff:
+		var payload protocol.SessionHandoffPayload
+		if err := protocol.DecodePayload(frame, &payload); err != nil {
+			return err
+		}
+		result := protocol.SessionHandoffResultPayload{Agent: payload.Agent}
+		switch {
+		case payload.DaemonID != "" && payload.DaemonID != d.config.ID:
+			result.Error = fmt.Sprintf("session handoff target %s does not match this daemon %s", payload.DaemonID, d.config.ID)
+		case strings.TrimSpace(payload.Workspace) == "":
+			result.Error = "workspace is required"
+		case len(payload.Messages) == 0:
+			result.Error = "handoff requires at least one message"
+		default:
+			messages := make([]adapter.HandoffMessage, 0, len(payload.Messages))
+			for _, item := range payload.Messages {
+				messages = append(messages, adapter.HandoffMessage{Role: item.Role, Content: item.Content})
+			}
+			value, err := d.manager.WriteHandoffSession(context.Background(), payload.Agent, payload.Workspace, d.config.ID, payload.CoordinationID, payload.DisplayName, messages)
+			if err != nil {
+				result.Error = err.Error()
+			} else {
+				result.SessionID = value.ID
+				result.DaemonID = value.DaemonID
+				result.Agent = value.Agent
+				result.AgentSessionID = value.AgentSessionID
+				result.Workspace = value.Workspace
+				result.HistoryPath = value.HistoryPath
+				result.DisplayName = value.DisplayName
+			}
+		}
+		if err := d.sendResponse(protocol.SessionHandoffResult, result, frame.RequestID); err != nil {
+			return err
+		}
+		if result.Error != "" {
+			return nil
+		}
+		return d.sendResync()
 	case protocol.SessionHistoryRequest:
 		log.Printf("agora daemon: history request for %s", frame.RequestID)
 		var payload protocol.HistoryRequestPayload

@@ -34,6 +34,8 @@ const (
 	SessionStopResult      = "session.stop_result"
 	SessionDelete          = "session.delete"
 	SessionDeleteResult    = "session.delete_result"
+	SessionHandoff         = "session.handoff"
+	SessionHandoffResult   = "session.handoff_result"
 	SessionExit            = "session.exit"
 	// SessionReport describes a message the injected Agent extension sends over
 	// the local Daemon socket. It is provider-native evidence: the Agent itself
@@ -80,7 +82,7 @@ func ValidateType(typ string) error {
 		DaemonResync, ServerResyncRequest, SessionCreate, SessionCreated,
 		SessionUpdate, SessionRebind, EventBatch, SessionHistoryRequest, SessionHistoryResponse,
 		SnapshotRequest, SnapshotResponse, AttachRequest, AttachResponse, SessionInput, SessionInputResult,
-		SessionStop, SessionStopResult, SessionDelete, SessionDeleteResult, SessionExit, Ack, Error:
+		SessionStop, SessionStopResult, SessionDelete, SessionDeleteResult, SessionHandoff, SessionHandoffResult, SessionExit, Ack, Error:
 		return nil
 	default:
 		return fmt.Errorf("unknown protocol message type %q", typ)
@@ -391,6 +393,37 @@ type DeleteResultPayload struct {
 	SessionID string `json:"session_id"`
 	Deleted   bool   `json:"deleted"`
 	Error     string `json:"error,omitempty"`
+}
+
+// HandoffMessagePayload is one settled turn of an extracted handoff dossier.
+type HandoffMessagePayload struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// SessionHandoffPayload asks a Daemon to write a new native transcript for the
+// target Agent and register it. The Server extracts the dossier (it already
+// holds the normalized history) and the owning Daemon performs the write,
+// because the transcript and workspace live on that workstation.
+type SessionHandoffPayload struct {
+	CoordinationID  string                  `json:"coordination_id,omitempty"`
+	SourceSessionID string                  `json:"source_session_id,omitempty"`
+	Agent           string                  `json:"agent"`
+	Workspace       string                  `json:"workspace"`
+	DisplayName     string                  `json:"display_name,omitempty"`
+	Messages        []HandoffMessagePayload `json:"messages"`
+	DaemonID        string                  `json:"daemon_id,omitempty"`
+}
+
+type SessionHandoffResultPayload struct {
+	SessionID      string `json:"session_id"`
+	DaemonID       string `json:"daemon_id,omitempty"`
+	Agent          string `json:"agent,omitempty"`
+	AgentSessionID string `json:"agent_session_id,omitempty"`
+	Workspace      string `json:"workspace,omitempty"`
+	HistoryPath    string `json:"history_path,omitempty"`
+	DisplayName    string `json:"display_name,omitempty"`
+	Error          string `json:"error,omitempty"`
 }
 
 type ExitPayload struct {

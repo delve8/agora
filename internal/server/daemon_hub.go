@@ -472,7 +472,7 @@ func (h *daemonHub) handleFrame(c *daemonConnection, frame protocol.Envelope) er
 		return nil
 	case protocol.EventBatch:
 		return h.handleEventBatch(c, frame)
-	case protocol.SessionInputResult, protocol.SessionStopResult, protocol.SessionDeleteResult, protocol.SessionHistoryResponse, protocol.SnapshotResponse, protocol.AttachResponse, protocol.SessionCreated:
+	case protocol.SessionInputResult, protocol.SessionStopResult, protocol.SessionDeleteResult, protocol.SessionHandoffResult, protocol.SessionHistoryResponse, protocol.SnapshotResponse, protocol.AttachResponse, protocol.SessionCreated:
 		log.Printf("agora server: response %s request %s", frame.Type, frame.RequestID)
 		if frame.RequestID == "" {
 			return nil
@@ -1133,6 +1133,30 @@ func (h *daemonHub) forgetSession(sessionID string) {
 	for daemonID := range h.history {
 		delete(h.history[daemonID], sessionID)
 	}
+}
+
+// handoffSession asks a Daemon to write a handoff transcript. The Server has
+// already extracted the dossier; the Daemon owns the workspace and does the
+// file write.
+func (h *daemonHub) handoffSession(ctx context.Context, payload protocol.SessionHandoffPayload) (protocol.SessionHandoffResultPayload, error) {
+	var frame protocol.Envelope
+	var err error
+	if payload.DaemonID != "" {
+		frame, err = h.requestToDaemon(ctx, payload.DaemonID, protocol.SessionHandoff, payload, protocol.SessionHandoffResult)
+	} else {
+		frame, err = h.requestAny(ctx, protocol.SessionHandoff, payload, protocol.SessionHandoffResult)
+	}
+	if err != nil {
+		return protocol.SessionHandoffResultPayload{}, err
+	}
+	var result protocol.SessionHandoffResultPayload
+	if err := protocol.DecodePayload(frame, &result); err != nil {
+		return result, err
+	}
+	if result.Error != "" {
+		return result, errors.New(result.Error)
+	}
+	return result, nil
 }
 
 func (h *daemonHub) sessionInput(ctx context.Context, value session.Session, content string) error {

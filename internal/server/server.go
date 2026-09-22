@@ -23,6 +23,7 @@ import (
 	"github.com/delve8/agora/internal/config"
 	"github.com/delve8/agora/internal/coordination"
 	"github.com/delve8/agora/internal/event"
+	"github.com/delve8/agora/internal/handoff"
 	"github.com/delve8/agora/internal/message"
 	"github.com/delve8/agora/internal/notification"
 	"github.com/delve8/agora/internal/protocol"
@@ -162,6 +163,7 @@ func NewWithWebDirAndAuth(addr string, db *store.Store, manager *runtime.Manager
 	mux.HandleFunc("GET /api/sessions/{id}", s.getSession)
 	mux.HandleFunc("PATCH /api/sessions/{id}", s.updateSession)
 	mux.HandleFunc("DELETE /api/sessions/{id}", s.deleteSession)
+	mux.HandleFunc("POST /api/sessions/{id}/handoff", s.handoffSession)
 	mux.HandleFunc("POST /api/sessions/{id}/resume", s.resumeSession)
 	mux.HandleFunc("POST /api/sessions/{id}/stop", s.stopSession)
 	mux.HandleFunc("GET /api/sessions/{id}/events", s.getEvents)
@@ -1603,6 +1605,138 @@ func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request) {
 		_ = s.store.DeleteSessionPreferenceByKey(r.Context(), key)
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"deleted": true})
+}
+
+type sessionHandoffInput struct {
+	TargetAgent     string `json:"target_agent"`
+	TargetDaemonID  string `json:"target_daemon_id"`
+	TargetWorkspace string `json:"target_workspace"`
+	DisplayName     string `json:"display_name"`
+}
+
+// handoffSession continues a source conversation on another Agent and/or device.
+// The Server extracts a deterministic dossier from the source's normalized
+// events and has the owning Daemon write it as a brand-new native transcript;
+// the synthesized session always gets a fresh id, never the source's.
+func (s *Server) handoffSession(w http.ResponseWriter, r *http.Request) {
+	source, location, err := s.resolveSession(r.Context(), r.PathValue("id"))
+	if errors.Is(err, sql.ErrNoRows) {
+		writeErrorStatus(w, http.StatusNotFound, err)
+		return
+	}
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	var input sessionHandoffInput
+	if err := decodeJSON(r, &input); err != nil {
+		writeErrorStatus(w, http.StatusBadRequest, err)
+		return
+	}
+	agent := normalizeHandoffAgent(input.TargetAgent)
+	if agent == "" {
+		agent = "claude"
+	}
+	if agent != "claude" && agent != "pi" {
+		writeErrorStatus(w, http.StatusBadRequest, fmt.Errorf("agent %q does not support direct session handoff yet", input.TargetAgent))
+		return
+	}
+	workspace := strings.TrimSpace(input.TargetWorkspace)
+	if workspace == "" {
+		writeErrorStatus(w, http.StatusBadRequest, fmt.Errorf("target_workspace is required"))
+		return
+	}
+	daemonID := strings.TrimSpace(input.TargetDaemonID)
+
+	events, err := s.handoffSourceEvents(r.Context(), source, location)
+	if err != nil {
+		writeErrorStatus(w, http.StatusBadGateway, err)
+		return
+	}
+	brief := handoff.Extract(source, events)
+	displayName := strings.TrimSpace(input.DisplayName)
+	if displayName == "" {
+		displayName = brief.Title()
+	}
+
+	if s.manager != nil && s.manager.CanManageSessions() {
+		if daemonID != "" {
+			writeErrorStatus(w, http.StatusBadRequest, errors.New("device targeting is not available in serve mode"))
+			return
+		}
+		value, err := s.manager.WriteHandoffSession(r.Context(), agent, workspace, "local", source.CoordinationID, displayName, brief.Messages())
+		if err != nil {
+			writeErrorStatus(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, value)
+		return
+	}
+	if s.daemons == nil {
+		writeErrorStatus(w, http.StatusServiceUnavailable, fmt.Errorf("daemon service is unavailable"))
+		return
+	}
+	if daemonID != "" && s.auth.Mode() == config.AuthModeLogto {
+		principal, principalErr := auth.RequirePrincipal(r.Context())
+		if principalErr != nil {
+			writeErrorStatus(w, http.StatusUnauthorized, principalErr)
+			return
+		}
+		owned, ownedErr := s.store.UserOwnsDaemon(r.Context(), principal.UserID, daemonID)
+		if ownedErr != nil {
+			writeError(w, ownedErr)
+			return
+		}
+		if !owned {
+			writeErrorStatus(w, http.StatusNotFound, sql.ErrNoRows)
+			return
+		}
+	}
+	messages := brief.Messages()
+	payload := protocol.SessionHandoffPayload{
+		CoordinationID: source.CoordinationID, SourceSessionID: source.ID,
+		Agent: agent, Workspace: workspace, DisplayName: displayName,
+		Messages: make([]protocol.HandoffMessagePayload, 0, len(messages)), DaemonID: daemonID,
+	}
+	for _, item := range messages {
+		payload.Messages = append(payload.Messages, protocol.HandoffMessagePayload{Role: item.Role, Content: item.Content})
+	}
+	result, err := s.daemons.handoffSession(r.Context(), payload)
+	if err != nil {
+		writeErrorStatus(w, http.StatusBadGateway, err)
+		return
+	}
+	value := session.Session{
+		ID: result.SessionID, CoordinationID: source.CoordinationID, DaemonID: result.DaemonID,
+		Agent: result.Agent, AgentSessionID: result.AgentSessionID, Workspace: result.Workspace,
+		DisplayName: result.DisplayName, DisplayNameSource: session.DisplayNameSourceCustom,
+		Role: "handoff", State: session.StateStopped, Source: session.SourceHistory,
+		Connection: session.ConnectionUnavailable, HistoryPath: result.HistoryPath,
+		Capabilities: session.Capabilities{CanReadHistory: true, CanResume: true},
+		CreatedAt:    time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}
+	if err := s.store.CreateSession(r.Context(), value); err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, value)
+}
+
+func (s *Server) handoffSourceEvents(ctx context.Context, value session.Session, location sessionLocation) ([]event.Event, error) {
+	if s.manager != nil && s.manager.CanManageSessions() && location != sessionLocationDaemonHistory {
+		return s.manager.HistoryForSession(ctx, value, 0)
+	}
+	// Bound what the Server pulls from a Daemon: the dossier only needs the
+	// recent conversation plus the last todolist.
+	return s.requestDaemonHistory(ctx, value.ID, 2000, "")
+}
+
+func normalizeHandoffAgent(agent string) string {
+	agent = strings.ToLower(strings.TrimSpace(agent))
+	if agent == "claude-code" {
+		return "claude"
+	}
+	return agent
 }
 
 func (s *Server) getEvents(w http.ResponseWriter, r *http.Request) {

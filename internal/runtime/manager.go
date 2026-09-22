@@ -17,6 +17,7 @@ import (
 
 	"github.com/delve8/agora/internal/adapter"
 	"github.com/delve8/agora/internal/event"
+	"github.com/delve8/agora/internal/handoff"
 	"github.com/delve8/agora/internal/message"
 	"github.com/delve8/agora/internal/runtime/piextension"
 	"github.com/delve8/agora/internal/session"
@@ -883,6 +884,83 @@ func (m *Manager) StopSession(value session.Session) error {
 		return fmt.Errorf("session is not running")
 	}
 	return client.Stop(context.Background())
+}
+
+// HandoffSession continues a source conversation on targetAgent at
+// targetWorkspace. It extracts a deterministic dossier from the source's
+// normalized events and writes it as a brand-new native transcript the target
+// Agent can resume, so the target starts already oriented and does not redo
+// finished work. Direct synthesis is the primary path; providers without a
+// writer return an error rather than guessing.
+func (m *Manager) HandoffSession(ctx context.Context, source session.Session, targetAgent, targetWorkspace, owner, coordinationID string) (session.Session, error) {
+	if m == nil {
+		return session.Session{}, fmt.Errorf("session manager is unavailable")
+	}
+	events, err := m.HistoryForSession(ctx, source, 0)
+	if err != nil {
+		return session.Session{}, err
+	}
+	brief := handoff.Extract(source, events)
+	return m.WriteHandoffSession(ctx, targetAgent, targetWorkspace, owner, coordinationID, brief.Title(), brief.Messages())
+}
+
+// WriteHandoffSession writes an already-extracted dossier as a brand-new native
+// transcript and registers it. The native id is always freshly generated: a
+// handoff is a new session on the target, never a reuse of the source id.
+func (m *Manager) WriteHandoffSession(ctx context.Context, targetAgent, targetWorkspace, owner, coordinationID, displayName string, messages []adapter.HandoffMessage) (session.Session, error) {
+	if m == nil {
+		return session.Session{}, fmt.Errorf("session manager is unavailable")
+	}
+	if len(messages) == 0 {
+		return session.Session{}, fmt.Errorf("handoff requires at least one message")
+	}
+	agent := normalizeAgentName(targetAgent)
+	writer, ok := adapter.NewSessionFileWriter(agent, m.homeDir, m.piHistoryRoot(), "")
+	if !ok {
+		return session.Session{}, fmt.Errorf("agent %q does not support direct session handoff yet", targetAgent)
+	}
+	nativeID, err := adapter.NewNativeSessionID()
+	if err != nil {
+		return session.Session{}, err
+	}
+	path, err := writer.WriteSessionFile(targetWorkspace, nativeID, messages)
+	if err != nil {
+		return session.Session{}, err
+	}
+	workspace, err := adapter.CanonicalWorkspace(targetWorkspace)
+	if err != nil {
+		return session.Session{}, err
+	}
+	uri := agent + "://" + nativeID
+	canonicalID, err := session.NewSessionID(owner, agent, uri)
+	if err != nil {
+		return session.Session{}, err
+	}
+	if strings.TrimSpace(displayName) == "" {
+		displayName = "Handoff"
+	}
+	now := time.Now().UTC()
+	value := session.Session{
+		ID: canonicalID, CoordinationID: coordinationID, DaemonID: owner,
+		Agent: agent, AgentSessionID: uri, Workspace: workspace,
+		DisplayName: displayName, DisplayNameSource: session.DisplayNameSourceCustom,
+		Role: "handoff", State: session.StateStopped, Source: session.SourceHistory,
+		Connection: session.ConnectionUnavailable, HistoryPath: path,
+		Capabilities: session.Capabilities{CanReadHistory: true, CanResume: true},
+		CreatedAt:    now, UpdatedAt: now,
+	}
+	if err := m.store.CreateSession(ctx, value); err != nil {
+		return session.Session{}, err
+	}
+	return value, nil
+}
+
+func normalizeAgentName(agent string) string {
+	agent = strings.ToLower(strings.TrimSpace(agent))
+	if agent == "claude-code" {
+		return "claude"
+	}
+	return agent
 }
 
 // DeleteSession permanently removes a stopped session: its provider transcript
