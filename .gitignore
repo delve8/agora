@@ -50,4 +50,9 @@ build/
 
 # Editor/IDE
 # .idea/
-# .vscode/
+.vscode/
+
+# Agent tooling kept local to a checkout: project skills and per-developer agent
+# configuration. Ignored rather than committed, so a skill can be tried out here
+# without becoming part of the repository.
+.agents/
