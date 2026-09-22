@@ -161,6 +161,8 @@ func NewWithWebDirAndAuth(addr string, db *store.Store, manager *runtime.Manager
 	mux.HandleFunc("GET /api/coordinations/{id}", s.getCoordination)
 	mux.HandleFunc("POST /api/coordinations/{id}/sessions", s.createSession)
 	mux.HandleFunc("GET /api/sessions/{id}", s.getSession)
+	mux.HandleFunc("PATCH /api/sessions/{id}", s.updateSession)
+	mux.HandleFunc("DELETE /api/sessions/{id}", s.deleteSession)
 	mux.HandleFunc("POST /api/sessions/{id}/resume", s.resumeSession)
 	mux.HandleFunc("POST /api/sessions/{id}/stop", s.stopSession)
 	mux.HandleFunc("GET /api/sessions/{id}/events", s.getEvents)
@@ -1097,11 +1099,14 @@ func (s *Server) liveSessions(ctx context.Context, coordinationID string) ([]ses
 	return sessions, nil
 }
 
-// hideRevokedSessions is a defense-in-depth boundary for state responses. Hub
-// cleanup normally removes revoked daemons before they can contribute rows, but
-// filtering against the store also covers an in-flight refresh or a connection
-// that was revoked concurrently with state construction.
-func (s *Server) hideRevokedSessions(ctx context.Context, values []session.Session) ([]session.Session, error) {
+// visibleSessions is the isolation boundary for every session-list response.
+// A device has exactly one owner, so a user must only ever see sessions on the
+// devices they own; the daemon hub holds every connected daemon's sessions, so
+// without this filter another user's sessions would leak into the list even
+// though acting on them is already forbidden. Revoked devices are hidden too.
+// trust-local mode is the deployment's own single-user trust boundary and does
+// not filter.
+func (s *Server) visibleSessions(ctx context.Context, values []session.Session) ([]session.Session, error) {
 	if s.store == nil || len(values) == 0 {
 		return values, nil
 	}
@@ -1109,18 +1114,18 @@ func (s *Server) hideRevokedSessions(ctx context.Context, values []session.Sessi
 	if err != nil {
 		return nil, err
 	}
+	if s.auth.Mode() == config.AuthModeLocal {
+		return values, nil
+	}
 	devices, err := s.store.ListDevices(ctx, principal.UserID)
 	if err != nil {
 		return nil, err
 	}
-	revoked := make(map[string]bool)
+	owned := make(map[string]bool, len(devices))
 	for _, device := range devices {
-		if device.RevokedAt != nil {
-			revoked[device.ID] = true
+		if device.RevokedAt == nil {
+			owned[device.ID] = true
 		}
-	}
-	if len(revoked) == 0 {
-		return values, nil
 	}
 	filtered := values[:0]
 	for _, value := range values {
@@ -1130,7 +1135,7 @@ func (s *Server) hideRevokedSessions(ctx context.Context, values []session.Sessi
 				daemonID = identity.DaemonID
 			}
 		}
-		if revoked[daemonID] {
+		if !owned[daemonID] {
 			continue
 		}
 		filtered = append(filtered, value)
@@ -1158,7 +1163,7 @@ func (s *Server) state(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	sessions, err = s.hideRevokedSessions(r.Context(), sessions)
+	sessions, err = s.visibleSessions(r.Context(), sessions)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -1259,8 +1264,12 @@ func (s *Server) state(w http.ResponseWriter, r *http.Request) {
 	for _, value := range s.daemons.historySessions(coord.ID) {
 		mergeDiscovered(value)
 	}
-	sessions, err = s.hideRevokedSessions(r.Context(), sessions)
+	sessions, err = s.visibleSessions(r.Context(), sessions)
 	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if err := s.applySessionPreferences(r.Context(), sessions); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -1273,8 +1282,102 @@ func (s *Server) state(w http.ResponseWriter, r *http.Request) {
 			sessions[index].UpdatedAt = now
 		}
 	}
-	sort.SliceStable(sessions, func(i, j int) bool { return sessions[i].UpdatedAt.After(sessions[j].UpdatedAt) })
+	// A starred session is the one the user currently cares about, so it sorts
+	// ahead of every unstarred session regardless of recency.
+	sort.SliceStable(sessions, func(i, j int) bool {
+		if sessions[i].Starred != sessions[j].Starred {
+			return sessions[i].Starred
+		}
+		return sessions[i].UpdatedAt.After(sessions[j].UpdatedAt)
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"coordination": coord, "sessions": sessions})
+}
+
+// sessionPreferenceKey is where a per-user preference is stored. The provider
+// native URI is preferred because it survives a canonical id change caused by a
+// resume/rebind; the canonical id is the fallback while the native URI is still
+// being resolved.
+func sessionPreferenceKey(value session.Session) string {
+	if uri := strings.TrimSpace(value.NativeSessionURI()); uri != "" {
+		return uri
+	}
+	return strings.TrimSpace(value.ID)
+}
+
+func (s *Server) lookupSessionPreference(ctx context.Context, userID string, value session.Session) (store.SessionPreference, error) {
+	keys := make([]string, 0, 2)
+	if uri := strings.TrimSpace(value.NativeSessionURI()); uri != "" {
+		keys = append(keys, uri)
+	}
+	if id := strings.TrimSpace(value.ID); id != "" && (len(keys) == 0 || keys[0] != id) {
+		keys = append(keys, id)
+	}
+	for _, key := range keys {
+		preference, err := s.store.GetSessionPreference(ctx, userID, key)
+		if err == nil {
+			return preference, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return store.SessionPreference{}, err
+		}
+	}
+	return store.SessionPreference{}, sql.ErrNoRows
+}
+
+func (s *Server) saveSessionPreference(ctx context.Context, userID string, value session.Session, preference store.SessionPreference) error {
+	preference.UserID = userID
+	preference.SessionKey = sessionPreferenceKey(value)
+	if preference.SessionKey == "" {
+		return fmt.Errorf("session has no id")
+	}
+	if err := s.store.UpsertSessionPreference(ctx, preference); err != nil {
+		return err
+	}
+	// Drop a stale row left under the canonical id before the native URI was
+	// resolved, so the same session does not keep two preferences.
+	if id := strings.TrimSpace(value.ID); id != "" && id != preference.SessionKey {
+		_ = s.store.DeleteSessionPreference(ctx, userID, id)
+	}
+	return nil
+}
+
+// applySessionPreferences overlays the requesting user's alias and starred flag
+// on the merged session list. It runs after discovery so a user alias always
+// wins over a derived name, and before sorting so starred sessions lead.
+func (s *Server) applySessionPreferences(ctx context.Context, sessions []session.Session) error {
+	if s.store == nil || len(sessions) == 0 {
+		return nil
+	}
+	principal, err := auth.RequirePrincipal(ctx)
+	if err != nil {
+		return err
+	}
+	preferences, err := s.store.ListSessionPreferences(ctx, principal.UserID)
+	if err != nil {
+		return err
+	}
+	if len(preferences) == 0 {
+		return nil
+	}
+	byKey := make(map[string]store.SessionPreference, len(preferences))
+	for _, preference := range preferences {
+		byKey[preference.SessionKey] = preference
+	}
+	for index := range sessions {
+		preference, ok := byKey[strings.TrimSpace(sessions[index].NativeSessionURI())]
+		if !ok {
+			preference, ok = byKey[strings.TrimSpace(sessions[index].ID)]
+		}
+		if !ok {
+			continue
+		}
+		sessions[index].Starred = preference.Starred
+		if name := strings.TrimSpace(preference.DisplayName); name != "" {
+			sessions[index].DisplayName = name
+			sessions[index].DisplayNameSource = session.DisplayNameSourceCustom
+		}
+	}
+	return nil
 }
 
 func shouldEnrichSessionName(current session.Session) bool {
@@ -1494,7 +1597,7 @@ func (s *Server) getCoordination(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	sessions, err = s.hideRevokedSessions(r.Context(), sessions)
+	sessions, err = s.visibleSessions(r.Context(), sessions)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -1583,6 +1686,130 @@ func (s *Server) getSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, value)
+}
+
+type sessionPatchPayload struct {
+	Starred     *bool   `json:"starred"`
+	DisplayName *string `json:"display_name"`
+}
+
+// updateSession sets the requesting user's alias and/or starred flag for a
+// session. These are Server-side preferences, not provider state, so they work
+// for live managed sessions and discovered history alike.
+func (s *Server) updateSession(w http.ResponseWriter, r *http.Request) {
+	value, _, err := s.resolveSession(r.Context(), r.PathValue("id"))
+	if errors.Is(err, sql.ErrNoRows) {
+		writeErrorStatus(w, http.StatusNotFound, err)
+		return
+	}
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	var payload sessionPatchPayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeErrorStatus(w, http.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
+		return
+	}
+	if payload.Starred == nil && payload.DisplayName == nil {
+		writeErrorStatus(w, http.StatusBadRequest, fmt.Errorf("starred or display_name is required"))
+		return
+	}
+	principal, err := auth.RequirePrincipal(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	preference, err := s.lookupSessionPreference(r.Context(), principal.UserID, value)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		writeError(w, err)
+		return
+	}
+	if payload.Starred != nil {
+		preference.Starred = *payload.Starred
+	}
+	if payload.DisplayName != nil {
+		preference.DisplayName = session.DescribeMessage(strings.TrimSpace(*payload.DisplayName))
+	}
+	if preference.DisplayName == "" && !preference.Starred {
+		// The row may live under either key depending on when the native URI was
+		// resolved, so clear both.
+		for _, key := range []string{sessionPreferenceKey(value), strings.TrimSpace(value.ID)} {
+			if key == "" {
+				continue
+			}
+			if err := s.store.DeleteSessionPreference(r.Context(), principal.UserID, key); err != nil {
+				writeError(w, err)
+				return
+			}
+		}
+		value.Starred = false
+	} else {
+		if err := s.saveSessionPreference(r.Context(), principal.UserID, value, preference); err != nil {
+			writeError(w, err)
+			return
+		}
+		value.Starred = preference.Starred
+		if preference.DisplayName != "" {
+			value.DisplayName = preference.DisplayName
+			value.DisplayNameSource = session.DisplayNameSourceCustom
+		}
+	}
+	writeJSON(w, http.StatusOK, value)
+}
+
+// deleteSession permanently removes a stopped session. The provider transcript
+// lives on the owning workstation, so a remote session is deleted through its
+// Daemon; a local session is deleted by the in-process manager. A running
+// session is refused because its files are still open.
+func (s *Server) deleteSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	value, location, err := s.resolveSession(r.Context(), id)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeErrorStatus(w, http.StatusNotFound, err)
+		return
+	}
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if location == sessionLocationDaemonHistory || s.manager == nil || !s.manager.CanManageSessions() {
+		// A canonical id that is not in the Server store resolves to a
+		// synthetic stopped row, so consult the owning Daemon's live summary
+		// before trusting it.
+		value = s.daemons.effectiveSession(value)
+	}
+	if isLiveSession(value) {
+		writeErrorStatus(w, http.StatusConflict, fmt.Errorf("session is running; stop it before deleting"))
+		return
+	}
+	if location == sessionLocationDaemonHistory || s.manager == nil || !s.manager.CanManageSessions() {
+		if !s.daemons.hasRoute(value.ID) {
+			writeErrorStatus(w, http.StatusBadGateway, fmt.Errorf("session owner is offline; cannot delete its files"))
+			return
+		}
+		if err := s.daemons.deleteSession(r.Context(), value); err != nil {
+			writeErrorStatus(w, http.StatusBadGateway, err)
+			return
+		}
+	} else if err := s.manager.DeleteSession(r.Context(), value); err != nil {
+		writeErrorStatus(w, http.StatusConflict, err)
+		return
+	}
+	// Remove what the Server still holds for this session: the persisted row,
+	// the user's preference and the hub's cached route/history entry.
+	if err := s.store.DeleteSession(r.Context(), value.ID); err != nil {
+		writeError(w, err)
+		return
+	}
+	s.daemons.forgetSession(value.ID)
+	// The session is gone for everyone, so drop every user's alias/star for it
+	// instead of leaving orphan rows. Both key shapes are cleared because the
+	// preference may have been saved before the native URI was resolved.
+	for _, key := range []string{sessionPreferenceKey(value), strings.TrimSpace(value.ID)} {
+		_ = s.store.DeleteSessionPreferenceByKey(r.Context(), key)
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"deleted": true})
 }
 
 func (s *Server) getEvents(w http.ResponseWriter, r *http.Request) {

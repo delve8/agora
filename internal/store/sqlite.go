@@ -66,6 +66,8 @@ CREATE TABLE IF NOT EXISTS user_identities (user_id TEXT NOT NULL, provider TEXT
 CREATE TABLE IF NOT EXISTS devices (device_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, credential_hash TEXT NOT NULL UNIQUE, name TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, last_seen_at TEXT NOT NULL DEFAULT '', revoked_at TEXT NOT NULL DEFAULT '', FOREIGN KEY (user_id) REFERENCES users(id));
 CREATE TABLE IF NOT EXISTS pair_codes (code_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at TEXT NOT NULL, consumed_at TEXT NOT NULL DEFAULT '', FOREIGN KEY (user_id) REFERENCES users(id));
 CREATE TABLE IF NOT EXISTS webhook_targets (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, provider TEXT NOT NULL DEFAULT 'generic', label TEXT NOT NULL DEFAULT '', url TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY (user_id) REFERENCES users(id));
+CREATE TABLE IF NOT EXISTS session_preferences (user_id TEXT NOT NULL, session_key TEXT NOT NULL, display_name TEXT NOT NULL DEFAULT '', starred INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (user_id, session_key), FOREIGN KEY (user_id) REFERENCES users(id));
+CREATE INDEX IF NOT EXISTS session_preferences_user_id ON session_preferences(user_id);
 CREATE INDEX IF NOT EXISTS webhook_targets_user_id ON webhook_targets(user_id);
 CREATE INDEX IF NOT EXISTS devices_user_id ON devices(user_id);
 CREATE INDEX IF NOT EXISTS pair_codes_user_id ON pair_codes(user_id);
@@ -244,8 +246,114 @@ func (s *Store) ListSessions(ctx context.Context, cid string) ([]session.Session
 	return result, nil
 }
 func (s *Store) DeleteSession(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE id=?`, id)
+	return s.withBusyRetry(ctx, func() error {
+		// observation_cursors references sessions without ON DELETE CASCADE, so
+		// remove the cursor first or the delete would leave an orphan row.
+		if _, err := s.db.ExecContext(ctx, `DELETE FROM observation_cursors WHERE session_id=?`, id); err != nil {
+			return err
+		}
+		_, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE id=?`, id)
+		return err
+	})
+}
+
+// SessionPreference is a per-user Server-side view of a session: a display-name
+// alias and a starred flag. It is keyed by the provider-native session URI when
+// available so it survives the canonical id changes a resume/rebind produces.
+type SessionPreference struct {
+	UserID      string
+	SessionKey  string
+	DisplayName string
+	Starred     bool
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+func (s *Store) ListSessionPreferences(ctx context.Context, userID string) ([]SessionPreference, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT user_id,session_key,display_name,starred,created_at,updated_at FROM session_preferences WHERE user_id=? ORDER BY created_at`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	values := make([]SessionPreference, 0)
+	for rows.Next() {
+		var value SessionPreference
+		var starred int
+		var created, updated string
+		if err := rows.Scan(&value.UserID, &value.SessionKey, &value.DisplayName, &starred, &created, &updated); err != nil {
+			return nil, err
+		}
+		value.Starred = starred != 0
+		if value.CreatedAt, err = parseTime(created); err != nil {
+			return nil, err
+		}
+		if value.UpdatedAt, err = parseTime(updated); err != nil {
+			return nil, err
+		}
+		values = append(values, value)
+	}
+	return values, rows.Err()
+}
+
+func (s *Store) GetSessionPreference(ctx context.Context, userID, sessionKey string) (SessionPreference, error) {
+	var value SessionPreference
+	var starred int
+	var created, updated string
+	err := s.db.QueryRowContext(ctx, `SELECT user_id,session_key,display_name,starred,created_at,updated_at FROM session_preferences WHERE user_id=? AND session_key=?`, userID, sessionKey).Scan(&value.UserID, &value.SessionKey, &value.DisplayName, &starred, &created, &updated)
+	if err != nil {
+		return value, err
+	}
+	value.Starred = starred != 0
+	if value.CreatedAt, err = parseTime(created); err != nil {
+		return value, err
+	}
+	value.UpdatedAt, err = parseTime(updated)
+	return value, err
+}
+
+func (s *Store) UpsertSessionPreference(ctx context.Context, value SessionPreference) error {
+	if strings.TrimSpace(value.UserID) == "" || strings.TrimSpace(value.SessionKey) == "" {
+		return fmt.Errorf("session preference requires user id and session key")
+	}
+	if value.CreatedAt.IsZero() {
+		value.CreatedAt = time.Now().UTC()
+	}
+	if value.UpdatedAt.IsZero() {
+		value.UpdatedAt = time.Now().UTC()
+	}
+	return s.withBusyRetry(ctx, func() error {
+		_, err := s.db.ExecContext(ctx, `INSERT INTO session_preferences(user_id,session_key,display_name,starred,created_at,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(user_id,session_key) DO UPDATE SET display_name=excluded.display_name,starred=excluded.starred,updated_at=excluded.updated_at`, value.UserID, value.SessionKey, value.DisplayName, boolInt(value.Starred), value.CreatedAt.UTC().Format(timeFormat), value.UpdatedAt.UTC().Format(timeFormat))
+		return err
+	})
+}
+
+func (s *Store) DeleteSessionPreference(ctx context.Context, userID, sessionKey string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM session_preferences WHERE user_id=? AND session_key=?`, userID, sessionKey)
 	return err
+}
+
+// DeleteSessionPreferenceByKey removes a session's alias/star for every user.
+// Deleting the session deletes it globally, so per-user rows left behind would
+// only be orphans.
+func (s *Store) DeleteSessionPreferenceByKey(ctx context.Context, sessionKey string) error {
+	if strings.TrimSpace(sessionKey) == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM session_preferences WHERE session_key=?`, sessionKey)
+	return err
+}
+
+// RenameSessionPreferenceKey moves a preference recorded under a canonical id to
+// the id a rekey produced. The provider-native URI is already stable and never
+// matches here, so this only fixes the short window before a URI was resolved.
+func (s *Store) RenameSessionPreferenceKey(ctx context.Context, oldKey, newKey string) error {
+	if oldKey == "" || newKey == "" || oldKey == newKey {
+		return nil
+	}
+	return s.withBusyRetry(ctx, func() error {
+		_, err := s.db.ExecContext(ctx, `UPDATE OR REPLACE session_preferences SET session_key=?, updated_at=? WHERE session_key=?`, newKey, nowString(), oldKey)
+		return err
+	})
 }
 
 func (s *Store) RekeySession(ctx context.Context, oldID string, value session.Session) error {

@@ -368,3 +368,17 @@ func TestSessionSnapshotWithoutAManager(t *testing.T) {
 		t.Fatalf("reply = %+v", reply)
 	}
 }
+
+func TestSessionRunningUsesProcessAndState(t *testing.T) {
+	manager := runtime.NewManager(runtime.NewMemoryStore(), nil, nil)
+	d := &Daemon{manager: manager}
+	if d.sessionRunning(session.Session{ID: "daemon/d/claude://one", State: session.StateStopped}) {
+		t.Fatal("stopped session reported running")
+	}
+	if !d.sessionRunning(session.Session{ID: "daemon/d/claude://two", State: session.StateRunning, ProcessID: 42}) {
+		t.Fatal("running session with a process was reported stopped")
+	}
+	if d.sessionRunning(session.Session{ID: "daemon/d/claude://three", State: session.StateRunning, ProcessID: 0}) {
+		t.Fatal("running session without a process was treated as live")
+	}
+}

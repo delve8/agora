@@ -770,6 +770,56 @@ func (d *Daemon) handle(frame protocol.Envelope) error {
 			result.Accepted = true
 		}
 		return d.sendResponse(protocol.SessionStopResult, result, frame.RequestID)
+	case protocol.SessionDelete:
+		var payload protocol.DeletePayload
+		if err := protocol.DecodePayload(frame, &payload); err != nil {
+			return err
+		}
+		result := protocol.DeleteResultPayload{SessionID: payload.SessionID}
+		value, valueErr := d.manager.GetSession(context.Background(), payload.SessionID)
+		if valueErr != nil || value.ID == "" {
+			// A history-only session may never have been persisted in the
+			// manager store; its transcript is still deletable.
+			d.historyMu.RLock()
+			for _, discovered := range d.historySessions {
+				if discovered.ID == payload.SessionID {
+					value = discovered
+					valueErr = nil
+					break
+				}
+			}
+			d.historyMu.RUnlock()
+		}
+		if valueErr != nil || value.ID == "" {
+			result.Error = fmt.Sprintf("session %s not found", payload.SessionID)
+		} else if d.sessionRunning(value) {
+			result.Error = "session is running; stop it before deleting"
+		} else if err := d.manager.DeleteSession(context.Background(), value); err != nil {
+			result.Error = err.Error()
+		} else {
+			result.Deleted = true
+		}
+		if err := d.sendResponse(protocol.SessionDeleteResult, result, frame.RequestID); err != nil {
+			return err
+		}
+		if !result.Deleted {
+			return nil
+		}
+		// Drop the history entry from the cache before resyncing: localSessions
+		// reads this slice, and the file is already gone from disk.
+		d.historyMu.Lock()
+		if len(d.historySessions) > 0 {
+			filtered := d.historySessions[:0]
+			for _, item := range d.historySessions {
+				if item.ID != payload.SessionID {
+					filtered = append(filtered, item)
+				}
+			}
+			d.historySessions = filtered
+		}
+		d.historyMu.Unlock()
+		d.stopEventBridge(payload.SessionID)
+		return d.sendResync()
 	case protocol.SessionHistoryRequest:
 		log.Printf("agora daemon: history request for %s", frame.RequestID)
 		var payload protocol.HistoryRequestPayload
@@ -1098,6 +1148,21 @@ func splitResync(payload protocol.ResyncPayload) []protocol.ResyncPayload {
 
 func capabilitiesMap(value session.Capabilities) map[string]bool {
 	return map[string]bool{"can_start": value.CanStart, "can_discover": value.CanDiscover, "can_attach": value.CanAttach, "can_observe": value.CanObserve, "can_send_input": value.CanSendInput, "can_stream": value.CanStream, "can_interrupt": value.CanInterrupt, "can_resume": value.CanResume, "can_approve": value.CanApprove, "can_read_history": value.CanReadHistory, "can_read_terminal": value.CanReadTerminal}
+}
+
+// sessionRunning reports whether a session currently owns a live Agent
+// process. The Host registry is authoritative; the stored row only covers the
+// case where the Host is gone but the last state was still running.
+func (d *Daemon) sessionRunning(value session.Session) bool {
+	if d.manager.IsRunning(value.ID) {
+		return true
+	}
+	switch value.State {
+	case session.StateRunning, session.StateWaiting, session.StateStarting:
+		return value.ProcessID > 0
+	default:
+		return false
+	}
 }
 
 func (d *Daemon) stopEventBridge(id string) {

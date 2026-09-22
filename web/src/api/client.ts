@@ -58,6 +58,9 @@ export function loadEvents(sessionId: string, options?: { limit?: number; before
   const suffix = query.toString() ? `?${query.toString()}` : "";
   return request<Event[]>(`/api/sessions/${encodeURIComponent(sessionId)}/events${suffix}`);
 }
+export type UpdateSessionInput = { starred?: boolean; display_name?: string };
+export function updateSession(sessionId: string, input: UpdateSessionInput) { return request<Session>(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: "PATCH", body: JSON.stringify(input) }); }
+export function deleteSession(sessionId: string) { return request<{ deleted: boolean }>(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" }); }
 export function resumeSession(sessionId: string) { return request<Session>(`/api/sessions/${encodeURIComponent(sessionId)}/resume`, { method: "POST" }); }
 export function stopSession(sessionId: string) { return request<{ accepted: boolean }>(`/api/sessions/${encodeURIComponent(sessionId)}/stop`, { method: "POST" }); }
 export function loadPTYSnapshot(sessionId: string, signal?: AbortSignal) { return request<PTYSnapshot>(`/api/sessions/${encodeURIComponent(sessionId)}/pty/snapshot`, { signal }); }

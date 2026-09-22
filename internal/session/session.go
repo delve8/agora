@@ -126,8 +126,11 @@ type Session struct {
 	LastObservedAt    *time.Time   `json:"last_observed_at,omitempty"`
 	LastError         string       `json:"last_error,omitempty"`
 	Capabilities      Capabilities `json:"capabilities"`
-	CreatedAt         time.Time    `json:"created_at"`
-	UpdatedAt         time.Time    `json:"updated_at"`
+	// Starred is a per-user Server-side preference, not session state. It is
+	// only populated on /api/state responses for the requesting user.
+	Starred   bool      `json:"starred,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 func (s Session) NativeSessionURI() string {

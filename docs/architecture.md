@@ -77,6 +77,7 @@ Web Browser ───────────────┐
 - `link_grants`：IM 通知链接 token 哈希、绑定 `session_id`、`scope`、签发用户、过期与撤销状态；
 - `web_auth_sessions`：BFF/session-cookie 演进下的 HttpOnly Web 会话；
 - `session_id -> daemon_id` 当前路由；
+- `session_preferences`：per-user 的会话别名与星标（`(user_id, session_key)`，`session_key` 优先用 provider-native URI，以便在 resume/rebind 改变 canonical id 后仍然有效）；transcript 本身不落库；
 - WebSocket 连接和 request correlation；
 - 可选的 webhook target 配置元数据（URL 不进入普通日志，必要时加密存储）；
 - Server 公开 Web base URL 等基础配置。

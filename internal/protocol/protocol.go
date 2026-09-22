@@ -32,6 +32,8 @@ const (
 	SessionInputResult     = "session.input_result"
 	SessionStop            = "session.stop"
 	SessionStopResult      = "session.stop_result"
+	SessionDelete          = "session.delete"
+	SessionDeleteResult    = "session.delete_result"
 	SessionExit            = "session.exit"
 	// SessionReport describes a message the injected Agent extension sends over
 	// the local Daemon socket. It is provider-native evidence: the Agent itself
@@ -78,7 +80,7 @@ func ValidateType(typ string) error {
 		DaemonResync, ServerResyncRequest, SessionCreate, SessionCreated,
 		SessionUpdate, SessionRebind, EventBatch, SessionHistoryRequest, SessionHistoryResponse,
 		SnapshotRequest, SnapshotResponse, AttachRequest, AttachResponse, SessionInput, SessionInputResult,
-		SessionStop, SessionStopResult, SessionExit, Ack, Error:
+		SessionStop, SessionStopResult, SessionDelete, SessionDeleteResult, SessionExit, Ack, Error:
 		return nil
 	default:
 		return fmt.Errorf("unknown protocol message type %q", typ)
@@ -360,6 +362,18 @@ type StopPayload struct {
 type StopResultPayload struct {
 	SessionID string `json:"session_id"`
 	Accepted  bool   `json:"accepted"`
+	Error     string `json:"error,omitempty"`
+}
+
+// DeletePayload asks a Daemon to remove a stopped session's provider files. The
+// Server never deletes a remote workstation's transcript itself.
+type DeletePayload struct {
+	SessionID string `json:"session_id"`
+}
+
+type DeleteResultPayload struct {
+	SessionID string `json:"session_id"`
+	Deleted   bool   `json:"deleted"`
 	Error     string `json:"error,omitempty"`
 }
 

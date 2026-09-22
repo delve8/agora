@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/delve8/agora/internal/adapter"
+	"github.com/delve8/agora/internal/auth"
 	"github.com/delve8/agora/internal/config"
 	"github.com/delve8/agora/internal/coordination"
 	"github.com/delve8/agora/internal/protocol"
@@ -818,5 +819,217 @@ func TestPublicConfigDescribesTheAuthMode(t *testing.T) {
 	incomplete := read(newServer(config.AuthModeLogto, "https://logto.example.com/oidc", ""))
 	if incomplete["logto_app_id"] != "" {
 		t.Fatalf("expected no app id, got %+v", incomplete)
+	}
+}
+
+func newSessionTestServer(t *testing.T) (*Server, *store.Store) {
+	t.Helper()
+	db, err := store.Open(filepath.Join(t.TempDir(), "agora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.CreateCoordination(context.Background(), coordination.Coordination{ID: "coord-1", Name: "Test", CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	// A nil-capable manager keeps the split-server shape: sessions come from the
+	// daemon hub, not from local providers.
+	srv := New(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), nil))
+	return srv, db
+}
+
+func patchSession(t *testing.T, srv *Server, id, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPatch, sessionAPIPath(id, ""), bytes.NewBufferString(body))
+	resp := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(resp, req)
+	return resp
+}
+
+func TestSessionPreferencesAliasAndStar(t *testing.T) {
+	srv, _ := newSessionTestServer(t)
+	now := time.Now().UTC()
+	newer := protocol.SessionSummary{SessionID: "daemon/daemon-1/claude://newer", DaemonID: "daemon-1", Agent: "claude", AgentSessionID: "claude://newer", ClaudeSessionID: "newer", Workspace: "/tmp/ws", DisplayName: "Newer", State: session.StateStopped, CreatedAt: now, UpdatedAt: now}
+	older := protocol.SessionSummary{SessionID: "daemon/daemon-1/claude://older", DaemonID: "daemon-1", Agent: "claude", AgentSessionID: "claude://older", ClaudeSessionID: "older", Workspace: "/tmp/ws", DisplayName: "Older", State: session.StateStopped, CreatedAt: now, UpdatedAt: now.Add(-time.Hour)}
+	seedDaemonLiveSession(srv, "daemon-1", newer)
+	seedDaemonLiveSession(srv, "daemon-1", older)
+
+	if resp := patchSession(t, srv, older.SessionID, `{"starred":true}`); resp.Code != http.StatusOK {
+		t.Fatalf("star returned %d: %s", resp.Code, resp.Body.String())
+	}
+	alias := patchSession(t, srv, newer.SessionID, `{"display_name":"我的别名"}`)
+	if alias.Code != http.StatusOK {
+		t.Fatalf("alias returned %d: %s", alias.Code, alias.Body.String())
+	}
+	var aliased session.Session
+	if err := json.Unmarshal(alias.Body.Bytes(), &aliased); err != nil {
+		t.Fatal(err)
+	}
+	if aliased.DisplayName != "我的别名" || aliased.DisplayNameSource != session.DisplayNameSourceCustom {
+		t.Fatalf("alias response = %+v", aliased)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/state", nil)
+	resp := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("state returned %d: %s", resp.Code, resp.Body.String())
+	}
+	var state struct {
+		Sessions []session.Session `json:"sessions"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Sessions) != 2 {
+		t.Fatalf("state sessions = %+v", state.Sessions)
+	}
+	// The starred, older session must lead the unstarred, newer one.
+	if state.Sessions[0].ID != older.SessionID || !state.Sessions[0].Starred {
+		t.Fatalf("starred session did not lead the list: %+v", state.Sessions)
+	}
+	for _, value := range state.Sessions {
+		if value.ID == newer.SessionID && (value.DisplayName != "我的别名" || value.DisplayNameSource != session.DisplayNameSourceCustom) {
+			t.Fatalf("alias was not applied in state: %+v", value)
+		}
+	}
+
+	// Clearing both preferences removes the row instead of keeping an empty one.
+	if resp := patchSession(t, srv, older.SessionID, `{"starred":false}`); resp.Code != http.StatusOK {
+		t.Fatalf("unstar returned %d: %s", resp.Code, resp.Body.String())
+	}
+	if resp := patchSession(t, srv, newer.SessionID, `{"display_name":""}`); resp.Code != http.StatusOK {
+		t.Fatalf("clear alias returned %d: %s", resp.Code, resp.Body.String())
+	}
+	for _, key := range []string{older.SessionID, newer.SessionID, "claude://older", "claude://newer"} {
+		if _, err := srv.store.GetSessionPreference(context.Background(), "local", key); err == nil {
+			t.Fatalf("preference %q survived clearing", key)
+		}
+	}
+}
+
+// A daemon hub holds every connected daemon's sessions, but a user must only
+// see the sessions on devices they own. Acting on someone else's session was
+// already forbidden; listing it must be too.
+func TestVisibleSessionsFiltersToOwnedDevices(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "agora.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	owner, err := db.FindByClaims(ctx, auth.ProvisionClaims{Provider: auth.ProviderLogto, Subject: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intruder, err := db.FindByClaims(ctx, auth.ProvisionClaims{Provider: auth.ProviderLogto, Subject: "intruder"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for _, device := range []store.Device{
+		{ID: "daemon-owner", UserID: owner.UserID, CredentialHash: "hash-owner", CreatedAt: now},
+		{ID: "daemon-intruder", UserID: intruder.UserID, CredentialHash: "hash-intruder", CreatedAt: now},
+	} {
+		if err := db.CreateDevice(ctx, device); err != nil {
+			t.Fatal(err)
+		}
+	}
+	values := []session.Session{
+		{ID: "daemon/daemon-owner/claude://a", DaemonID: "daemon-owner"},
+		{ID: "daemon/daemon-intruder/claude://b", DaemonID: "daemon-intruder"},
+	}
+
+	logto := NewWithWebDirAndAuth(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), nil), t.TempDir(), config.ServerAuthConfig{Mode: config.AuthModeLogto})
+	got, err := logto.visibleSessions(auth.WithPrincipal(ctx, owner), values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].DaemonID != "daemon-owner" {
+		t.Fatalf("owner saw sessions they do not own: %+v", got)
+	}
+	// An unpaired daemon is not owned by anyone and must not leak either.
+	ghost, err := logto.visibleSessions(auth.WithPrincipal(ctx, owner), []session.Session{{ID: "daemon/daemon-ghost/claude://c", DaemonID: "daemon-ghost"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ghost) != 0 {
+		t.Fatalf("unknown daemon leaked: %+v", ghost)
+	}
+
+	// trust-local mode is the deployment's own single-user trust boundary.
+	local := NewWithWebDirAndAuth(":0", db, runtime.NewManager(db, adapter.NewClaudeCodeAdapter(""), nil), t.TempDir(), config.ServerAuthConfig{Mode: config.AuthModeLocal})
+	localGot, err := local.visibleSessions(auth.WithPrincipal(ctx, owner), values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(localGot) != 2 {
+		t.Fatalf("local mode filtered sessions: %+v", localGot)
+	}
+}
+
+func TestDeleteRunningSessionIsRefused(t *testing.T) {
+	srv, _ := newSessionTestServer(t)
+	now := time.Now().UTC()
+	sessionID := "daemon/daemon-1/claude://live"
+	seedDaemonLiveSession(srv, "daemon-1", protocol.SessionSummary{SessionID: sessionID, DaemonID: "daemon-1", Agent: "claude", AgentSessionID: "claude://live", ClaudeSessionID: "live", Workspace: "/tmp/ws", DisplayName: "Live", State: session.StateRunning, Connection: session.ConnectionObserved, PID: 42, CreatedAt: now, UpdatedAt: now})
+
+	req := httptest.NewRequest(http.MethodDelete, sessionAPIPath(sessionID, ""), nil)
+	resp := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusConflict {
+		t.Fatalf("deleting a running session returned %d: %s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestDeleteHistorySessionRoutesToDaemon(t *testing.T) {
+	srv, _ := newSessionTestServer(t)
+	now := time.Now().UTC()
+	sessionID := "daemon/daemon-1/claude://claude-1"
+	connection := &daemonConnection{id: "daemon-1", send: make(chan protocol.Envelope, 8), lastSeen: now}
+	srv.daemons.mu.Lock()
+	srv.daemons.devices["daemon-1"] = connection
+	srv.daemons.history["daemon-1"] = map[string]protocol.HistorySessionSummary{
+		sessionID: {SessionID: sessionID, DaemonID: "daemon-1", Agent: "claude", AgentSessionID: "claude://claude-1", ClaudeSessionID: "claude-1", Workspace: "/tmp/ws", HistoryPath: "/tmp/claude-1.jsonl", DisplayName: "Old", CreatedAt: now, UpdatedAt: now},
+	}
+	srv.daemons.mu.Unlock()
+
+	// Seed an alias/star so the delete path can prove it cleans them up.
+	if err := srv.store.UpsertSessionPreference(context.Background(), store.SessionPreference{UserID: "local", SessionKey: "claude://claude-1", DisplayName: "别名", Starred: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		request := <-connection.send
+		if request.Type != protocol.SessionDelete {
+			return
+		}
+		response, err := protocol.NewEnvelope(protocol.SessionDeleteResult, protocol.DeleteResultPayload{SessionID: sessionID, Deleted: true})
+		if err != nil {
+			return
+		}
+		response.RequestID = request.RequestID
+		srv.daemons.mu.RLock()
+		pending := srv.daemons.pending[request.RequestID]
+		srv.daemons.mu.RUnlock()
+		if pending != nil {
+			pending <- response
+		}
+	}()
+
+	req := httptest.NewRequest(http.MethodDelete, sessionAPIPath(sessionID, ""), nil)
+	resp := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("deleting a history session returned %d: %s", resp.Code, resp.Body.String())
+	}
+	srv.daemons.mu.RLock()
+	_, historyLeft := srv.daemons.history["daemon-1"][sessionID]
+	srv.daemons.mu.RUnlock()
+	if historyLeft {
+		t.Fatal("deleted history session survived in the hub")
+	}
+	if _, err := srv.store.GetSessionPreference(context.Background(), "local", "claude://claude-1"); err == nil {
+		t.Fatal("alias/star survived session deletion")
 	}
 }

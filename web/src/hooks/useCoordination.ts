@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { createSession, loadEvents, loadState, resumeSession, sendMessage, stopSession, subscribe } from "../api/client";
+import { createSession, deleteSession, loadEvents, loadState, resumeSession, sendMessage, stopSession, subscribe, updateSession } from "../api/client";
 import type { CreateSessionInput } from "../api/client";
 import type { Coordination, Event, Session } from "../types";
 
@@ -178,7 +178,51 @@ export function useCoordination() {
     }
   }, [refresh]);
 
+  // Star and alias are Server-side per-user preferences; the response is the
+  // authoritative session, so apply it instead of guessing locally.
+  const star = useCallback(async (sessionId: string, starred: boolean) => {
+    try {
+      const updated = await updateSession(sessionId, { starred });
+      setSessions((current) => current.map((item) => item.id === updated.id ? { ...item, starred: updated.starred } : item));
+      setError("");
+      return updated;
+    } catch (value) {
+      const message = value instanceof Error ? value.message : "Unable to star session";
+      setError(message);
+      throw value;
+    }
+  }, []);
+
+  const rename = useCallback(async (sessionId: string, displayName: string) => {
+    try {
+      const updated = await updateSession(sessionId, { display_name: displayName });
+      setSessions((current) => current.map((item) => item.id === updated.id
+        ? { ...item, display_name: updated.display_name, display_name_source: updated.display_name_source }
+        : item));
+      setError("");
+      return updated;
+    } catch (value) {
+      const message = value instanceof Error ? value.message : "Unable to rename session";
+      setError(message);
+      throw value;
+    }
+  }, []);
+
+  const remove = useCallback(async (sessionId: string) => {
+    try {
+      await deleteSession(sessionId);
+      setError("");
+      // Refresh so the selection falls back to a remaining session and a stale
+      // history row cannot reappear from discovery.
+      await refresh(true);
+    } catch (value) {
+      const message = value instanceof Error ? value.message : "Unable to delete session";
+      setError(message);
+      throw value;
+    }
+  }, [refresh]);
+
   const send = useCallback(async (sessionId: string, content: string) => sendMessage(sessionId, content), []);
 
-  return { coordination, sessions, currentSession, selectedSessionId, setSelectedSessionId, events, hasOlderEvents, loadingOlderEvents, loadOlderEvents, loading, error, setError, addSession, resume, stop, send, refresh };
+  return { coordination, sessions, currentSession, selectedSessionId, setSelectedSessionId, events, hasOlderEvents, loadingOlderEvents, loadOlderEvents, loading, error, setError, addSession, resume, stop, star, rename, remove, send, refresh };
 }

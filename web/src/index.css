@@ -28,6 +28,8 @@ button, input, textarea { font: inherit; }
 .session-control { display: flex; width: 100%; }
 .session-control .session-selector { flex: 1 1 auto; }
 .session-inactive-icon { color: #86909c; font-size: 12px; }
+.session-star-icon { color: #faad14; }
+.session-star-toggle { padding-inline: 0; }
 .session-selector .ant-select-selector { min-height: 40px !important; align-items: center; }
 .session-selector-value { display: flex; align-items: center; gap: 4px; min-width: 0; overflow: hidden; }
 .session-selector-workspace { color: #86909c; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 0 1 auto; min-width: 0; }
@@ -109,6 +111,10 @@ button, input, textarea { font: inherit; }
 .pairing-panel { margin-top: 16px; padding: 4px 0 24px; border-top: 1px solid #f0f0f0; }
 .pairing-panel .ant-divider { margin-block: 8px 12px; }
 .device-drawer .ant-drawer-body { overflow-y: auto; }
+.session-manager-drawer .ant-drawer-body { overflow-y: auto; }
+.session-manager-error { margin-bottom: 12px; }
+.session-manager-empty { margin: 24px 0; }
+.session-manager-table .ant-table-cell { vertical-align: middle; }
 .pair-code-row { display: flex; align-items: center; gap: 12px; }
 .pairing-loading { display: flex; align-items: center; gap: 8px; }
 .pair-command-row { display: flex; align-items: flex-start; gap: 8px; }
@@ -160,7 +166,7 @@ button, input, textarea { font: inherit; }
 @media (max-width: 1279px) {
   .app-header { flex-wrap: nowrap; gap: 8px; padding: 8px 12px; }
   .header-primary-controls, .header-actions { display: none; }
-  .desktop-device-manager, .desktop-new-session { display: none; }
+  .desktop-session-manager, .desktop-device-manager, .desktop-new-session { display: none; }
   .mobile-menu-button { display: inline-flex; flex: 1 1 auto; min-width: 0; align-items: center; justify-content: flex-start; padding-inline: 10px; }
   .mobile-menu-button .anticon { flex: 0 0 auto; }
   .mobile-menu-button .mobile-menu-label { flex: 1 1 auto; text-align: left; }
@@ -201,7 +207,8 @@ button, input, textarea { font: inherit; }
 @media (max-width: 700px) {
   .app-header { padding: 6px 8px; min-height: 48px; }
   .mobile-process-details-toggle { margin-inline: 2px; }
-  .mobile-menu-content .device-manager-trigger { width: 100%; justify-content: flex-start; }
+  .mobile-menu-content .device-manager-trigger,
+  .mobile-menu-content .session-manager-trigger { width: 100%; justify-content: flex-start; }
   .app-content { padding: 8px; }
   .session-heading { padding-inline: 2px; }
   .session-heading-name { max-width: calc(100vw - 48px); }

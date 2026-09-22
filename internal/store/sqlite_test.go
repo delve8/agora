@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/delve8/agora/internal/auth"
 	"github.com/delve8/agora/internal/coordination"
 	"github.com/delve8/agora/internal/session"
 )
@@ -92,6 +93,102 @@ func TestListObservedSessionsDoesNotHoldRowsWhileLoadingValues(t *testing.T) {
 	}
 	if len(values) != 3 {
 		t.Fatalf("expected 3 observed sessions, got %d", len(values))
+	}
+}
+
+func TestSessionPreferencesRoundTrip(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	user, err := db.GetOrCreateLocalUser(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key := "pi://native-1"
+	if _, err := db.GetSessionPreference(ctx, user.UserID, key); err != sql.ErrNoRows {
+		t.Fatalf("missing preference error = %v, want sql.ErrNoRows", err)
+	}
+	if err := db.UpsertSessionPreference(ctx, SessionPreference{UserID: user.UserID, SessionKey: key, DisplayName: "我的会话", Starred: true}); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := db.GetSessionPreference(ctx, user.UserID, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.DisplayName != "我的会话" || !stored.Starred {
+		t.Fatalf("stored preference = %+v", stored)
+	}
+
+	// A second upsert must update in place, not duplicate the row.
+	if err := db.UpsertSessionPreference(ctx, SessionPreference{UserID: user.UserID, SessionKey: key, DisplayName: "", Starred: true}); err != nil {
+		t.Fatal(err)
+	}
+	listed, err := db.ListSessionPreferences(ctx, user.UserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].DisplayName != "" || !listed[0].Starred {
+		t.Fatalf("preferences = %+v", listed)
+	}
+
+	// A canonical-id key follows a rekey.
+	if err := db.UpsertSessionPreference(ctx, SessionPreference{UserID: user.UserID, SessionKey: "daemon/d/pi://old", Starred: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RenameSessionPreferenceKey(ctx, "daemon/d/pi://old", "daemon/d/pi://new"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.GetSessionPreference(ctx, user.UserID, "daemon/d/pi://new"); err != nil {
+		t.Fatalf("rekeyed preference not found: %v", err)
+	}
+	if _, err := db.GetSessionPreference(ctx, user.UserID, "daemon/d/pi://old"); err != sql.ErrNoRows {
+		t.Fatalf("old preference key survived rekey: %v", err)
+	}
+
+	if err := db.DeleteSessionPreference(ctx, user.UserID, key); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.GetSessionPreference(ctx, user.UserID, key); err != sql.ErrNoRows {
+		t.Fatalf("preference survived delete: %v", err)
+	}
+}
+
+func TestDeleteSessionPreferenceByKeyRemovesEveryUser(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	local, err := db.GetOrCreateLocalUser(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := db.FindByClaims(ctx, auth.ProvisionClaims{Provider: auth.ProviderLogto, Subject: "other"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := "pi://shared"
+	for _, userID := range []string{local.UserID, other.UserID} {
+		if err := db.UpsertSessionPreference(ctx, SessionPreference{UserID: userID, SessionKey: key, DisplayName: "别名", Starred: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.DeleteSessionPreferenceByKey(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	for _, userID := range []string{local.UserID, other.UserID} {
+		if _, err := db.GetSessionPreference(ctx, userID, key); err != sql.ErrNoRows {
+			t.Fatalf("preference for %s survived global delete: %v", userID, err)
+		}
+	}
+	// Deleting an unknown or empty key is a no-op, not an error.
+	if err := db.DeleteSessionPreferenceByKey(ctx, ""); err != nil {
+		t.Fatal(err)
 	}
 }
 

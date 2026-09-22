@@ -408,6 +408,11 @@ func (h *daemonHub) handleFrame(c *daemonConnection, frame protocol.Envelope) er
 		h.routes[payload.NewSessionID] = c.id
 		h.removeHistoryAliasLocked(c.id, old)
 		h.mu.Unlock()
+		if h.store != nil {
+			// A preference saved before the native URI was resolved is keyed by
+			// the old canonical id; follow the rebind to the new one.
+			_ = h.store.RenameSessionPreferenceKey(context.Background(), payload.OldSessionID, payload.NewSessionID)
+		}
 		return nil
 	case protocol.SessionUpdate:
 		var payload protocol.SessionUpdatePayload
@@ -467,7 +472,7 @@ func (h *daemonHub) handleFrame(c *daemonConnection, frame protocol.Envelope) er
 		return nil
 	case protocol.EventBatch:
 		return h.handleEventBatch(c, frame)
-	case protocol.SessionInputResult, protocol.SessionStopResult, protocol.SessionHistoryResponse, protocol.SnapshotResponse, protocol.AttachResponse, protocol.SessionCreated:
+	case protocol.SessionInputResult, protocol.SessionStopResult, protocol.SessionDeleteResult, protocol.SessionHistoryResponse, protocol.SnapshotResponse, protocol.AttachResponse, protocol.SessionCreated:
 		log.Printf("agora server: response %s request %s", frame.Type, frame.RequestID)
 		if frame.RequestID == "" {
 			return nil
@@ -1099,6 +1104,35 @@ func (h *daemonHub) stopSession(ctx context.Context, value session.Session) erro
 		return errors.New(result.Error)
 	}
 	return nil
+}
+
+func (h *daemonHub) deleteSession(ctx context.Context, value session.Session) error {
+	frame, err := h.request(ctx, value.ID, protocol.SessionDelete, protocol.DeletePayload{SessionID: value.ID}, protocol.SessionDeleteResult)
+	if err != nil {
+		return err
+	}
+	var result protocol.DeleteResultPayload
+	if err := protocol.DecodePayload(frame, &result); err != nil {
+		return err
+	}
+	if !result.Deleted {
+		return errors.New(result.Error)
+	}
+	return nil
+}
+
+// forgetSession drops a deleted session from the hub's live, history and route
+// maps so a stale entry cannot reappear before the daemon's next resync.
+func (h *daemonHub) forgetSession(sessionID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.routes, sessionID)
+	for daemonID := range h.sessions {
+		delete(h.sessions[daemonID], sessionID)
+	}
+	for daemonID := range h.history {
+		delete(h.history[daemonID], sessionID)
+	}
 }
 
 func (h *daemonHub) sessionInput(ctx context.Context, value session.Session, content string) error {

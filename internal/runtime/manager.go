@@ -885,6 +885,74 @@ func (m *Manager) StopSession(value session.Session) error {
 	return client.Stop(context.Background())
 }
 
+// DeleteSession permanently removes a stopped session: its provider transcript
+// files, its observers and its stored row. Running sessions are refused so the
+// caller can stop them first. The value may be a live row or a history row that
+// was never persisted; only HistoryPath is required to delete the files.
+func (m *Manager) DeleteSession(ctx context.Context, value session.Session) error {
+	if m == nil {
+		return fmt.Errorf("session manager is unavailable")
+	}
+	id := m.ResolveSessionID(value.ID)
+	if m.IsRunning(id) {
+		return fmt.Errorf("session is running; stop it before deleting")
+	}
+	m.StopObserver(id)
+	if m.hosts != nil {
+		m.hosts.Delete(id)
+	}
+	if err := deleteProviderHistory(value); err != nil {
+		return err
+	}
+	if m.store != nil {
+		if err := m.store.DeleteSession(ctx, id); err != nil && !isSessionNotFound(err) {
+			return err
+		}
+	}
+	m.forgetCatalogSession(id)
+	return nil
+}
+
+// deleteProviderHistory removes the provider-owned transcript. Claude also
+// keeps per-session side data (subagents, tool results) in a directory named
+// after the transcript; leaving it behind would not actually free the space.
+// Workspace files are never touched.
+func deleteProviderHistory(value session.Session) error {
+	path := strings.TrimSpace(value.HistoryPath)
+	if path == "" {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	agent := strings.ToLower(strings.TrimSpace(value.Agent))
+	if agent == "claude" || agent == "claude-code" {
+		dir := strings.TrimSuffix(path, filepath.Ext(path))
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			if err := os.RemoveAll(dir); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// forgetCatalogSession drops a deleted session from the fallback snapshots so a
+// transient catalog error cannot resurrect it before the next successful scan.
+func (m *Manager) forgetCatalogSession(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for provider, values := range m.catalogSnapshots {
+		filtered := values[:0]
+		for _, value := range values {
+			if value.ID != id {
+				filtered = append(filtered, value)
+			}
+		}
+		m.catalogSnapshots[provider] = filtered
+	}
+}
+
 func (m *Manager) StartObserver(value session.Session) error {
 	if value.Agent == "pi" {
 		return m.StartPiObserver(value)

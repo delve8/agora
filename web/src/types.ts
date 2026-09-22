@@ -30,6 +30,8 @@ export type Session = {
   process_id?: number;
   history_path?: string;
   last_error?: string;
+  /** Per-user Server-side preference: a session the user currently cares about. */
+  starred?: boolean;
   capabilities: Capabilities;
   created_at: string;
   updated_at: string;

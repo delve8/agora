@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { Alert, Avatar, Button, Cascader, Drawer, Dropdown, Layout, Select, Space, Switch, Tooltip } from "antd";
-import { DesktopOutlined, EyeInvisibleOutlined, EyeOutlined, HistoryOutlined, LogoutOutlined, MenuOutlined, PlayCircleOutlined, PlusOutlined, PoweroffOutlined, RobotOutlined, UserOutlined } from "@ant-design/icons";
+import { DesktopOutlined, EyeInvisibleOutlined, EyeOutlined, HistoryOutlined, LogoutOutlined, MenuOutlined, PlayCircleOutlined, PlusOutlined, PoweroffOutlined, RobotOutlined, StarFilled, StarOutlined, UserOutlined } from "@ant-design/icons";
 import { EventStream } from "./components/EventStream";
 import { MessageComposer } from "./components/MessageComposer";
 import { SessionCreate } from "./components/SessionCreate";
+import { SessionManager } from "./components/SessionManager";
 import { TerminalSnapshot } from "./components/TerminalSnapshot";
 import { DeviceManager } from "./components/DeviceManager";
 import { useAuthActions } from "./AuthProvider";
@@ -17,13 +18,23 @@ const { Header, Content } = Layout;
 
 type SessionOption = { value: string; label: ReactNode; children?: SessionOption[] };
 
+// Starred sessions move into a dedicated group at the top of the selector so
+// they lead the list regardless of which workspace they belong to.
+const STARRED_GROUP = "★ 收藏";
+
 function workspaceLabel(workspace: string) {
   return workspace || "未知工作区";
 }
 
-function sessionOptionLabel(session: { display_name: string; id: string; agent?: string; daemon_id?: string; capabilities: { can_resume: boolean; can_stream: boolean } }, deviceLabel: string) {
+function sessionGroupLabel(session: { workspace: string; starred?: boolean }) {
+  return session.starred ? STARRED_GROUP : workspaceLabel(session.workspace);
+}
+
+function sessionOptionLabel(session: { display_name: string; id: string; agent?: string; daemon_id?: string; starred?: boolean; capabilities: { can_resume: boolean; can_stream: boolean } }, deviceLabel: string) {
   const label = sessionLabel(session.display_name, session.id);
-  const parts: ReactNode[] = [<AgentBadge key="agent" agent={session.agent} compact />, <span key="label">{label}</span>];
+  const parts: ReactNode[] = [];
+  if (session.starred) parts.push(<StarFilled key="star" className="session-star-icon" />);
+  parts.push(<AgentBadge key="agent" agent={session.agent} compact />, <span key="label">{label}</span>);
   if (deviceLabel) parts.push(<span key="device" className="session-device-badge" title={session.daemon_id}>{deviceLabel}</span>);
   if (session.capabilities.can_resume && !session.capabilities.can_stream) {
     parts.push(<Tooltip key="inactive" title="会话未运行，可恢复"><HistoryOutlined className="session-inactive-icon" /></Tooltip>);
@@ -32,7 +43,7 @@ function sessionOptionLabel(session: { display_name: string; id: string; agent?:
 }
 
 export default function App() {
-  const { coordination, sessions, currentSession, setSelectedSessionId, events, hasOlderEvents, loadingOlderEvents, loadOlderEvents, loading, error, setError, addSession, resume, stop, send, refresh } = useCoordination();
+  const { coordination, sessions, currentSession, setSelectedSessionId, events, hasOlderEvents, loadingOlderEvents, loadOlderEvents, loading, error, setError, addSession, resume, stop, star, rename, remove, send, refresh } = useCoordination();
   const { devices, refresh: refreshDevices, deviceName } = useDevices();
   const auth = useAuthActions();
   const activeDevices = devices.filter((device) => !device.revoked_at);
@@ -90,29 +101,34 @@ export default function App() {
   const sessionOptions = useMemo<SessionOption[]>(() => {
     const byWorkspace = new Map<string, SessionOption>();
     const activity = new Map<string, string>();
+    const updatedAt = new Map<string, string>();
+    const starred: SessionOption[] = [];
     for (const session of sessions) {
       if (deviceFilter && session.daemon_id !== deviceFilter) continue;
       if (agentFilter && (session.agent || "unknown") !== agentFilter) continue;
+      updatedAt.set(session.id, session.updated_at);
+      const option = { value: session.id, label: sessionOptionLabel(session, deviceName(session.daemon_id)) };
+      if (session.starred) {
+        starred.push(option);
+        continue;
+      }
       const workspace = workspaceLabel(session.workspace);
       let group = byWorkspace.get(workspace);
       if (!group) {
         group = { value: workspace, label: workspace, children: [] };
         byWorkspace.set(workspace, group);
       }
-      group.children!.push({ value: session.id, label: sessionOptionLabel(session, deviceName(session.daemon_id)) });
+      group.children!.push(option);
       if (session.updated_at > (activity.get(workspace) ?? "")) activity.set(workspace, session.updated_at);
     }
-    for (const group of byWorkspace.values()) {
-      group.children!.sort((a, b) => {
-        const left = sessions.find((session) => session.id === a.value);
-        const right = sessions.find((session) => session.id === b.value);
-        return (right?.updated_at ?? "").localeCompare(left?.updated_at ?? "");
-      });
-    }
-    return [...byWorkspace.values()].sort((a, b) => (activity.get(String(b.value)) ?? "").localeCompare(activity.get(String(a.value)) ?? ""));
+    const byRecency = (a: SessionOption, b: SessionOption) => (updatedAt.get(String(b.value)) ?? "").localeCompare(updatedAt.get(String(a.value)) ?? "");
+    starred.sort(byRecency);
+    for (const group of byWorkspace.values()) group.children!.sort(byRecency);
+    const groups = [...byWorkspace.values()].sort((a, b) => (activity.get(String(b.value)) ?? "").localeCompare(activity.get(String(a.value)) ?? ""));
+    return starred.length > 0 ? [{ value: STARRED_GROUP, label: STARRED_GROUP, children: starred }, ...groups] : groups;
   }, [sessions, deviceFilter, agentFilter, deviceName]);
 
-  const selectedPath = currentSession ? [workspaceLabel(currentSession.workspace), currentSession.id] : undefined;
+  const selectedPath = currentSession ? [sessionGroupLabel(currentSession), currentSession.id] : undefined;
   const mobileWorkspaceOptions = useMemo(() => sessionOptions.map((group) => ({ value: String(group.value), label: group.label })), [sessionOptions]);
   const mobileSessionOptions = useMemo(() => {
     const group = sessionOptions.find((item) => String(item.value) === mobileWorkspace);
@@ -121,9 +137,9 @@ export default function App() {
 
   useEffect(() => {
     if (!mobileMenuOpen) return;
-    setMobileWorkspace(currentSession ? workspaceLabel(currentSession.workspace) : String(mobileWorkspaceOptions[0]?.value ?? ""));
+    setMobileWorkspace(currentSession ? sessionGroupLabel(currentSession) : String(mobileWorkspaceOptions[0]?.value ?? ""));
     setMobileSessionId(currentSession?.id);
-  }, [currentSession?.id, currentSession?.workspace, mobileMenuOpen, mobileWorkspaceOptions]);
+  }, [currentSession?.id, currentSession?.workspace, currentSession?.starred, mobileMenuOpen, mobileWorkspaceOptions]);
 
   const submit = async (content: string) => {
     if (!currentSession) return;
@@ -221,6 +237,7 @@ export default function App() {
             onChange={setShowProcessDetails}
           />
         </Tooltip>
+        <span className="desktop-session-manager"><SessionManager sessions={sessions} onSelect={setSelectedSessionId} onStar={(_session, value) => star(_session.id, value)} onRename={(session, name) => rename(session.id, name)} onDelete={(session) => remove(session.id)} /></span>
         <span className="desktop-device-manager"><DeviceManager devices={devices} refresh={refreshDevices} onRevoked={refreshAfterRevoke} /></span>
         <Button className="desktop-new-session" type="primary" icon={<PlusOutlined />} onClick={() => setCreateOpen(true)}>新建会话</Button>
         {auth && <Dropdown
@@ -317,6 +334,7 @@ export default function App() {
               {currentSession?.capabilities.can_interrupt && <Tooltip title="停止该 Agent 会话"><Button danger aria-label="Stop session" icon={<PoweroffOutlined />} loading={stopping} onClick={() => { closeMobileMenu(); void stopCurrent(); }} /></Tooltip>}
             </Space.Compact></label>
           </>}
+          {sessions.length > 0 && <SessionManager sessions={sessions} onSelect={setSelectedSessionId} onStar={(_session, value) => star(_session.id, value)} onRename={(session, name) => rename(session.id, name)} onDelete={(session) => remove(session.id)} onOpen={closeMobileMenu} />}
           <div className="mobile-menu-actions">
             <Button type="primary" block icon={<PlusOutlined />} onClick={() => { setCreateOpen(true); closeMobileMenu(); }}>新建会话</Button>
           </div>
@@ -333,7 +351,20 @@ export default function App() {
       {sessions.length === 0 || createOpen ? <div className="setup-wrap"><SessionCreate onCreate={addSession} onCreated={() => { setCreateOpen(false); void refresh(); }} disabled={!coordination} devices={devices} /></div> : <div className="workspace-grid">
         <main className="session-main">
           <div className="session-heading">
-            {currentSession && <Space size={8} wrap><AgentBadge agent={currentSession.agent} /><span className="session-heading-name">{sessionLabel(currentSession.display_name, currentSession.id)}</span></Space>}
+            {currentSession && <Space size={8} wrap>
+              <Tooltip title={currentSession.starred ? "取消星标" : "标记为关注"}>
+                <Button
+                  type="text"
+                  size="small"
+                  className="session-star-toggle"
+                  aria-label={currentSession.starred ? "取消星标" : "标记为关注"}
+                  icon={currentSession.starred ? <StarFilled style={{ color: "#faad14" }} /> : <StarOutlined />}
+                  onClick={() => void star(currentSession.id, !currentSession.starred)}
+                />
+              </Tooltip>
+              <AgentBadge agent={currentSession.agent} />
+              <span className="session-heading-name">{sessionLabel(currentSession.display_name, currentSession.id)}</span>
+            </Space>}
           </div>
           {showTUI && canReadTerminal ? <div className="tui-view">
             <TerminalSnapshot agent={currentSession?.agent} snapshot={terminal.snapshot} error={terminal.error} loading={terminal.loading} />
