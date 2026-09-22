@@ -365,6 +365,22 @@ type StopResultPayload struct {
 	Error     string `json:"error,omitempty"`
 }
 
+// SessionStopRequest and SessionStopResponse are the local wrapper-socket path
+// used by `agora stop`. They are separate from the Server->Daemon
+// session.stop frame: the local request carries a Type so the wrapper socket
+// can route it, and the Daemon stops the session it owns without the control
+// plane.
+type SessionStopRequest struct {
+	Type      string `json:"type"`
+	SessionID string `json:"session_id"`
+}
+
+type SessionStopResponse struct {
+	SessionID string `json:"session_id"`
+	Stopped   bool   `json:"stopped"`
+	Error     string `json:"error,omitempty"`
+}
+
 // DeletePayload asks a Daemon to remove a stopped session's provider files. The
 // Server never deletes a remote workstation's transcript itself.
 type DeletePayload struct {

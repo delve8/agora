@@ -290,6 +290,9 @@ func (d *Daemon) handleLocalWrapper(conn net.Conn) {
 	case protocol.SessionSnapshot:
 		d.handleSessionSnapshot(conn, body)
 		return
+	case protocol.SessionStop:
+		d.handleLocalStop(conn, body)
+		return
 	}
 	var payload protocol.WrapperRequest
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -995,6 +998,33 @@ func (d *Daemon) localSessions(ctx context.Context) ([]session.Session, []sessio
 // handleSessionList answers a local terminal asking which sessions exist, so the
 // wrapper does not have to be handed a canonical id. It never contacts the
 // Server: this is a local question about the machine the terminal is on.
+// handleLocalStop stops a managed session on this workstation. `agora stop`
+// uses it so ending a local session never needs the Server.
+func (d *Daemon) handleLocalStop(conn net.Conn, body []byte) {
+	var payload protocol.SessionStopRequest
+	response := protocol.SessionStopResponse{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		response.Error = "invalid stop request: " + err.Error()
+		_ = json.NewEncoder(conn).Encode(response)
+		return
+	}
+	response.SessionID = payload.SessionID
+	value, err := d.manager.GetSession(context.Background(), payload.SessionID)
+	switch {
+	case err != nil:
+		response.Error = fmt.Sprintf("session %s not found", payload.SessionID)
+	case !d.manager.IsRunning(value.ID):
+		response.Error = fmt.Sprintf("session %s is not running", payload.SessionID)
+	default:
+		if stopErr := d.manager.StopSession(value); stopErr != nil {
+			response.Error = stopErr.Error()
+		} else {
+			response.Stopped = true
+		}
+	}
+	_ = json.NewEncoder(conn).Encode(response)
+}
+
 func (d *Daemon) handleSessionList(conn net.Conn, body []byte) {
 	var payload protocol.SessionListRequest
 	if err := json.Unmarshal(body, &payload); err != nil {

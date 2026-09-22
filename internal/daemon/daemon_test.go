@@ -397,3 +397,33 @@ func TestCreateManagedSessionValidatesLocally(t *testing.T) {
 		t.Fatal("expected a misrouted daemon id to be rejected")
 	}
 }
+
+// `agora stop` reaches the Daemon over the local wrapper socket; it must report
+// a missing session and refuse a session that is not running.
+func TestHandleLocalStop(t *testing.T) {
+	store := runtime.NewMemoryStore()
+	manager := runtime.NewManager(store, nil, nil)
+	d := &Daemon{manager: manager, config: Config{ID: "daemon-1"}}
+	if err := store.CreateSession(context.Background(), session.Session{ID: "daemon/daemon-1/pi://stopped", DaemonID: "daemon-1", Agent: "pi", State: session.StateStopped, Source: session.SourceManaged}); err != nil {
+		t.Fatal(err)
+	}
+	call := func(sessionID string) protocol.SessionStopResponse {
+		t.Helper()
+		server, client := net.Pipe()
+		defer server.Close()
+		defer client.Close()
+		go d.handleLocalStop(server, []byte(`{"type":"session.stop","session_id":"`+sessionID+`"}`))
+		_ = client.SetDeadline(time.Now().Add(2 * time.Second))
+		var response protocol.SessionStopResponse
+		if err := json.NewDecoder(client).Decode(&response); err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	if response := call("daemon/daemon-1/pi://missing"); !strings.Contains(response.Error, "not found") {
+		t.Fatalf("missing session response = %+v", response)
+	}
+	if response := call("daemon/daemon-1/pi://stopped"); !strings.Contains(response.Error, "not running") {
+		t.Fatalf("stopped session response = %+v", response)
+	}
+}

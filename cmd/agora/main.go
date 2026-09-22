@@ -19,7 +19,7 @@ import (
 
 const usageLine = "usage: agora serve | agora server | agora daemon | agora update [--check] | agora version | " +
 	"agora pair <code> [--server <url>] | agora session-host --config <path> | agora pty <args...> | " +
-	"agora attach [list [--all] | <#|session-id>] | agora wrap <pi|claude> [session-id|prompt...]"
+	"agora attach [list [--all] | <#|session-id>] | agora stop <#|session-id> | agora wrap <pi|claude> [session-id|prompt...]"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -54,6 +54,8 @@ func main() {
 		err = runPTY(os.Args[2:])
 	case "attach":
 		err = runAttachCommand(os.Args[2:])
+	case "stop":
+		err = runStopCommand(os.Args[2:])
 	case "wrap":
 		if len(os.Args) < 3 {
 			err = fmt.Errorf("wrap requires an agent: pi or claude")
