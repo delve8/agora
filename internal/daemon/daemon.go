@@ -1,7 +1,6 @@
 package daemon
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -176,6 +175,95 @@ func (d *Daemon) startLocalWrapperServer(ctx context.Context) error {
 	return nil
 }
 
+// createManagedSession launches or resumes a managed Agent on this workstation.
+// It is shared by the Server's session.create frame and the local wrapper, so a
+// terminal session never depends on the control plane being reachable.
+func (d *Daemon) createManagedSession(payload protocol.SessionCreatePayload) (session.Session, error) {
+	var value session.Session
+	var err error
+	agent := strings.ToLower(strings.TrimSpace(payload.Agent))
+	if agent == "" {
+		agent = "claude"
+	}
+	if agent == "claude-code" {
+		agent = "claude"
+	}
+	if agent != "claude" && agent != "pi" {
+		err = fmt.Errorf("unsupported agent %q", agent)
+	} else if payload.DaemonID != "" && payload.DaemonID != d.config.ID {
+		// The server routes create frames to the targeted daemon's
+		// connection, but the daemon verifies the declared target anyway so
+		// a misrouted frame can never start work on the wrong device.
+		err = fmt.Errorf("session create target %s does not match this daemon %s", payload.DaemonID, d.config.ID)
+	} else if payload.ResumeID != "" {
+		identity, identityErr := session.ParseSessionID(payload.SessionID)
+		if identityErr != nil {
+			err = identityErr
+		} else if identity.DaemonID != d.config.ID || identity.Agent != agent {
+			err = fmt.Errorf("session %s is not owned by daemon %s", payload.SessionID, d.config.ID)
+		} else {
+			workspace := strings.TrimSpace(payload.Workspace)
+			if workspace == "" {
+				workspace = d.resolveWorkspace(payload.SessionID)
+			}
+			if workspace == "" {
+				err = fmt.Errorf("session %s workspace not found in daemon", payload.SessionID)
+			} else {
+				value = session.Session{ID: payload.SessionID, CoordinationID: payload.CoordinationID, DaemonID: identity.DaemonID, Agent: identity.Agent, AgentSessionID: identity.AgentSessionID, Workspace: workspace, HistoryPath: payload.HistoryPath, DisplayName: payload.DisplayName, Role: payload.Role, State: session.StateStarting, Source: session.SourceManaged, Capabilities: session.Capabilities{CanStart: true, CanResume: true, CanReadHistory: true}}
+				if agent == "claude" {
+					value.ClaudeSessionID = strings.TrimPrefix(identity.AgentSessionID, "claude://")
+				}
+				value, err = d.manager.ResumeSession(runtime.WithTerminalEnv(context.Background(), payload.Terminal), value)
+			}
+		}
+	} else {
+		workspace := strings.TrimSpace(payload.Workspace)
+		if workspace == "" {
+			err = errors.New("workspace is required")
+		} else {
+			workspace, err = filepath.Abs(workspace)
+			if err == nil {
+				if info, statErr := os.Stat(workspace); statErr != nil || !info.IsDir() {
+					err = errors.New("workspace must be an existing directory")
+				}
+			}
+		}
+		provisional := "pending/" + protocol.NewID("session")
+		if err == nil {
+			// The requesting terminal's identity travels with the create request:
+			// the Daemon is a service, so it has no TERM of its own to give the
+			// Agent, and an Agent without one renders for 16 colours.
+			createCtx := runtime.WithTerminalEnv(context.Background(), payload.Terminal)
+			value, err = d.manager.CreateManagedSessionWithAgentArgs(createCtx, provisional, payload.CoordinationID, workspace, payload.DisplayName, payload.Role, agent, payload.AgentArgs)
+		}
+		if err == nil {
+			// A Pi invocation that forwards the user's arguments cannot be told
+			// which session id to use, so the provider may create its own and
+			// report it before the identity is adopted here. Adopt what the
+			// provider already decided instead of overwriting it.
+			if resolved := d.manager.ResolveSessionID(provisional); resolved != provisional {
+				value, err = d.manager.GetSession(context.Background(), resolved)
+			} else {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				nativeID, waitErr := d.manager.WaitAgentSessionID(ctx, provisional)
+				cancel()
+				if waitErr != nil {
+					err = waitErr
+				} else {
+					uri := agent + "://" + nativeID
+					canonicalID, identityErr := session.NewSessionID(d.config.ID, agent, uri)
+					if identityErr != nil {
+						err = identityErr
+					} else if value, err = d.manager.SetAgentIdentity(context.Background(), provisional, agent, uri); err == nil {
+						value, err = d.manager.RekeySession(context.Background(), provisional, canonicalID)
+					}
+				}
+			}
+		}
+	}
+	return value, err
+}
+
 func (d *Daemon) handleLocalWrapper(conn net.Conn) {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(60 * time.Second))
@@ -208,51 +296,53 @@ func (d *Daemon) handleLocalWrapper(conn net.Conn) {
 		_ = json.NewEncoder(conn).Encode(protocol.WrapperResponse{Error: "invalid wrapper request: " + err.Error()})
 		return
 	}
-	body, err := json.Marshal(payload)
+	// The wrapper path is local-first: the PTY, Session Host and attach socket
+	// all live on this workstation, so a terminal session must not wait on the
+	// control plane. The Server catches up asynchronously through resync.
+	if payload.SessionID != "" {
+		value, err := d.manager.GetSession(context.Background(), payload.SessionID)
+		if err != nil {
+			_ = json.NewEncoder(conn).Encode(protocol.WrapperResponse{Error: fmt.Sprintf("session %s not found", payload.SessionID)})
+			return
+		}
+		socket, err := d.manager.AttachAddr(value.ID)
+		if err != nil {
+			_ = json.NewEncoder(conn).Encode(protocol.WrapperResponse{Error: err.Error()})
+			return
+		}
+		_ = json.NewEncoder(conn).Encode(protocol.WrapperResponse{SessionID: value.ID, Socket: socket})
+		return
+	}
+	displayName := strings.TrimSpace(payload.DisplayName)
+	if displayName == "" {
+		displayName = "New session"
+	}
+	value, err := d.createManagedSession(protocol.SessionCreatePayload{
+		Workspace: payload.Workspace, DisplayName: displayName, Role: payload.Role,
+		Agent: payload.Agent, AgentArgs: payload.AgentArgs, Terminal: payload.Terminal,
+	})
 	if err != nil {
 		_ = json.NewEncoder(conn).Encode(protocol.WrapperResponse{Error: err.Error()})
 		return
 	}
-	readyCtx, cancel := context.WithTimeout(context.Background(), 50*time.Second)
-	defer cancel()
-	if err := d.waitRegistered(readyCtx); err != nil {
-		_ = json.NewEncoder(conn).Encode(protocol.WrapperResponse{Error: err.Error()})
-		return
-	}
-	endpoint, err := daemonHTTPBase(d.config.ServerURL)
+	d.startEventBridge(value)
+	socket, err := d.manager.AttachAddr(value.ID)
 	if err != nil {
 		_ = json.NewEncoder(conn).Encode(protocol.WrapperResponse{Error: err.Error()})
 		return
 	}
-	request, err := http.NewRequest(http.MethodPost, endpoint+"/api/daemon/wrap", bytes.NewReader(body))
-	if err != nil {
-		_ = json.NewEncoder(conn).Encode(protocol.WrapperResponse{Error: err.Error()})
-		return
-	}
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("X-Agora-Daemon-ID", d.config.ID)
-	if d.config.Credential != "" {
-		request.Header.Set("Authorization", "Bearer "+d.config.Credential)
-	}
-	requestCtx, cancel := context.WithTimeout(context.Background(), 50*time.Second)
-	defer cancel()
-	request = request.WithContext(requestCtx)
-	response, err := http.DefaultClient.Do(request)
-	if err != nil {
-		_ = json.NewEncoder(conn).Encode(protocol.WrapperResponse{Error: "request Server through daemon: " + err.Error()})
-		return
-	}
-	defer response.Body.Close()
-	var result protocol.WrapperResponse
-	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
-		result.Error = err.Error()
-	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		if result.Error == "" {
-			result.Error = response.Status
+	_ = json.NewEncoder(conn).Encode(protocol.WrapperResponse{SessionID: value.ID, Socket: socket})
+	for _, prompt := range payload.Prompts {
+		if strings.TrimSpace(prompt) == "" {
+			continue
+		}
+		if err := d.manager.Send(context.Background(), value, messageForInput(prompt)); err != nil {
+			log.Printf("agora daemon: send initial prompt for %s: %v", value.ID, err)
 		}
 	}
-	_ = json.NewEncoder(conn).Encode(result)
+	// Best effort: when the Server is offline the resync is queued in the
+	// outbox and delivered on reconnect.
+	go func() { _ = d.sendResync() }()
 }
 
 // handleSessionReport applies a provider-native session report. The injected
@@ -638,88 +728,7 @@ func (d *Daemon) handle(frame protocol.Envelope) error {
 		if err := protocol.DecodePayload(frame, &payload); err != nil {
 			return err
 		}
-		var value session.Session
-		var err error
-		agent := strings.ToLower(strings.TrimSpace(payload.Agent))
-		if agent == "" {
-			agent = "claude"
-		}
-		if agent == "claude-code" {
-			agent = "claude"
-		}
-		if agent != "claude" && agent != "pi" {
-			err = fmt.Errorf("unsupported agent %q", agent)
-		} else if payload.DaemonID != "" && payload.DaemonID != d.config.ID {
-			// The server routes create frames to the targeted daemon's
-			// connection, but the daemon verifies the declared target anyway so
-			// a misrouted frame can never start work on the wrong device.
-			err = fmt.Errorf("session create target %s does not match this daemon %s", payload.DaemonID, d.config.ID)
-		} else if payload.ResumeID != "" {
-			identity, identityErr := session.ParseSessionID(payload.SessionID)
-			if identityErr != nil {
-				err = identityErr
-			} else if identity.DaemonID != d.config.ID || identity.Agent != agent {
-				err = fmt.Errorf("session %s is not owned by daemon %s", payload.SessionID, d.config.ID)
-			} else {
-				workspace := strings.TrimSpace(payload.Workspace)
-				if workspace == "" {
-					workspace = d.resolveWorkspace(payload.SessionID)
-				}
-				if workspace == "" {
-					err = fmt.Errorf("session %s workspace not found in daemon", payload.SessionID)
-				} else {
-					value = session.Session{ID: payload.SessionID, CoordinationID: payload.CoordinationID, DaemonID: identity.DaemonID, Agent: identity.Agent, AgentSessionID: identity.AgentSessionID, Workspace: workspace, HistoryPath: payload.HistoryPath, DisplayName: payload.DisplayName, Role: payload.Role, State: session.StateStarting, Source: session.SourceManaged, Capabilities: session.Capabilities{CanStart: true, CanResume: true, CanReadHistory: true}}
-					if agent == "claude" {
-						value.ClaudeSessionID = strings.TrimPrefix(identity.AgentSessionID, "claude://")
-					}
-					value, err = d.manager.ResumeSession(runtime.WithTerminalEnv(context.Background(), payload.Terminal), value)
-				}
-			}
-		} else {
-			workspace := strings.TrimSpace(payload.Workspace)
-			if workspace == "" {
-				err = errors.New("workspace is required")
-			} else {
-				workspace, err = filepath.Abs(workspace)
-				if err == nil {
-					if info, statErr := os.Stat(workspace); statErr != nil || !info.IsDir() {
-						err = errors.New("workspace must be an existing directory")
-					}
-				}
-			}
-			provisional := "pending/" + protocol.NewID("session")
-			if err == nil {
-				// The requesting terminal's identity travels with the create request:
-				// the Daemon is a service, so it has no TERM of its own to give the
-				// Agent, and an Agent without one renders for 16 colours.
-				createCtx := runtime.WithTerminalEnv(context.Background(), payload.Terminal)
-				value, err = d.manager.CreateManagedSessionWithAgentArgs(createCtx, provisional, payload.CoordinationID, workspace, payload.DisplayName, payload.Role, agent, payload.AgentArgs)
-			}
-			if err == nil {
-				// A Pi invocation that forwards the user's arguments cannot be told
-				// which session id to use, so the provider may create its own and
-				// report it before the identity is adopted here. Adopt what the
-				// provider already decided instead of overwriting it.
-				if resolved := d.manager.ResolveSessionID(provisional); resolved != provisional {
-					value, err = d.manager.GetSession(context.Background(), resolved)
-				} else {
-					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-					nativeID, waitErr := d.manager.WaitAgentSessionID(ctx, provisional)
-					cancel()
-					if waitErr != nil {
-						err = waitErr
-					} else {
-						uri := agent + "://" + nativeID
-						canonicalID, identityErr := session.NewSessionID(d.config.ID, agent, uri)
-						if identityErr != nil {
-							err = identityErr
-						} else if value, err = d.manager.SetAgentIdentity(context.Background(), provisional, agent, uri); err == nil {
-							value, err = d.manager.RekeySession(context.Background(), provisional, canonicalID)
-						}
-					}
-				}
-			}
-		}
+		value, err := d.createManagedSession(payload)
 		created := protocol.SessionCreatedPayload{SessionID: value.ID, DaemonID: d.config.ID, Agent: value.Agent, AgentSessionID: value.AgentSessionID, Workspace: value.Workspace}
 		if err != nil {
 			created.Error = err.Error()

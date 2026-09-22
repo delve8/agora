@@ -1033,3 +1033,15 @@ func TestDeleteHistorySessionRoutesToDaemon(t *testing.T) {
 		t.Fatal("alias/star survived session deletion")
 	}
 }
+
+// The local wrapper no longer proxies through the Server, so the endpoint it
+// used must be gone rather than left as a second, stale creation path.
+func TestDaemonWrapEndpointRemoved(t *testing.T) {
+	srv, _ := newSessionTestServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/api/daemon/wrap", bytes.NewBufferString("{}"))
+	resp := httptest.NewRecorder()
+	srv.HTTP.Handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("POST /api/daemon/wrap returned %d, want 404", resp.Code)
+	}
+}

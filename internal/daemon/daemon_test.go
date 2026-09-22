@@ -382,3 +382,18 @@ func TestSessionRunningUsesProcessAndState(t *testing.T) {
 		t.Fatal("running session without a process was treated as live")
 	}
 }
+
+// createManagedSession is shared with the local wrapper, so it must validate
+// its input without any Server connection.
+func TestCreateManagedSessionValidatesLocally(t *testing.T) {
+	d := &Daemon{manager: runtime.NewManager(runtime.NewMemoryStore(), nil, nil), config: Config{ID: "daemon-1"}}
+	if _, err := d.createManagedSession(protocol.SessionCreatePayload{Agent: "opencode", Workspace: "/tmp"}); err == nil {
+		t.Fatal("expected an unsupported agent to be rejected")
+	}
+	if _, err := d.createManagedSession(protocol.SessionCreatePayload{Agent: "pi"}); err == nil {
+		t.Fatal("expected a missing workspace to be rejected")
+	}
+	if _, err := d.createManagedSession(protocol.SessionCreatePayload{Agent: "pi", Workspace: "/tmp", DaemonID: "other"}); err == nil {
+		t.Fatal("expected a misrouted daemon id to be rejected")
+	}
+}
